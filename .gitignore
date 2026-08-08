@@ -1,2 +1,4 @@
 .venv/
 .env.local
+config.yaml
+.claude/
