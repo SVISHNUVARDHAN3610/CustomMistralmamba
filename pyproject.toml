@@ -1,0 +1,5 @@
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+# You can customize these based on your project's needs
+# select = ["E", "F", "W", "I", "B", "D"]
