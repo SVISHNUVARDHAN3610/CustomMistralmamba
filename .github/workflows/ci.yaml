@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, edited, synchronize, reopened]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,46 +17,13 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Validate PR description template
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const body = context.payload.pull_request.body ?? '';
-            const errors = [];
-
-            const prDescription = body.match(/^##\s*PR-Description\s*\r?\n([\s\S]*?)(?=^##\s*Test-Plan\s*$|\Z)/im);
-            const testPlan = body.match(/^##\s*Test-Plan\s*\r?\n([\s\S]*)/im);
-
-            if (!prDescription) {
-              errors.push('Missing required section: ## PR-Description');
-            } else if (!prDescription[1].trim()) {
-              errors.push('## PR-Description section is empty');
-            }
-
-            if (!testPlan) {
-              errors.push('Missing required section: ## Test-Plan');
-            } else if (!testPlan[1].trim()) {
-              errors.push('## Test-Plan section is empty');
-            }
-
-            if (errors.length > 0) {
-              core.setFailed(
-                [
-                  'PR description must use this template:',
-                  '',
-                  '## PR-Description',
-                  '<describe your changes>',
-                  '',
-                  '## Test-Plan',
-                  '<describe how you tested>',
-                  '',
-                  ...errors.map((error) => `- ${error}`),
-                ].join('\n')
-              );
-              return;
-            }
-
-            core.info('PR description template check passed.');
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: python3 .github/scripts/validate_pr_description.py
 
   lint:
     name: Lint & Format
