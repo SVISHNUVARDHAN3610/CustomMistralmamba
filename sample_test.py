@@ -80,9 +80,9 @@ class TestCIFiles(unittest.TestCase):
         )
 
     def test_pr_template_has_required_headings(self) -> None:
-        template_text = (
-            REPO_ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md"
-        ).read_text(encoding="utf-8")
+        template_text = (REPO_ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(
+            encoding="utf-8"
+        )
         self.assertIn("## PR-Description", template_text)
         self.assertIn("## Test-Plan", template_text)
 
