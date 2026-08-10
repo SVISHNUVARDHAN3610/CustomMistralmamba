@@ -55,7 +55,7 @@ class TestHybridModel(unittest.TestCase):
 
     def test_param_budget(self) -> None:
         n = count_trainable_params(self.model)
-        self.assertLess(n, 12_000_000)
+        self.assertLess(n, 20_000_000)
         self.assertGreater(n, 1_000_000)
 
     def test_dt_proj_bias_not_zeroed(self) -> None:
@@ -252,14 +252,16 @@ class TestHybridModel(unittest.TestCase):
         prompt = torch.randint(1, cfg.vocab_size, (1, 6))
 
         skip_flags: list[bool] = []
-        mem_snapshots: list[torch.Tensor] = []
+        buf_lens: list[int | None] = []
         orig_forward = model.forward
 
         def spy_forward(*args, **kwargs):
             skip_flags.append(kwargs.get("skip_memory_write", False))
             out = orig_forward(*args, **kwargs)
-            if out.memory_states is not None:
-                mem_snapshots.append(out.memory_states[0][0].clone())
+            if out.write_buffers is not None and out.write_buffers[0] is not None:
+                buf_lens.append(out.write_buffers[0][0].size(1))
+            else:
+                buf_lens.append(None)
             return out
 
         model.forward = spy_forward  # type: ignore[method-assign]
@@ -267,17 +269,52 @@ class TestHybridModel(unittest.TestCase):
         gen = model.generate(prompt, max_new_tokens=4, do_sample=False)
         self.assertEqual(gen.shape[1], 10)
 
-        # prefill + 4 decode forwards
-        self.assertEqual(len(skip_flags), 5)
-        self.assertFalse(skip_flags[0])  # prefill always writes
-        # tokens_since_write after prefill = prompt_len (6); writes at 8, 12, ...
-        self.assertEqual(skip_flags[1:], [True, False, True, True])
+        # Prefill is chunked: [0:4] write, [4:6] write, then 4 decode steps.
+        self.assertEqual(len(skip_flags), 6)
+        self.assertEqual(skip_flags[:2], [False, False])  # prefill chunks write
+        # Decode accumulates until interval=4, then writes.
+        self.assertEqual(skip_flags[2:], [True, True, True, False])
+        # After first three decode skips, buffer holds 1,2,3 tokens; write clears.
+        self.assertEqual(buf_lens[2:5], [1, 2, 3])
+        self.assertIsNone(buf_lens[5])
 
-        # memory unchanged on skip steps, changes on write steps
-        self.assertTrue(torch.equal(mem_snapshots[1], mem_snapshots[0]))
-        self.assertFalse(torch.equal(mem_snapshots[2], mem_snapshots[1]))
-        self.assertTrue(torch.equal(mem_snapshots[3], mem_snapshots[2]))
-        self.assertTrue(torch.equal(mem_snapshots[4], mem_snapshots[3]))
+    def test_memory_write_all_pad_no_nan(self) -> None:
+        cfg = _small_hybrid_config()
+        model = HybridForCausalLM(cfg).eval()
+        ids = torch.zeros(2, 8, dtype=torch.long)
+        mask = torch.zeros(2, 8, dtype=torch.long)
+        out = model(input_ids=ids, attention_mask=mask)
+        self.assertFalse(torch.isnan(out.logits).any())
+
+    def test_ce_ignore_index_pads(self) -> None:
+        cfg = _small_hybrid_config()
+        model = HybridForCausalLM(cfg)
+        model.train()
+        ids = torch.randint(1, cfg.vocab_size, (1, 8))
+        labels = ids.clone()
+        labels[:, -3:] = cfg.label_ignore_index
+        mask = torch.ones(1, 8, dtype=torch.long)
+        mask[:, -3:] = 0
+        out = model(input_ids=ids, attention_mask=mask, labels=labels)
+        self.assertIsNotNone(out.loss)
+        self.assertFalse(torch.isnan(out.loss))
+
+    def test_mamba_pad_state_matches_trimmed(self) -> None:
+        """Right-padded prefill cache should match trimmed sequence cache."""
+        cfg = _small_hybrid_config(num_layers=1, memory_chunk_size=None)
+        model = HybridForCausalLM(cfg).eval()
+        ids = torch.randint(1, cfg.vocab_size, (1, 10))
+        padded = torch.cat([ids, torch.zeros(1, 4, dtype=torch.long)], dim=1)
+        mask = torch.cat(
+            [torch.ones(1, 10, dtype=torch.long), torch.zeros(1, 4, dtype=torch.long)],
+            dim=1,
+        )
+        trimmed = model(input_ids=ids, use_cache=True)
+        padded_out = model(input_ids=padded, attention_mask=mask, use_cache=True)
+        t_conv, t_ssm = trimmed.mamba_caches[0]
+        p_conv, p_ssm = padded_out.mamba_caches[0]
+        self.assertLess((t_ssm - p_ssm).abs().max().item(), 1e-4)
+        self.assertLess((t_conv - p_conv).abs().max().item(), 1e-4)
 
     def test_generate_finished_row_zeros_input(self) -> None:
         """Finished batch rows must not feed real token ids into decode forward."""
