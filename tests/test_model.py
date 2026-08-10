@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -247,9 +248,93 @@ class TestHybridModel(unittest.TestCase):
     def test_generate_memory_write_interval(self) -> None:
         cfg = _small_hybrid_config(memory_write_interval=4, memory_chunk_size=4)
         model = HybridForCausalLM(cfg).eval()
-        prompt = torch.randint(0, cfg.vocab_size, (1, 6))
-        gen = model.generate(prompt, max_new_tokens=8, do_sample=False)
-        self.assertEqual(gen.shape[1], 14)
+        torch.manual_seed(42)
+        prompt = torch.randint(1, cfg.vocab_size, (1, 6))
+
+        skip_flags: list[bool] = []
+        mem_snapshots: list[torch.Tensor] = []
+        orig_forward = model.forward
+
+        def spy_forward(*args, **kwargs):
+            skip_flags.append(kwargs.get("skip_memory_write", False))
+            out = orig_forward(*args, **kwargs)
+            if out.memory_states is not None:
+                mem_snapshots.append(out.memory_states[0][0].clone())
+            return out
+
+        model.forward = spy_forward  # type: ignore[method-assign]
+
+        gen = model.generate(prompt, max_new_tokens=4, do_sample=False)
+        self.assertEqual(gen.shape[1], 10)
+
+        # prefill + 4 decode forwards
+        self.assertEqual(len(skip_flags), 5)
+        self.assertFalse(skip_flags[0])  # prefill always writes
+        # tokens_since_write after prefill = prompt_len (6); writes at 8, 12, ...
+        self.assertEqual(skip_flags[1:], [True, False, True, True])
+
+        # memory unchanged on skip steps, changes on write steps
+        self.assertTrue(torch.equal(mem_snapshots[1], mem_snapshots[0]))
+        self.assertFalse(torch.equal(mem_snapshots[2], mem_snapshots[1]))
+        self.assertTrue(torch.equal(mem_snapshots[3], mem_snapshots[2]))
+        self.assertTrue(torch.equal(mem_snapshots[4], mem_snapshots[3]))
+
+    def test_generate_finished_row_zeros_input(self) -> None:
+        """Finished batch rows must not feed real token ids into decode forward."""
+        cfg = _small_hybrid_config()
+        model = HybridForCausalLM(cfg).eval()
+        eos = cfg.eos_token_id
+        prompt = torch.randint(1, cfg.vocab_size, (2, 4))
+
+        decode_inputs: list[torch.Tensor] = []
+        orig_forward = model.forward
+
+        def spy_forward(*args, **kwargs):
+            ids = kwargs.get("input_ids")
+            if ids is not None and ids.size(1) == 1:
+                decode_inputs.append(ids.clone())
+            return orig_forward(*args, **kwargs)
+
+        model.forward = spy_forward  # type: ignore[method-assign]
+
+        argmax_calls = {"n": 0}
+        real_argmax = torch.argmax
+
+        def mock_argmax(input, dim=-1, keepdim=False):
+            if input.dim() == 2 and input.size(0) == 2 and argmax_calls["n"] == 0:
+                argmax_calls["n"] += 1
+                out = torch.tensor(
+                    [[eos], [5]],
+                    device=input.device,
+                    dtype=torch.long,
+                )
+                return out if keepdim else out.squeeze(dim)
+
+            return real_argmax(input, dim=dim, keepdim=keepdim)
+
+        with mock.patch.object(torch, "argmax", side_effect=mock_argmax):
+            gen = model.generate(
+                prompt, max_new_tokens=3, do_sample=False, eos_token_id=eos
+            )
+
+        self.assertEqual(gen.shape[0], 2)
+        self.assertGreaterEqual(len(decode_inputs), 1)
+        # First decode after row 0 hits EOS: finished row must not feed a real token.
+        self.assertEqual(decode_inputs[0][0, 0].item(), 0)
+        self.assertNotEqual(decode_inputs[0][1, 0].item(), 0)
+
+    def test_moe_capacity_eval_deterministic(self) -> None:
+        """Eval mode with capacity_factor should be order-stable across seeds."""
+        cfg = _small_hybrid_config(capacity_factor=1.0, num_experts=2, top_k=1)
+        model = HybridForCausalLM(cfg).eval()
+        ids = torch.randint(1, cfg.vocab_size, (4, 32))
+
+        torch.manual_seed(0)
+        logits_a = model(input_ids=ids).logits
+        torch.manual_seed(99)
+        logits_b = model(input_ids=ids).logits
+        diff = (logits_a - logits_b).abs().max().item()
+        self.assertLess(diff, 1e-5)
 
 
 if __name__ == "__main__":

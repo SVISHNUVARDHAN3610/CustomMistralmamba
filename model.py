@@ -432,12 +432,17 @@ class DroplessMoELayer(nn.Module):
 
     `capacity_factor` (from config) optionally bounds the number of tokens
     each expert will process to `capacity_factor * num_tokens / num_experts`,
-    dropping (zeroing) overflow tokens for that expert. This is a memory
-    safety valve for T4: with imbalanced routing, a naive dispatch can spike
-    a single expert's batch 2-3x versus the average, which is the difference
-    between fitting in 16GB and OOM. Set `capacity_factor=None` to restore
-    the original fully "dropless" (no token ever skipped) behavior -- note
-    this reintroduces the memory-spike risk under imbalanced routing.
+    dropping overflow tokens for that expert. This is a memory safety valve for
+    T4: with imbalanced routing, a naive dispatch can spike a single expert's
+    batch 2-3x versus the average, which is the difference between fitting in
+    16GB and OOM. Set `capacity_factor=None` to restore the original fully
+    "dropless" (no token ever skipped) behavior -- note this reintroduces the
+    memory-spike risk under imbalanced routing.
+
+    When capacity drops tokens, remaining top-k weights are renormalized so
+    per-token MoE magnitude is preserved. During training, overflow tokens
+    are chosen via a random permutation (not always the first ``capacity``
+    indices) to reduce order bias; eval uses stable first-``capacity`` order.
     """
 
     def __init__(
@@ -485,8 +490,15 @@ class DroplessMoELayer(nn.Module):
             row_indices, k_indices = torch.where(token_mask)
 
             if capacity is not None and row_indices.numel() > capacity:
-                row_indices = row_indices[:capacity]
-                k_indices = k_indices[:capacity]
+                if self.training:
+                    perm = torch.randperm(
+                        row_indices.numel(), device=row_indices.device
+                    )[:capacity]
+                    row_indices = row_indices[perm]
+                    k_indices = k_indices[perm]
+                else:
+                    row_indices = row_indices[:capacity]
+                    k_indices = k_indices[:capacity]
 
             expert_inputs = x_flat[row_indices]
             expert_outputs = self.experts[expert_idx](expert_inputs)
@@ -1286,6 +1298,9 @@ class HybridDecoderLayer(nn.Module):
         if self.use_dual_memory:
             assert memory_state is not None
             a_mem, s_mem = memory_state
+            if hidden_mask is not None:
+                attn_out = attn_out * hidden_mask
+                mamba_out = mamba_out * hidden_mask
             if skip_memory_write:
                 new_memory_state = memory_state
             else:

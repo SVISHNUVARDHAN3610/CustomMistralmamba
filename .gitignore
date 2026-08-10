@@ -1,6 +1,6 @@
 .venv/
 .env.local
 config.yaml
-.claude/
 __pycache__/
 tests/__pycache__/
+reviews/
