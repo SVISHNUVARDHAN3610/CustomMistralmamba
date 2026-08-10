@@ -158,21 +158,27 @@ A full reference implementation exists in `model.py`:
 
 - ✅ `MixtralConfig` / `MixtralForCausalLM` — baseline (sliding-window GQA +
   Top-2 MoE), used as the control model for all comparisons below.
-- ✅ `MambaBlock` — reference selective-SSM (sequential scan; no custom CUDA
-  kernel dependency, so it runs on any SDPA-compatible device including T4).
-- ✅ `CompressiveMemoryBank` — gated read/write memory, verified to persist
-  correctly across simulated sequence chunks.
+- ✅ `MambaBlock` — selective SSM with a **checkpointed sequential associative
+  scan** for training (O(L) work, bounded activation memory; default) and an
+  optional Hillis-Steele parallel scan (`use_parallel_scan=True`) for short
+  sequences. Incremental `(conv_state, ssm_state)` step cache for decode. No
+  custom CUDA kernel dependency.
+- ✅ `CompressiveMemoryBank` — lightweight einsum read/write memory. Banks are
+  **read into** each branch and **written from raw branch outputs**, matching
+  §3.2. Padding masks zero Mamba/MoE paths and mask memory writes.
 - ✅ `TokenGatedFusion` — O(L) branch fusion.
-- ✅ `HybridForCausalLM` — full model wiring; forward/backward pass verified,
-  memory-on and memory-off (ablation) configurations both run correctly.
-- ✅ `generate()` — autoregressive decoding (greedy + temperature/top-k/top-p
-  sampling, per-sequence EOS handling), verified end-to-end.
+- ✅ `HybridForCausalLM` — full model wiring; **internal `memory_chunk_size`
+  chunking** threads memory across chunks in one backward (BPTT for write
+  params). Hooks: `use_dual_memory=False`, `zero_memory_states`, and
+  `build_test3_null_baseline_config()` (parameter-matched via binary search).
+- ✅ `generate()` — incremental KV + Mamba + memory caches; memory writes
+  batched every `memory_write_interval` tokens (defaults to `memory_chunk_size`).
+- ✅ `capacity_factor` defaults to `None` (fully dropless, batch-independent).
+  Set only for memory-constrained hardware.
 
-**Known implementation limitation:** `MambaBlock` now supports
-incremental (conv-state + SSM-state) caching, so `generate()` achieves
-O(L) total generation cost. A bit-identical logit check against a
-non-cached forward pass is recommended to verify caching correctness
-before relying on it for latency-sensitive use.
+**Caching correctness:** `tests/test_model.py` checks incremental vs full-forward
+last-logit cosine similarity on a small config. Re-run before latency-sensitive
+use at larger scales.
 
 **Bug found and fixed during testing:** the original `SlidingWindowGQA`
 truncated key/value tensors to the trailing attention window once the
@@ -197,7 +203,7 @@ no benefit.
 | Test | Method | Pass condition |
 |---|---|---|
 | **1. Rare-fact recall** | Inject a single, non-recurring fact early in a long sequence; query for exact recall late. Compare memory-on vs. memory-zeroed at inference. | Recall degrades sharply when memory is zeroed |
-| **2. Write-gate activity monitoring** | Log gate values from the memory write rule across training | Gates show non-degenerate activity (not saturating near 0 or 1) |
+| **2. Write-gate activity monitoring** | Log gate values from the memory write rule across training | Gates show non-degenerate activity (not saturating near 0 or 1). **Requires** `memory_chunk_size` chunking (or explicit cross-chunk memory threading) so write params receive gradients — random init gates ≈0.5 are not sufficient evidence alone. |
 | **3. Matched-parameter null hypothesis** | Train a baseline with a larger Mamba state dimension instead of the memory subsystem, at roughly matched parameter count | Memory-bank model beats the bigger-state baseline on rare-fact recall |
 
 All three should point the same direction before this architecture is
@@ -211,20 +217,22 @@ more machinery on top of a mechanism that hasn't earned its place.
 
 | Challenge | Notes |
 |---|---|
-| Chunk size vs. memory size tradeoff | Smaller chunks → more frequent, more responsive memory writes but more overhead; needs empirical sweep |
+| Chunk size vs. memory size tradeoff | `memory_chunk_size` (training) and `memory_write_interval` (decode) should be matched; sweep empirically |
 | Write-gate saturation | Same failure mode as vanilla RNNs over very long sequences; may need periodic reset or regularization |
 | Router collapse (MoE) | Standard Mixtral-class issue; load-balancing auxiliary loss already implemented |
-| Hardware efficiency | Selective scan is currently unfused (sequential loop); memory read/write is small-shaped and may not be GPU-efficient without custom kernels |
-| Incremental generation | Mamba branch needs conv/state caching before `generate()` is efficient for interactive use |
+| Hardware efficiency | Selective scan is parallelized in pure PyTorch but still **unfused** (materializes O(L·d·n) state); memory read/write is small-shaped and may not be GPU-efficient without custom kernels |
+| Incremental generation | ✅ Done — `MambaBlock.step` + KV/memory threading; `generate()` is O(L). Remaining work is fused CUDA kernels for wall-clock, not correctness |
 
 ---
 
 ## 8. Roadmap
 
 1. Run the three falsification tests (§6) at small scale before any larger
-   training run.
-2. If memory proves indispensable: add incremental Mamba state caching for
-   efficient generation.
+   training run (`use_dual_memory=False`, `zero_memory_states`, and
+   `build_test3_null_baseline_config` are the hooks in `model.py`).
+2. Incremental Mamba/KV/memory caching for `generate()` is implemented;
+   next efficiency step is an optional fused selective-scan CUDA kernel if
+   wall-clock on long contexts becomes the bottleneck.
 3. If memory proves redundant: simplify to a Mamba+GQA+MoE baseline (Jamba-
    equivalent) and redirect effort toward the bigger-state approach instead.
 4. Either path: benchmark wall-clock and memory footprint against the
