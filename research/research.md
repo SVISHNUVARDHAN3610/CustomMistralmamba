@@ -158,21 +158,28 @@ A full reference implementation exists in `model.py`:
 
 - ✅ `MixtralConfig` / `MixtralForCausalLM` — baseline (sliding-window GQA +
   Top-2 MoE), used as the control model for all comparisons below.
-- ✅ `MambaBlock` — reference selective-SSM (sequential scan; no custom CUDA
-  kernel dependency, so it runs on any SDPA-compatible device including T4).
-- ✅ `CompressiveMemoryBank` — gated read/write memory, verified to persist
-  correctly across simulated sequence chunks.
+- ✅ `MambaBlock` — selective SSM with a **pure-PyTorch parallel associative
+  scan** for prefill/training (no per-token Python loop) and incremental
+  `(conv_state, ssm_state)` step cache for decode. No custom CUDA kernel
+  dependency; runs on any SDPA-compatible device. Peak activation memory for
+  the scan is still O(L·d·n) because the unfused implementation materializes
+  the expanded state — acceptable on large training GPUs, a known limit vs
+  fused selective-scan kernels.
+- ✅ `CompressiveMemoryBank` — gated read/write memory. Banks are **read into**
+  each branch (condition GQA/Mamba inputs) and **written from raw branch
+  outputs**, matching §3.2. Padding masks are applied on write so pad tokens
+  do not pollute summaries. State is threaded across chunks.
 - ✅ `TokenGatedFusion` — O(L) branch fusion.
-- ✅ `HybridForCausalLM` — full model wiring; forward/backward pass verified,
-  memory-on and memory-off (ablation) configurations both run correctly.
-- ✅ `generate()` — autoregressive decoding (greedy + temperature/top-k/top-p
-  sampling, per-sequence EOS handling), verified end-to-end.
+- ✅ `HybridForCausalLM` — full model wiring; forward/backward verified;
+  memory-on, memory-off (`use_dual_memory=False`), and memory-zeroed-at-
+  inference (`zero_memory_states`) hooks for §6 tests.
+- ✅ `generate()` — autoregressive decoding (greedy + temperature/top-k/top-p,
+  per-sequence EOS) with incremental KV + Mamba + memory caches — O(L) total
+  cost. Absolute positions use `past_seen_tokens` (not truncated KV length).
 
-**Known implementation limitation:** `MambaBlock` now supports
-incremental (conv-state + SSM-state) caching, so `generate()` achieves
-O(L) total generation cost. A bit-identical logit check against a
-non-cached forward pass is recommended to verify caching correctness
-before relying on it for latency-sensitive use.
+**Caching correctness:** `tests/test_model.py` checks incremental vs full-forward
+last-logit cosine similarity on a small config. Re-run before latency-sensitive
+use at larger scales.
 
 **Bug found and fixed during testing:** the original `SlidingWindowGQA`
 truncated key/value tensors to the trailing attention window once the
@@ -214,17 +221,19 @@ more machinery on top of a mechanism that hasn't earned its place.
 | Chunk size vs. memory size tradeoff | Smaller chunks → more frequent, more responsive memory writes but more overhead; needs empirical sweep |
 | Write-gate saturation | Same failure mode as vanilla RNNs over very long sequences; may need periodic reset or regularization |
 | Router collapse (MoE) | Standard Mixtral-class issue; load-balancing auxiliary loss already implemented |
-| Hardware efficiency | Selective scan is currently unfused (sequential loop); memory read/write is small-shaped and may not be GPU-efficient without custom kernels |
-| Incremental generation | Mamba branch needs conv/state caching before `generate()` is efficient for interactive use |
+| Hardware efficiency | Selective scan is parallelized in pure PyTorch but still **unfused** (materializes O(L·d·n) state); memory read/write is small-shaped and may not be GPU-efficient without custom kernels |
+| Incremental generation | ✅ Done — `MambaBlock.step` + KV/memory threading; `generate()` is O(L). Remaining work is fused CUDA kernels for wall-clock, not correctness |
 
 ---
 
 ## 8. Roadmap
 
 1. Run the three falsification tests (§6) at small scale before any larger
-   training run.
-2. If memory proves indispensable: add incremental Mamba state caching for
-   efficient generation.
+   training run (`use_dual_memory=False`, `zero_memory_states`, and
+   `build_test3_null_baseline_config` are the hooks in `model.py`).
+2. Incremental Mamba/KV/memory caching for `generate()` is implemented;
+   next efficiency step is an optional fused selective-scan CUDA kernel if
+   wall-clock on long contexts becomes the bottleneck.
 3. If memory proves redundant: simplify to a Mamba+GQA+MoE baseline (Jamba-
    equivalent) and redirect effort toward the bigger-state approach instead.
 4. Either path: benchmark wall-clock and memory footprint against the

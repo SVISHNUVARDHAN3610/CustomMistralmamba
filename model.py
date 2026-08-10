@@ -3,37 +3,26 @@ model.py
 
 Contains two model families:
 
-1. MixtralConfig / MixtralForCausalLM  -- the original sliding-window-GQA +
-   Top-2 MoE baseline (unchanged from the working version). Keep this around
-   as the control model for ablations -- in particular it doubles as the
-   "no explicit memory, no SSM branch" reference point.
+1. MixtralConfig / MixtralForCausalLM -- sliding-window-GQA + Top-2 MoE
+   baseline (control for ablations).
 
-2. HybridMambaMoEConfig / HybridForCausalLM -- the proposed v2.0 architecture
-   (Hybrid Mamba-MoE with Dual Memory, see design doc v2.0):
-       - Sliding window GQA branch (reuses SlidingWindowGQA below)
-       - Mamba (selective SSM) branch (MambaBlock)
+2. HybridMambaMoEConfig / HybridForCausalLM -- Hybrid Mamba-MoE with Dual
+   Memory (research/research.md v2.0):
+       - Sliding window GQA branch (reuses SlidingWindowGQA)
+       - Mamba selective-SSM branch (MambaBlock) with parallel associative
+         scan for prefill/training and incremental (conv_state, ssm_state)
+         caching for autoregressive decode
        - Two compressive memory banks (CompressiveMemoryBank), one per
-         branch, with explicit bounded-size, gated read/write -- NOT a
-         static nn.Parameter. This is the actual mechanism the v1.0 doc's
-         "Aₗ, Mₗ" diagram implied but never implemented.
-       - Token-wise gated fusion (TokenGatedFusion) instead of the
-         bidirectional cross-attention from v1.0 that reintroduced O(L^2)
-         cost. Fusion here is O(L); memory read/write is O(L * m) with a
-         constant memory size m << L.
+         branch: read *into* branch inputs, write *raw* branch outputs
+         (research.md §3.2), O(L * m), m << L
+       - Token-wise gated fusion (TokenGatedFusion) -- O(L), not O(L^2)
+       - Top-2 sparse MoE (shared DroplessMoELayer)
 
-Both models share: RMSNorm, RotaryEmbedding, SlidingWindowGQA, SwiGLUExpert,
-MOERouter, DroplessMoELayer.
-
-For the falsification tests from the design doc (rare-fact recall,
-write-gate activity monitoring, matched-parameter bigger-Mamba-state null
-hypothesis) see the bottom of this file for the relevant hooks:
-    - HybridDecoderLayer.forward returns per-layer write-gate stats
-    - HybridMambaMoEConfig.use_dual_memory=False gives you the "memory off"
-      ablation for Test 1
-    - Bumping HybridMambaMoEConfig.mamba_state_size while setting
-      use_dual_memory=False gives you the Test 3 null-hypothesis baseline
-      (bigger SSM state, no explicit memory) at roughly matched parameter
-      count -- see the parameter-count helper at the bottom.
+Falsification hooks (design doc §6):
+    - HybridDecoderLayer returns per-layer write-gate stats
+    - use_dual_memory=False for architecture-level memory-off ablation
+    - HybridModel.zero_memory_states() for Test-1 zeroed-at-inference
+    - build_test3_null_baseline_config() for matched-parameter SSM-only null
 """
 
 import json
@@ -44,10 +33,6 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-
-# =============================================================================
-# Shared config (Mixtral baseline)
-# =============================================================================
 
 
 @dataclass
@@ -105,11 +90,6 @@ class MixtralConfig:
         return cls.from_dict(config_dict)
 
 
-# =============================================================================
-# Shared building blocks
-# =============================================================================
-
-
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -129,7 +109,10 @@ class RMSNorm(nn.Module):
 class RotaryEmbedding(nn.Module):
     """
     Cache is allocated once up to `max_position_embeddings` and never
-    re-registered at runtime. If a sequence longer than
+    re-registered at runtime. The previous implementation re-registered
+    `cos_cached`/`sin_cached` via `register_buffer` whenever `seq_len`
+    exceeded the cache, which is not guaranteed to free the old buffer and
+    can bloat/corrupt FSDP state_dicts over time. If a sequence longer than
     `max_position_embeddings` is requested we fail loudly instead of quietly
     growing a mutable buffer underneath FSDP.
     """
@@ -151,6 +134,7 @@ class RotaryEmbedding(nn.Module):
         freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
 
+        # Registered once, fixed size for the lifetime of the module.
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
@@ -196,7 +180,17 @@ def apply_rotary_pos_emb(
 
 
 class SlidingWindowGQA(nn.Module):
-    """Sliding-window grouped-query attention using SDPA only."""
+    """
+    Sliding-window grouped-query attention using SDPA only.
+
+    The flex_attention experimental path was removed: it depended on a
+    module-level global (`_CURRENT_PADDING_MASK`) that is unsafe with FSDP
+    (concurrent forward passes across wrapped layers/ranks can race on it),
+    it indexed the padding mask with block-local `kv_idx` instead of the
+    global sequence index (semantically wrong), and it was unsupported on
+    T4 (compute capability 7.5) in any case -- the previous code even forced
+    `HAS_FLEX = False` unconditionally, so this path was already dead code.
+    """
 
     def __init__(self, config: MixtralConfig) -> None:
         super().__init__()
@@ -282,20 +276,18 @@ class SlidingWindowGQA(nn.Module):
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
-        present_key_value = (key_states, value_states) if use_cache else None
-
         if key_states.size(2) > self.window_size:
             key_states = key_states[:, :, -self.window_size :, :]
             value_states = value_states[:, :, -self.window_size :, :]
-            # BUGFIX: attention_mask (padding mask over the same key/value
-            # sequence) must be truncated the same way, or it ends up a
-            # different length than key_states/value_states below and the
-            # `&` with sliding_causal_mask raises a shape mismatch. This
-            # only shows up once seq_len > window_size with a mask passed
-            # in -- e.g. during generate() on a sequence longer than one
-            # window -- so it was latent in the original code.
+            # Padding mask must match truncated KV length, or the `&` with
+            # sliding_causal_mask raises a shape mismatch once seq_len >
+            # window_size (latent during generate() with a mask present).
             if attention_mask is not None and attention_mask.dim() == 2:
                 attention_mask = attention_mask[:, -self.window_size :]
+
+        # Cache only the sliding window (O(1) in L for decode), not the
+        # full history — RoPE is already baked into cached K.
+        present_key_value = (key_states, value_states) if use_cache else None
 
         kv_seq_len = key_states.size(2)
 
@@ -338,7 +330,11 @@ class SlidingWindowGQA(nn.Module):
 
 
 class SwiGLUExpert(nn.Module):
-    """Standard SwiGLU feed-forward expert."""
+    """Standard SwiGLU feed-forward expert. (The deeper duplicate definition
+    that used to shadow this one -- adding two extra Linear+RMSNorm+SiLU
+    residual blocks per expert -- has been removed; it silently inflated
+    params ~30% and activation memory ~2x with no indication that was
+    intended.)"""
 
     def __init__(self, hidden_size: int, intermediate_size: int) -> None:
         super().__init__()
@@ -373,20 +369,47 @@ class MOERouter(nn.Module):
             x = x.reshape(-1, orig_shape[-1])
 
         input_dtype = x.dtype
+        # IMPORTANT: do NOT cast `x` to float32 before this matmul. Under
+        # FSDP's MixedPrecision(param_dtype=torch.float16), `self.wg.weight`
+        # is fp16 during forward; casting the *input* to fp32 first creates
+        # a genuine fp32-vs-fp16 dtype mismatch that nn.Linear (correctly)
+        # refuses to run ("mat1 and mat2 to have the same dtype"). This
+        # used to be silently papered over by an outer
+        # `torch.amp.autocast(dtype=torch.float16)` in main.py, which
+        # downcast the fp32 tensor back to fp16 right before the linear op
+        # -- but that autocast has been removed as redundant with FSDP's own
+        # MixedPrecision policy, so the router must not depend on it.
+        # Instead: run the linear at its native (weight) dtype, then upcast
+        # the *output* logits to fp32 -- that's what actually needs the
+        # extra precision (clamp / logsumexp / softmax stability), not the
+        # matmul itself.
         logits = self.wg(x).to(torch.float32)
+        # Clamp router logits to prevent FP16 softmax overflow.
         logits = torch.clamp(logits, min=-30.0, max=30.0)
 
+        # Router z-loss: numerically stable logsumexp over the expert dim.
         logsumexp_vals = torch.logsumexp(logits, dim=-1)
         z_loss = torch.mean(logsumexp_vals**2)
 
+        # Full softmax distribution over ALL experts is needed for the
+        # Switch-Transformer-style load-balancing loss (p_i below). Top-k is
+        # only used to select which experts actually process each token.
         full_probs = F.softmax(logits, dim=-1)  # [N, E]
 
         topk_logits, topk_indices = torch.topk(logits, self.top_k, dim=-1)
         topk_weights = F.softmax(topk_logits, dim=-1).to(input_dtype)
 
+        # f_i: fraction of tokens for which expert i is in the top-k set.
         one_hot_indices = F.one_hot(topk_indices, num_classes=self.num_experts).float()
-        f_i = one_hot_indices.sum(dim=1).mean(dim=0)  # [E]
+        f_i = one_hot_indices.sum(dim=1).mean(
+            dim=0
+        )  # [E], mean over tokens of "selected count"
 
+        # p_i: mean router probability assigned to expert i across ALL
+        # tokens (not just top-k weight) -- this is the standard Switch
+        # Transformer formulation. Using only top-k weights (as before)
+        # underweights the probability mass on non-selected experts and
+        # understates load imbalance.
         p_i = full_probs.mean(dim=0)  # [E]
 
         aux_loss = self.num_experts * torch.sum(f_i * p_i)
@@ -395,7 +418,18 @@ class MOERouter(nn.Module):
 
 
 class DroplessMoELayer(nn.Module):
-    """MoE dispatch/combine with optional capacity-limited expert batches."""
+    """
+    MoE dispatch/combine.
+
+    `capacity_factor` (from config) optionally bounds the number of tokens
+    each expert will process to `capacity_factor * num_tokens / num_experts`,
+    dropping (zeroing) overflow tokens for that expert. This is a memory
+    safety valve for T4: with imbalanced routing, a naive dispatch can spike
+    a single expert's batch 2-3x versus the average, which is the difference
+    between fitting in 16GB and OOM. Set `capacity_factor=None` to restore
+    the original fully "dropless" (no token ever skipped) behavior -- note
+    this reintroduces the memory-spike risk under imbalanced routing.
+    """
 
     def __init__(
         self,
@@ -439,6 +473,8 @@ class DroplessMoELayer(nn.Module):
             row_indices, k_indices = torch.where(token_mask)
 
             if capacity is not None and row_indices.numel() > capacity:
+                # Keep first `capacity` tokens in original order; drop the
+                # rest (they simply get no contribution from this expert).
                 row_indices = row_indices[:capacity]
                 k_indices = k_indices[:capacity]
 
@@ -449,11 +485,6 @@ class DroplessMoELayer(nn.Module):
             moe_output.index_add_(0, row_indices, expert_outputs * gating_scale)
 
         return moe_output.view(*orig_shape), aux_loss, z_loss
-
-
-# =============================================================================
-# Mixtral baseline: decoder layer / model / causal LM
-# =============================================================================
 
 
 class MixtralDecoderLayer(nn.Module):
@@ -509,6 +540,16 @@ class MixtralDecoderLayer(nn.Module):
 
 @dataclass
 class MixtralTrainingOutput:
+    """
+    Encapsulates logits, language modeling loss, auxiliary routing losses,
+    and attention state caches for unified training and inference steps.
+
+    NOTE: this used to be defined twice in this file (an earlier, incomplete
+    definition with only `loss`/`router_loss`, and this one). Only this
+    single definition remains; the training loop in main.py relies on
+    `ce_loss`, `router_aux_loss`, and `router_z_loss` all being present.
+    """
+
     logits: Tensor
     loss: Tensor | None = None
     ce_loss: Tensor | None = None
@@ -587,7 +628,9 @@ class MixtralForCausalLM(nn.Module):
         if isinstance(module, nn.Linear):
             std = self.init_range / math.sqrt(2 * self.config.num_layers)
             module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
+            if module.bias is not None and not getattr(
+                module.bias, "_no_reinit", False
+            ):
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.init_range)
@@ -611,9 +654,18 @@ class MixtralForCausalLM(nn.Module):
         )
         logits = self.lm_head(hidden_states)
 
+        # NOTE: `ce_loss` must be initialized before the conditional --
+        # previously it was only assigned inside `if labels is not None`
+        # but was unconditionally referenced when building the output
+        # below, which raised a NameError whenever `labels` was omitted
+        # (e.g. plain inference/generation calls).
         loss = None
         ce_loss = None
         if labels is not None:
+            # `labels` are expected to ALREADY be the next-token shift of
+            # `input_ids` (i.e. labels[i] is the target for logits[i]),
+            # matching the (chunk[:-1], chunk[1:]) contract produced by
+            # MmapShardDataset. Do NOT shift again here.
             loss_fct = nn.CrossEntropyLoss()
             ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
 
@@ -635,7 +687,7 @@ class MixtralForCausalLM(nn.Module):
 
 
 # =============================================================================
-# NEW: Hybrid Mamba-MoE with Dual Memory (v2.0)
+# Hybrid Mamba–MoE with Dual Memory
 # =============================================================================
 
 
@@ -643,44 +695,30 @@ class MixtralForCausalLM(nn.Module):
 class HybridMambaMoEConfig(MixtralConfig):
     """
     Extends MixtralConfig with Mamba-branch and memory-branch settings.
-    All Mixtral fields (hidden_size, num_heads, window_size, num_experts,
-    top_k, etc.) are reused unchanged for the GQA and MoE parts of each
-    layer.
+    All Mixtral fields are reused for the GQA and MoE parts of each layer.
     """
 
-    # --- Mamba (selective SSM) branch ---
-    mamba_state_size: int = 16  # n: SSM state dimension per inner channel
-    mamba_conv_kernel: int = 4  # causal depthwise conv kernel width
-    mamba_expand: int = 2  # d_inner = mamba_expand * hidden_size
-    mamba_dt_rank: int | None = None  # defaults to ceil(hidden_size / 16) if None
+    mamba_state_size: int = 16
+    mamba_conv_kernel: int = 4
+    mamba_expand: int = 2
+    mamba_dt_rank: int | None = None
 
-    # --- Dual memory branch ---
-    use_dual_memory: bool = (
-        True  # set False for the "memory off" / "SSM-only" ablations
-    )
-    memory_size: int = 64  # m: fixed number of memory slots (bounded, != L)
-    memory_num_heads: int = 8  # heads used for memory read/write cross-attention
+    use_dual_memory: bool = True
+    memory_size: int = 64
+    memory_num_heads: int = 8
 
-    def __post_init__(self):
-        # dataclass inheritance note: MixtralConfig has no __post_init__, so
-        # this is safe to define here without calling super().
-        pass
+
+MambaCache = tuple[Tensor, Tensor]  # (conv_state, ssm_state)
 
 
 class MambaBlock(nn.Module):
     """
-    Selective State Space Model block (Mamba / S6), reference sequential-scan
-    implementation. This trades throughput for correctness/portability: no
-    custom CUDA kernel dependency, works on any device SDPA works on
-    (including T4). Swap in an optimized selective-scan kernel later without
-    changing the surrounding architecture.
+    Selective SSM (Mamba / S6) in pure PyTorch.
 
-    NOTE on caching: this implementation does not yet expose an incremental
-    (conv_state, ssm_state) cache for step-by-step autoregressive generation
-    the way SlidingWindowGQA exposes past_key_value -- it always scans the
-    full sequence passed to forward(). Fine for training and for the
-    falsification-test evaluations (which process fixed chunks), not yet
-    wired for token-by-token generation.
+    Prefill/training uses a parallel associative scan (no per-token Python
+    loop). Autoregressive decode uses allocate_inference_cache() + step()
+    with (conv_state, ssm_state), matching the official mamba_ssm API shape.
+    No custom CUDA dependency — runs on any SDPA-capable device.
     """
 
     def __init__(
@@ -699,7 +737,6 @@ class MambaBlock(nn.Module):
         self.dt_rank = dt_rank if dt_rank is not None else math.ceil(hidden_size / 16)
 
         self.in_proj = nn.Linear(hidden_size, 2 * self.d_inner, bias=False)
-
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
@@ -708,120 +745,220 @@ class MambaBlock(nn.Module):
             padding=conv_kernel - 1,
             bias=True,
         )
-
-        # Produces per-token, input-dependent (dt, B, C) -- the "selective"
-        # part of selective SSM: the model can choose, per token, how much
-        # to write into / read from state.
         self.x_proj = nn.Linear(self.d_inner, self.dt_rank + 2 * state_size, bias=False)
         self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
 
-        # A is initialized structured (HiPPO-like: -1..-state_size per
-        # channel) and kept negative via log-parameterization + negation,
-        # standard Mamba init.
+        # Softplus(dt_bias) ~ Uniform[dt_min, dt_max] at init (official Mamba).
+        # Marked _no_reinit so HybridForCausalLM._init_weights does not zero it.
+        dt_min, dt_max, dt_init_floor = 0.001, 0.1, 1e-4
+        dt = torch.exp(
+            torch.rand(self.d_inner) * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True  # type: ignore[attr-defined]
+
         A = torch.arange(1, state_size + 1, dtype=torch.float32).repeat(self.d_inner, 1)
         self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True  # type: ignore[attr-defined]
         self.D = nn.Parameter(torch.ones(self.d_inner))
-
+        self.D._no_weight_decay = True  # type: ignore[attr-defined]
         self.out_proj = nn.Linear(self.d_inner, hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, L, hidden_size]
+    def allocate_inference_cache(
+        self,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype | None = None,
+    ) -> MambaCache:
+        conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
+        ssm_dtype = torch.float32
+        conv_state = torch.zeros(
+            batch_size,
+            self.d_inner,
+            self.conv_kernel,
+            device=device,
+            dtype=conv_dtype,
+        )
+        ssm_state = torch.zeros(
+            batch_size,
+            self.d_inner,
+            self.state_size,
+            device=device,
+            dtype=ssm_dtype,
+        )
+        return conv_state, ssm_state
+
+    def forward(
+        self,
+        x: Tensor,
+        cache: MambaCache | None = None,
+        use_cache: bool = False,
+    ) -> tuple[Tensor, MambaCache | None]:
+        """
+        x: [B, L, hidden_size]
+        If use_cache and L==1 and cache is provided, runs a single decode step.
+        Otherwise runs full-sequence prefill (parallel scan); when use_cache,
+        returns updated (conv_state, ssm_state) for subsequent steps.
+        """
         _, seq_len, _ = x.shape
 
-        xz = self.in_proj(x)  # [B, L, 2*d_inner]
+        if use_cache and cache is not None and seq_len == 1:
+            return self.step(x, cache[0], cache[1])
+
+        xz = self.in_proj(x)
         x_in, z = xz.chunk(2, dim=-1)
 
-        x_in = x_in.transpose(1, 2)  # [B, d_inner, L]
-        x_in = self.conv1d(x_in)[..., :seq_len]  # causal conv, trim padding tail
-        x_in = F.silu(x_in)
-        x_in = x_in.transpose(1, 2)  # [B, L, d_inner]
+        x_conv = x_in.transpose(1, 2)
+        if use_cache:
+            # Keep last conv_kernel tokens as the rolling conv buffer.
+            pad = max(self.conv_kernel - seq_len, 0)
+            conv_state = F.pad(x_conv, (pad, 0))[:, :, -self.conv_kernel :].contiguous()
+        else:
+            conv_state = None
 
-        x_dbl = self.x_proj(x_in)  # [B, L, dt_rank + 2*state_size]
+        x_conv = self.conv1d(x_conv)[..., :seq_len]
+        x_conv = F.silu(x_conv).transpose(1, 2)
+
+        x_dbl = self.x_proj(x_conv)
         dt, B_param, C_param = torch.split(
             x_dbl, [self.dt_rank, self.state_size, self.state_size], dim=-1
         )
-        dt = F.softplus(
-            self.dt_proj(dt)
-        )  # [B, L, d_inner], strictly positive step size
+        dt = F.softplus(self.dt_proj(dt))
 
-        A = -torch.exp(
-            self.A_log.float()
-        )  # [d_inner, state_size], strictly negative -> stable
-
-        y = self._selective_scan(x_in, dt, A, B_param, C_param, self.D)
-
+        A = -torch.exp(self.A_log.float())
+        y, ssm_state = self._selective_scan(
+            x_conv, dt, A, B_param, C_param, self.D, return_final_state=use_cache
+        )
         y = y * F.silu(z)
-        return self.out_proj(y)
+        out = self.out_proj(y)
+
+        new_cache: MambaCache | None = None
+        if use_cache:
+            assert conv_state is not None and ssm_state is not None
+            new_cache = (conv_state, ssm_state)
+        return out, new_cache
+
+    def step(
+        self, x: Tensor, conv_state: Tensor, ssm_state: Tensor
+    ) -> tuple[Tensor, MambaCache]:
+        """Single-token decode. x: [B, 1, hidden_size]."""
+        assert x.size(1) == 1
+        dtype = x.dtype
+
+        xz = self.in_proj(x.squeeze(1))
+        x_in, z = xz.chunk(2, dim=-1)
+
+        # Roll causal-conv buffer and insert the new token.
+        conv_state = conv_state.roll(shifts=-1, dims=-1)
+        conv_state[:, :, -1] = x_in
+        x_conv = torch.sum(conv_state * self.conv1d.weight.squeeze(1), dim=-1)
+        if self.conv1d.bias is not None:
+            x_conv = x_conv + self.conv1d.bias
+        x_conv = F.silu(x_conv).to(dtype=dtype)
+
+        x_dbl = self.x_proj(x_conv)
+        dt, B_param, C_param = torch.split(
+            x_dbl, [self.dt_rank, self.state_size, self.state_size], dim=-1
+        )
+        dt = F.softplus(self.dt_proj(dt))
+
+        A = -torch.exp(self.A_log.float())
+        dt_f = dt.float()
+        dA = torch.exp(dt_f.unsqueeze(-1) * A)  # [B, d_inner, n]
+        dB_u = (
+            dt_f.unsqueeze(-1)
+            * B_param.float().unsqueeze(1)
+            * x_conv.float().unsqueeze(-1)
+        )
+        ssm_state = ssm_state.float() * dA + dB_u
+        y = (ssm_state * C_param.float().unsqueeze(1)).sum(dim=-1)
+        y = (y + x_conv.float() * self.D.float()).to(dtype)
+        y = y * F.silu(z)
+        out = self.out_proj(y).unsqueeze(1)
+        return out, (conv_state, ssm_state)
 
     @staticmethod
+    def _parallel_associative_scan(delta_a: Tensor, delta_b_u: Tensor) -> Tensor:
+        """
+        Inclusive parallel scan for h_t = delta_a_t * h_{t-1} + delta_b_u_t
+        with h_{-1} = 0.
+
+        delta_a, delta_b_u: [B, L, D, N] -> h: [B, L, D, N]
+
+        Uses doubling (Blelloch-style) with out-of-place updates so autograd
+        stays correct — no per-token Python loop over L.
+        """
+        seq_len = delta_a.size(1)
+        a = delta_a
+        b = delta_b_u
+        n = 1
+        while n < seq_len:
+            a_prev = a[:, :-n]
+            b_prev = b[:, :-n]
+            a_curr = a[:, n:]
+            b_curr = b[:, n:]
+            a = torch.cat([a[:, :n], a_curr * a_prev], dim=1)
+            b = torch.cat([b[:, :n], a_curr * b_prev + b_curr], dim=1)
+            n *= 2
+        return b
+
+    @classmethod
     def _selective_scan(
-        u: torch.Tensor,  # [B, L, d_inner]
-        dt: torch.Tensor,  # [B, L, d_inner]
-        A: torch.Tensor,  # [d_inner, n]
-        B: torch.Tensor,  # [B, L, n]
-        C: torch.Tensor,  # [B, L, n]
-        D: torch.Tensor,  # [d_inner]
-    ) -> torch.Tensor:
+        cls,
+        u: Tensor,
+        dt: Tensor,
+        A: Tensor,
+        B: Tensor,
+        C: Tensor,
+        D: Tensor,
+        return_final_state: bool = False,
+    ) -> tuple[Tensor, Tensor | None]:
         """
-        Naive sequential scan, O(L) time / O(1) extra memory per step (state
-        is [B, d_inner, n], reused in place across the loop). This is the
-        textbook-correct but unfused implementation -- prioritizes being
-        obviously correct over throughput. For long sequences on a single
-        T4 this will be the training-speed bottleneck; that's a known,
-        expected tradeoff of skipping the custom CUDA kernel, not a bug.
+        u, dt: [B, L, d_inner]; A: [d_inner, n]; B, C: [B, L, n]; D: [d_inner]
         """
-        batch_size, seq_len, d_inner = u.shape
-        n = A.shape[1]
+        input_dtype = u.dtype
+        u_f = u.float()
+        dt_f = dt.float()
+        B_f = B.float()
+        C_f = C.float()
 
-        # Discretize: deltaA = exp(dt * A), per (batch, time, channel, state)
-        deltaA = torch.exp(dt.unsqueeze(-1) * A)  # [B, L, d_inner, n]
-        deltaB_u = (
-            dt.unsqueeze(-1) * B.unsqueeze(2) * u.unsqueeze(-1)
-        )  # [B, L, d_inner, n]
+        delta_a = torch.exp(dt_f.unsqueeze(-1) * A)  # [B, L, d_inner, n]
+        delta_b_u = dt_f.unsqueeze(-1) * B_f.unsqueeze(2) * u_f.unsqueeze(-1)
 
-        state = torch.zeros(batch_size, d_inner, n, device=u.device, dtype=deltaA.dtype)
-        ys = []
-        for t in range(seq_len):
-            state = deltaA[:, t] * state + deltaB_u[:, t]
-            y_t = (state * C[:, t].unsqueeze(1)).sum(dim=-1)  # [B, d_inner]
-            ys.append(y_t)
-
-        y = torch.stack(ys, dim=1).to(u.dtype)  # [B, L, d_inner]
-        y = y + u * D
-        return y
+        states = cls._parallel_associative_scan(delta_a, delta_b_u)
+        y = (states * C_f.unsqueeze(2)).sum(dim=-1)
+        y = y + u_f * D.float()
+        final_state = states[:, -1].contiguous() if return_final_state else None
+        return y.to(input_dtype), final_state
 
 
 class CompressiveMemoryBank(nn.Module):
     """
-    Fixed-size (m slots), gated read/write memory bank -- see design doc
-    v2.0, "Compressive Memory Banks" section. This is the actual mechanism;
-    v1.0's `attention_memory` / `state_memory` were static nn.Parameter
-    vectors with no read/write dynamics at all.
+    Fixed-size (m slots) gated read/write memory bank.
 
-    - read(x, memory): x (length L) attends to memory (length m) as K/V.
-      Cost O(L * m), linear in L since m is fixed.
-    - write(x, memory): a fixed set of m learned summary queries attend to x
-      (length L) as K/V to compress it down to m vectors, then a GRU-style
-      gate blends that summary into the existing memory. Cost O(L * m).
+    - read: tokens attend to memory as K/V — O(L * m)
+    - write: learned summary queries compress the chunk, GRU-style gate
+      blends into existing memory — O(L * m)
 
-    Memory state is NOT a module buffer -- it's threaded explicitly through
-    forward() calls by the caller (HybridModel), the same way KV-cache is
-    threaded through past_key_value. This makes it trivial to: reset memory
-    between independent sequences, persist it across chunks of one long
-    sequence, or zero it out for the Test 1 "memory off" falsification run.
+    Memory is threaded through forward by the caller (not a module buffer).
     """
 
     def __init__(
         self, hidden_size: int, memory_size: int = 64, num_heads: int = 8
     ) -> None:
         super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by memory_num_heads ({num_heads})."
+            )
         self.hidden_size = hidden_size
         self.memory_size = memory_size
 
         self.init_memory = nn.Parameter(torch.randn(memory_size, hidden_size) * 0.02)
-
         self.read_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-
         self.summary_query = nn.Parameter(torch.randn(memory_size, hidden_size) * 0.02)
         self.write_attn = nn.MultiheadAttention(
             hidden_size, num_heads, batch_first=True
@@ -831,7 +968,7 @@ class CompressiveMemoryBank(nn.Module):
 
     def init_state(
         self, batch_size: int, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
+    ) -> Tensor:
         return (
             self.init_memory.unsqueeze(0)
             .expand(batch_size, -1, -1)
@@ -839,63 +976,74 @@ class CompressiveMemoryBank(nn.Module):
             .clone()
         )
 
-    def read(self, x: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
-        # x: [B, L, d] as query, memory: [B, m, d] as key/value -> O(L*m)
+    @staticmethod
+    def _key_padding_mask(attention_mask: Tensor | None) -> Tensor | None:
+        """Convert 1=keep / 0=pad mask to MultiheadAttention key_padding_mask."""
+        if attention_mask is None:
+            return None
+        if attention_mask.dim() != 2:
+            raise ValueError(
+                "CompressiveMemoryBank expects a 2D attention_mask [B, L]."
+            )
+        # True = ignore that key position.
+        return ~attention_mask.bool()
+
+    def read(
+        self,
+        x: Tensor,
+        memory: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        # Queries are sequence tokens; memory slots are never padded.
+        del attention_mask  # read attends to fixed memory slots, not sequence keys
         out, _ = self.read_attn(x, memory, memory, need_weights=False)
         return out
 
     def write(
-        self, x: torch.Tensor, memory: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        # Compress x (length L) down to m summary vectors via learned queries.
+        self,
+        x: Tensor,
+        memory: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         batch_size = x.size(0)
         query = self.summary_query.unsqueeze(0).expand(batch_size, -1, -1)
-        chunk_summary, _ = self.write_attn(query, x, x, need_weights=False)  # [B, m, d]
+        kpm = self._key_padding_mask(attention_mask)
+        chunk_summary, _ = self.write_attn(
+            query, x, x, key_padding_mask=kpm, need_weights=False
+        )
 
         gate = torch.sigmoid(
             self.write_gate(torch.cat([memory, chunk_summary], dim=-1))
         )
         new_memory = gate * memory + (1.0 - gate) * self.write_update(chunk_summary)
-
-        # gate returned for Test 2 (write-gate activity monitoring): values
-        # saturating near 0 or 1 across training indicate the memory is
-        # either never updating or never persisting.
         return new_memory, gate
 
 
 class TokenGatedFusion(nn.Module):
-    """
-    O(L) per-token fusion of the attention-branch and Mamba-branch outputs.
-    Replaces v1.0's bidirectional nn.MultiheadAttention cross-fusion, which
-    cost O(L^2) and was run twice (redundant weights) for no benefit: both
-    branches already produce per-position, aligned outputs, so mixing them
-    is a local operation and doesn't need cross-sequence attention.
-    """
+    """O(L) per-token fusion of attention-branch and Mamba-branch outputs."""
 
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
         self.gate = nn.Linear(hidden_size * 2, hidden_size)
 
-    def forward(
-        self, a: torch.Tensor, m: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, a: Tensor, m: Tensor) -> tuple[Tensor, Tensor]:
         g = torch.sigmoid(self.gate(torch.cat([a, m], dim=-1)))
         fused = g * a + (1.0 - g) * m
         return fused, g
 
 
-HybridMemoryState = tuple[
-    torch.Tensor, torch.Tensor
-]  # (attn_memory, state_memory), each [B, m, d]
+HybridMemoryState = tuple[Tensor, Tensor]
 
 
 class HybridDecoderLayer(nn.Module):
     """
-    One layer of the v2.0 architecture:
-        RMSNorm -> {SlidingWindowGQA, MambaBlock} (parallel)
-                -> optional memory read/write per branch
-                -> TokenGatedFusion
-                -> residual add -> RMSNorm -> Top-2 MoE -> residual add
+    RMSNorm -> memory-conditioned {GQA, Mamba} in parallel -> write raw
+    branch outputs to memory banks -> TokenGatedFusion -> residual ->
+    RMSNorm -> Top-2 MoE -> residual.
+
+    Matches research.md §3.2: banks are read *into* each branch (via an
+    input combine on the shared normed states), and raw branch outputs
+    write back — not the memory-augmented tensors.
     """
 
     def __init__(self, config: HybridMambaMoEConfig) -> None:
@@ -903,7 +1051,6 @@ class HybridDecoderLayer(nn.Module):
         self.use_dual_memory = config.use_dual_memory
 
         self.rmsnorm_in = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
         self.attention_block = SlidingWindowGQA(config)
         self.mamba_block = MambaBlock(
             hidden_size=config.hidden_size,
@@ -920,9 +1067,8 @@ class HybridDecoderLayer(nn.Module):
             self.state_memory_bank = CompressiveMemoryBank(
                 config.hidden_size, config.memory_size, config.memory_num_heads
             )
-            # Combine branch output with its memory read (concat + project,
-            # rather than overwrite) so the branch can learn how much to
-            # rely on memory vs. its own local computation.
+            # Condition each branch's *input* with a memory read (diagram:
+            # AM/SM -.read.-> GQA/Mamba), rather than mixing after the branch.
             self.attn_memory_combine = nn.Linear(
                 config.hidden_size * 2, config.hidden_size
             )
@@ -931,7 +1077,6 @@ class HybridDecoderLayer(nn.Module):
             )
 
         self.fusion = TokenGatedFusion(config.hidden_size)
-
         self.rmsnorm_moe = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         router = MOERouter(
             hidden_size=config.hidden_size,
@@ -958,57 +1103,95 @@ class HybridDecoderLayer(nn.Module):
             self.state_memory_bank.init_state(batch_size, device, dtype),
         )
 
+    def allocate_mamba_cache(
+        self, batch_size: int, device: torch.device, dtype: torch.dtype
+    ) -> MambaCache:
+        return self.mamba_block.allocate_inference_cache(batch_size, device, dtype)
+
+    def zero_memory_state(
+        self, batch_size: int, device: torch.device, dtype: torch.dtype
+    ) -> HybridMemoryState | None:
+        """Test-1 hook: same shapes as init_state, but all zeros."""
+        state = self.init_memory_state(batch_size, device, dtype)
+        if state is None:
+            return None
+        return tuple(torch.zeros_like(t) for t in state)  # type: ignore[return-value]
+
     def forward(
         self,
-        x: torch.Tensor,
+        x: Tensor,
         memory_state: HybridMemoryState | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
-        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        attention_mask: Tensor | None = None,
+        position_ids: Tensor | None = None,
+        past_key_value: tuple[Tensor, Tensor] | None = None,
+        mamba_cache: MambaCache | None = None,
         use_cache: bool = False,
     ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        tuple[torch.Tensor, torch.Tensor] | None,
+        Tensor,
+        Tensor,
+        Tensor,
+        tuple[Tensor, Tensor] | None,
         HybridMemoryState | None,
-        dict[str, torch.Tensor],
+        MambaCache | None,
+        dict[str, Tensor],
     ]:
         residual = x
         x_norm = self.rmsnorm_in(x)
+        seq_len = x.size(1)
 
-        attn_out, present_key_value = self.attention_block(
-            x_norm,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-        )
-        mamba_out = self.mamba_block(x_norm)
+        # Memory R/W keys are the current chunk tokens [B, seq_len]; GQA may
+        # receive a longer window-aligned padding mask during cached decode.
+        token_attention_mask: Tensor | None = None
+        if attention_mask is not None and attention_mask.dim() == 2:
+            if attention_mask.size(1) < seq_len:
+                raise ValueError(
+                    f"attention_mask length {attention_mask.size(1)} < seq_len {seq_len}."
+                )
+            token_attention_mask = attention_mask[:, -seq_len:]
 
         new_memory_state = memory_state
-        gate_stats: dict[str, torch.Tensor] = {}
+        gate_stats: dict[str, Tensor] = {}
+        attn_input = x_norm
+        mamba_input = x_norm
 
         if self.use_dual_memory:
             if memory_state is None:
                 memory_state = self.init_memory_state(x.size(0), x.device, x.dtype)
             a_mem, s_mem = memory_state
 
-            a_read = self.attn_memory_bank.read(attn_out, a_mem)
-            attn_out = self.attn_memory_combine(torch.cat([attn_out, a_read], dim=-1))
-
-            s_read = self.state_memory_bank.read(mamba_out, s_mem)
-            mamba_out = self.state_memory_combine(
-                torch.cat([mamba_out, s_read], dim=-1)
+            # Read memory *into* each branch (condition inputs before GQA/Mamba).
+            a_read = self.attn_memory_bank.read(
+                x_norm, a_mem, attention_mask=token_attention_mask
             )
+            attn_input = self.attn_memory_combine(torch.cat([x_norm, a_read], dim=-1))
 
-            new_a_mem, a_write_gate = self.attn_memory_bank.write(attn_out, a_mem)
-            new_s_mem, s_write_gate = self.state_memory_bank.write(mamba_out, s_mem)
+            s_read = self.state_memory_bank.read(
+                x_norm, s_mem, attention_mask=token_attention_mask
+            )
+            mamba_input = self.state_memory_combine(torch.cat([x_norm, s_read], dim=-1))
+
+        attn_out, present_key_value = self.attention_block(
+            attn_input,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+        )
+        mamba_out, new_mamba_cache = self.mamba_block(
+            mamba_input, cache=mamba_cache, use_cache=use_cache
+        )
+
+        if self.use_dual_memory:
+            assert memory_state is not None
+            a_mem, s_mem = memory_state
+            # Write *raw* branch outputs (research E/F), not memory-mixed tensors.
+            new_a_mem, a_write_gate = self.attn_memory_bank.write(
+                attn_out, a_mem, attention_mask=token_attention_mask
+            )
+            new_s_mem, s_write_gate = self.state_memory_bank.write(
+                mamba_out, s_mem, attention_mask=token_attention_mask
+            )
             new_memory_state = (new_a_mem, new_s_mem)
-
-            # Detached scalars for logging (Test 2) -- mean write-gate value
-            # per bank. Gate saturating near 0 or 1 across training is the
-            # signal memory isn't functioning as intended.
             gate_stats = {
                 "attn_write_gate_mean": a_write_gate.detach().mean(),
                 "state_write_gate_mean": s_write_gate.detach().mean(),
@@ -1020,11 +1203,18 @@ class HybridDecoderLayer(nn.Module):
         moe_out, aux_loss, z_loss = self.moe_block(self.rmsnorm_moe(x))
         x_out = x + moe_out
 
-        return x_out, aux_loss, z_loss, present_key_value, new_memory_state, gate_stats
+        return (
+            x_out,
+            aux_loss,
+            z_loss,
+            present_key_value,
+            new_memory_state,
+            new_mamba_cache,
+            gate_stats,
+        )
 
 
 def _top_k_filter(logits: Tensor, top_k: int) -> Tensor:
-    """Keep only the top_k highest-logit tokens per row, -inf out the rest."""
     top_k = min(top_k, logits.size(-1))
     values, _ = torch.topk(logits, top_k, dim=-1)
     min_values = values[:, -1].unsqueeze(-1)
@@ -1034,12 +1224,10 @@ def _top_k_filter(logits: Tensor, top_k: int) -> Tensor:
 
 
 def _top_p_filter(logits: Tensor, top_p: float) -> Tensor:
-    """Nucleus filtering: keep smallest set of tokens whose cumulative prob >= top_p."""
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
     cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
 
     sorted_mask = cumulative_probs > top_p
-    # shift right so we always keep at least the single highest-prob token
     sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
     sorted_mask[..., 0] = False
 
@@ -1055,50 +1243,85 @@ class HybridTrainingOutput:
     router_aux_loss: Tensor | None = None
     router_z_loss: Tensor | None = None
     past_key_values: list[tuple[Tensor, Tensor]] | None = None
-    # Threaded memory state, one (attn_mem, state_mem) tuple per layer (or
-    # None per layer if that layer has use_dual_memory=False). Pass this
-    # back in as `memory_states` on the next forward() call to persist
-    # memory across chunks of a long sequence -- this is what makes the
-    # memory bank behave like a KV-cache-style running state rather than
-    # something reset every forward pass.
     memory_states: list[HybridMemoryState | None] | None = None
-    # Per-layer write-gate means, for Test 2 monitoring. Keys are
-    # "layer_{i}_attn_write_gate_mean" / "layer_{i}_state_write_gate_mean".
+    mamba_caches: list[MambaCache | None] | None = None
     gate_stats: dict[str, Tensor] | None = None
 
 
 class HybridModel(nn.Module):
     def __init__(self, config: HybridMambaMoEConfig) -> None:
         super().__init__()
+        self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [HybridDecoderLayer(config) for _ in range(config.num_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def allocate_mamba_caches(
+        self, batch_size: int, device: torch.device, dtype: torch.dtype
+    ) -> list[MambaCache]:
+        return [
+            layer.allocate_mamba_cache(batch_size, device, dtype)
+            for layer in self.layers
+        ]
+
+    def init_memory_states(
+        self, batch_size: int, device: torch.device, dtype: torch.dtype
+    ) -> list[HybridMemoryState | None]:
+        return [
+            layer.init_memory_state(batch_size, device, dtype) for layer in self.layers
+        ]
+
+    def zero_memory_states(
+        self, batch_size: int, device: torch.device, dtype: torch.dtype
+    ) -> list[HybridMemoryState | None]:
+        """Test-1: keep memory modules, but start from all-zero banks."""
+        return [
+            layer.zero_memory_state(batch_size, device, dtype) for layer in self.layers
+        ]
+
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Tensor,
         memory_states: list[HybridMemoryState | None] | None = None,
-        attention_mask: torch.Tensor | None = None,
-        position_ids: torch.Tensor | None = None,
+        attention_mask: Tensor | None = None,
+        position_ids: Tensor | None = None,
         past_key_values: list | None = None,
+        mamba_caches: list[MambaCache | None] | None = None,
+        past_seen_tokens: int | None = None,
         use_cache: bool = False,
     ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
+        Tensor,
+        Tensor,
+        Tensor,
         list | None,
         list[HybridMemoryState | None],
-        dict[str, torch.Tensor],
+        list[MambaCache | None] | None,
+        dict[str, Tensor],
     ]:
         hidden_states = self.embed_tokens(input_ids)
-        seq_len = hidden_states.size(1)
+        batch_size, seq_len = hidden_states.shape[:2]
 
         if position_ids is None:
-            position_ids = torch.arange(
-                seq_len, dtype=torch.long, device=hidden_states.device
-            ).unsqueeze(0)
+            # Absolute positions must track tokens *seen*, not truncated KV length.
+            if past_seen_tokens is None:
+                past_seen_tokens = 0
+            position_ids = (
+                (
+                    torch.arange(seq_len, dtype=torch.long, device=hidden_states.device)
+                    + past_seen_tokens
+                )
+                .unsqueeze(0)
+                .expand(batch_size, -1)
+            )
+
+        max_pos = int(position_ids.max().item()) if position_ids.numel() else -1
+        if max_pos >= self.config.max_position_embeddings:
+            raise ValueError(
+                f"position_ids max={max_pos} exceeds "
+                f"max_position_embeddings={self.config.max_position_embeddings}."
+            )
 
         total_aux_loss = torch.tensor(
             0.0, device=hidden_states.device, dtype=hidden_states.dtype
@@ -1108,11 +1331,13 @@ class HybridModel(nn.Module):
         )
         present_key_values = [] if use_cache else None
         new_memory_states: list[HybridMemoryState | None] = []
-        all_gate_stats: dict[str, torch.Tensor] = {}
+        new_mamba_caches: list[MambaCache | None] | None = [] if use_cache else None
+        all_gate_stats: dict[str, Tensor] = {}
 
         for i, layer in enumerate(self.layers):
             layer_past_kv = past_key_values[i] if past_key_values is not None else None
-            layer_memory_state = memory_states[i] if memory_states is not None else None
+            layer_memory = memory_states[i] if memory_states is not None else None
+            layer_mamba = mamba_caches[i] if mamba_caches is not None else None
 
             (
                 hidden_states,
@@ -1120,24 +1345,25 @@ class HybridModel(nn.Module):
                 layer_z_loss,
                 present_kv,
                 layer_new_memory,
+                layer_new_mamba,
                 layer_gate_stats,
             ) = layer(
                 hidden_states,
-                memory_state=layer_memory_state,
+                memory_state=layer_memory,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_value=layer_past_kv,
+                mamba_cache=layer_mamba,
                 use_cache=use_cache,
             )
             total_aux_loss = total_aux_loss + layer_aux_loss
             total_z_loss = total_z_loss + layer_z_loss
             new_memory_states.append(layer_new_memory)
-
             for k, v in layer_gate_stats.items():
                 all_gate_stats[f"layer_{i}_{k}"] = v
-
             if use_cache:
                 present_key_values.append(present_kv)
+                new_mamba_caches.append(layer_new_mamba)
 
         hidden_states = self.norm(hidden_states)
         return (
@@ -1146,6 +1372,7 @@ class HybridModel(nn.Module):
             total_z_loss,
             present_key_values,
             new_memory_states,
+            new_mamba_caches,
             all_gate_stats,
         )
 
@@ -1167,7 +1394,9 @@ class HybridForCausalLM(nn.Module):
         if isinstance(module, nn.Linear):
             std = self.init_range / math.sqrt(2 * self.config.num_layers)
             module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
+            if module.bias is not None and not getattr(
+                module.bias, "_no_reinit", False
+            ):
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.init_range)
@@ -1179,16 +1408,18 @@ class HybridForCausalLM(nn.Module):
         attention_mask: Tensor | None = None,
         position_ids: Tensor | None = None,
         past_key_values: list | None = None,
+        mamba_caches: list[MambaCache | None] | None = None,
+        past_seen_tokens: int | None = None,
         use_cache: bool = False,
         labels: Tensor | None = None,
     ) -> HybridTrainingOutput:
-
         (
             hidden_states,
             aux_loss,
             z_loss,
             present_key_values,
             new_memory_states,
+            new_mamba_caches,
             gate_stats,
         ) = self.model(
             input_ids=input_ids,
@@ -1196,6 +1427,8 @@ class HybridForCausalLM(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            mamba_caches=mamba_caches,
+            past_seen_tokens=past_seen_tokens,
             use_cache=use_cache,
         )
         logits = self.lm_head(hidden_states)
@@ -1203,9 +1436,6 @@ class HybridForCausalLM(nn.Module):
         loss = None
         ce_loss = None
         if labels is not None:
-            # labels are expected to already be the next-token shift of
-            # input_ids, matching the (chunk[:-1], chunk[1:]) contract from
-            # the Mixtral baseline's data pipeline. Do NOT shift again here.
             loss_fct = nn.CrossEntropyLoss()
             ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
             loss = (
@@ -1222,6 +1452,7 @@ class HybridForCausalLM(nn.Module):
             router_z_loss=z_loss,
             past_key_values=present_key_values,
             memory_states=new_memory_states,
+            mamba_caches=new_mamba_caches,
             gate_stats=gate_stats,
         )
 
@@ -1238,41 +1469,9 @@ class HybridForCausalLM(nn.Module):
         attention_mask: Tensor | None = None,
     ) -> Tensor:
         """
-        Simple autoregressive generation for interactive use (chat interface,
-        qualitative eval, etc.).
-
-        CACHING LIMITATION (read before using this for anything
-        latency-sensitive): MambaBlock does not yet expose an incremental
-        (conv_state, ssm_state) cache -- see its docstring. Because of that,
-        this method re-runs the FULL forward pass over the entire sequence
-        generated so far at every single step, instead of reusing
-        past_key_value / memory_states incrementally the way a
-        transformer-only model normally would during generation. That makes
-        total generation cost O(L^2) in the final sequence length rather than
-        O(L). It is correct, just not efficient -- fine for research-loop
-        generation checks and demos, not for production serving. If you need
-        fast interactive generation, the next step is adding incremental
-        Mamba state caching (conv buffer + SSM state per layer) and threading
-        it through the same way `past_key_value` is threaded through
-        SlidingWindowGQA today.
-
-        Args:
-            input_ids: [B, L_prompt] prompt token ids.
-            max_new_tokens: number of tokens to generate after the prompt.
-            temperature: softmax temperature; lower = more deterministic.
-            top_k: if set, restrict sampling to the top_k highest-logit tokens.
-            top_p: if set, restrict sampling to the smallest nucleus with
-                cumulative probability >= top_p (applied after top_k, if both given).
-            do_sample: if False, use greedy argmax decoding (temperature/top_k/
-                top_p are ignored).
-            eos_token_id: stop generating (per-sequence) once this token is
-                produced. Defaults to config.eos_token_id.
-            attention_mask: [B, L_prompt] optional padding mask matching input_ids.
-
-        Returns:
-            Tensor [B, L_prompt + up_to_max_new_tokens] of generated token ids.
-            Sequences that hit eos early are padded with eos_token_id for the
-            remaining steps so the batch stays a single rectangular tensor.
+        Autoregressive generation with incremental KV + Mamba + memory caches.
+        Total cost is O(L) in the final sequence length (one prefill + L_new
+        single-token steps), not O(L^2) full re-forwards.
         """
         was_training = self.training
         self.eval()
@@ -1287,28 +1486,44 @@ class HybridForCausalLM(nn.Module):
             attention_mask = torch.ones_like(generated)
 
         finished = torch.zeros(generated.size(0), dtype=torch.bool, device=device)
+        batch_size = generated.size(0)
+
+        prompt_len = generated.size(1)
+        if prompt_len > self.config.max_position_embeddings:
+            raise ValueError(
+                f"Prompt length {prompt_len} exceeds "
+                f"max_position_embeddings={self.config.max_position_embeddings}."
+            )
+        if prompt_len + max_new_tokens > self.config.max_position_embeddings:
+            raise ValueError(
+                f"prompt_len+max_new_tokens="
+                f"{prompt_len + max_new_tokens} exceeds "
+                f"max_position_embeddings={self.config.max_position_embeddings}."
+            )
+
+        position_ids = (
+            torch.arange(prompt_len, dtype=torch.long, device=device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
+
+        out = self.forward(
+            input_ids=generated,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_seen_tokens=0,
+            use_cache=True,
+        )
+        past_key_values = out.past_key_values
+        memory_states = out.memory_states
+        mamba_caches = out.mamba_caches
+        past_seen_tokens = prompt_len
 
         try:
-            for _ in range(max_new_tokens):
-                seq_len = generated.size(1)
-                if seq_len > self.config.max_position_embeddings:
-                    # Keep only the most recent window so RotaryEmbedding
-                    # doesn't raise on sequences longer than it was built for.
-                    window = self.config.max_position_embeddings
-                    model_input_ids = generated[:, -window:]
-                    model_attention_mask = attention_mask[:, -window:]
-                else:
-                    model_input_ids = generated
-                    model_attention_mask = attention_mask
-
-                out = self.forward(
-                    input_ids=model_input_ids,
-                    attention_mask=model_attention_mask,
-                    use_cache=False,
-                )
-                next_token_logits = out.logits[:, -1, :] / max(temperature, 1e-8)
-
+            for step in range(max_new_tokens):
+                logits = out.logits[:, -1, :]
                 if do_sample:
+                    next_token_logits = logits / max(temperature, 1e-8)
                     if top_k is not None:
                         next_token_logits = _top_k_filter(next_token_logits, top_k)
                     if top_p is not None:
@@ -1316,10 +1531,8 @@ class HybridForCausalLM(nn.Module):
                     probs = F.softmax(next_token_logits, dim=-1)
                     next_token = torch.multinomial(probs, num_samples=1)
                 else:
-                    next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
 
-                # Sequences that already hit eos just keep emitting eos so the
-                # batch stays rectangular.
                 next_token = torch.where(
                     finished.unsqueeze(-1),
                     torch.full_like(next_token, eos_token_id),
@@ -1330,19 +1543,38 @@ class HybridForCausalLM(nn.Module):
                 attention_mask = torch.cat(
                     [attention_mask, (~finished).long().unsqueeze(-1)], dim=1
                 )
-
                 finished = finished | (next_token.squeeze(-1) == eos_token_id)
                 if finished.all():
                     break
+
+                step_position_ids = torch.full(
+                    (batch_size, 1),
+                    past_seen_tokens,
+                    dtype=torch.long,
+                    device=device,
+                )
+                step_attn_mask = attention_mask
+                if step_attn_mask.size(1) > self.config.window_size:
+                    step_attn_mask = step_attn_mask[:, -self.config.window_size :]
+
+                out = self.forward(
+                    input_ids=next_token,
+                    attention_mask=step_attn_mask,
+                    position_ids=step_position_ids,
+                    past_key_values=past_key_values,
+                    memory_states=memory_states,
+                    mamba_caches=mamba_caches,
+                    past_seen_tokens=past_seen_tokens,
+                    use_cache=True,
+                )
+                past_key_values = out.past_key_values
+                memory_states = out.memory_states
+                mamba_caches = out.mamba_caches
+                past_seen_tokens += 1
         finally:
             self.train(was_training)
 
         return generated
-
-
-# =============================================================================
-# Falsification-test helpers
-# =============================================================================
 
 
 def count_trainable_params(module: nn.Module) -> int:
@@ -1353,22 +1585,12 @@ def build_test3_null_baseline_config(
     hybrid_config: HybridMambaMoEConfig,
 ) -> HybridMambaMoEConfig:
     """
-    Test 3 (design doc v2.0): the null hypothesis for "do we need explicit
-    memory at all" is a Mamba branch with a larger state dimension instead
-    of a second memory subsystem. This builds a config with:
-        - use_dual_memory = False (no CompressiveMemoryBank params)
-        - mamba_state_size increased to roughly absorb the parameter budget
-          that the memory banks would otherwise have used.
-
-    The state-size bump below is a rough heuristic, not an exact parameter
-    match -- after constructing both models, call count_trainable_params()
-    on each and fine-tune mamba_state_size until they're within a few
-    percent of each other before running the comparison.
+    Test 3 null hypothesis: larger Mamba state, no explicit memory banks.
+    Heuristic bump — verify with count_trainable_params and adjust.
     """
     import copy
 
     null_config = copy.deepcopy(hybrid_config)
     null_config.use_dual_memory = False
-    # Heuristic bump; verify against count_trainable_params and adjust.
     null_config.mamba_state_size = hybrid_config.mamba_state_size * 4
     return null_config

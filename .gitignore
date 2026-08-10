@@ -2,3 +2,5 @@
 .env.local
 config.yaml
 .claude/
+__pycache__/
+tests/__pycache__/
