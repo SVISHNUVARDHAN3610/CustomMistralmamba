@@ -219,7 +219,9 @@ class TestHybridModel(unittest.TestCase):
 
     def test_null_baseline_param_match(self) -> None:
         cfg = _small_hybrid_config()
-        full = count_trainable_params(HybridForCausalLM(cfg))
+        full = count_trainable_params(
+            HybridForCausalLM(cfg), exclude_training_aux=True
+        )
         null_cfg = build_test3_null_baseline_config(cfg)
         null_n = count_trainable_params(HybridForCausalLM(null_cfg))
         self.assertFalse(null_cfg.use_dual_memory)
@@ -460,8 +462,8 @@ class TestHybridModel(unittest.TestCase):
             torch.cat(attn_chunks, dim=1),
             torch.cat(mamba_chunks, dim=1),
         )
-        exp_a, _ = layer.attn_memory_bank.write(buf_attn, a_mem)
-        exp_s, _ = layer.state_memory_bank.write(buf_mamba, s_mem)
+        exp_a, _, _ = layer.attn_memory_bank.write(buf_attn, a_mem)
+        exp_s, _, _ = layer.state_memory_bank.write(buf_mamba, s_mem)
 
         self.assertLess((flushed[0][0] - exp_a).abs().max().item(), 1e-5)
         self.assertLess((flushed[0][1] - exp_s).abs().max().item(), 1e-5)
@@ -617,6 +619,7 @@ class TestHybridModel(unittest.TestCase):
                 _,
                 _,
                 _,
+                _,
             ) = model.model(
                 input_ids=chunk_ids,
                 memory_states=memory_states,
@@ -679,6 +682,47 @@ class TestHybridModel(unittest.TestCase):
         self.assertLess(
             abs(o8.router_z_loss.detach() - o32.router_z_loss.detach()).item(), 1e-4
         )
+
+    def test_auxiliary_losses_present_when_training(self) -> None:
+        self.model.train()
+        ids = torch.randint(0, self.cfg.vocab_size, (2, 16))
+        labels = torch.randint(0, self.cfg.vocab_size, (2, 16))
+        out = self.model(input_ids=ids, labels=labels)
+        self.assertIsNotNone(out.auxiliary_losses)
+        aux = out.auxiliary_losses
+        assert aux is not None
+        for name in ("recon", "gate", "read", "fusion", "expert", "ssm", "slot"):
+            val = getattr(aux, name)
+            self.assertIsNotNone(val)
+            self.assertFalse(torch.isnan(val).any())
+        self.assertIsNotNone(out.loss)
+        out.loss.backward()
+
+    def test_auxiliary_losses_disabled(self) -> None:
+        cfg = _small_hybrid_config(use_auxiliary_losses=False)
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 12))
+        labels = torch.randint(0, cfg.vocab_size, (1, 12))
+        out = model(input_ids=ids, labels=labels)
+        assert out.auxiliary_losses is not None
+        aux = out.auxiliary_losses
+        self.assertEqual(aux.recon.item(), 0.0)
+        self.assertEqual(aux.fusion.item(), 0.0)
+        self.assertEqual(aux.expert.item(), 0.0)
+
+    def test_recon_loss_gradients_write_path(self) -> None:
+        cfg = _small_hybrid_config(num_layers=1, use_auxiliary_losses=True)
+        model = HybridForCausalLM(cfg).train()
+        layer = model.model.layers[0]
+        layer.attn_memory_bank.write_gate.weight.grad = None
+        ids = torch.randint(0, cfg.vocab_size, (1, 8))
+        labels = torch.randint(0, cfg.vocab_size, (1, 8))
+        out = model(input_ids=ids, labels=labels)
+        assert out.loss is not None
+        out.loss.backward()
+        grad = layer.attn_memory_bank.write_gate.weight.grad
+        self.assertIsNotNone(grad)
+        self.assertGreater(grad.abs().max().item(), 0.0)
 
 
 if __name__ == "__main__":

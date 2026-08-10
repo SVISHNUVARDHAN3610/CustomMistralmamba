@@ -440,7 +440,36 @@ class MOERouter(nn.Module):
 
         aux_loss = self.num_experts * torch.sum(f_i * p_i)
 
-        return topk_weights, topk_indices, aux_loss, z_loss
+        return topk_weights, topk_indices, aux_loss, z_loss, logits
+
+
+def expert_specialization_loss(
+    x_flat: Tensor,
+    logits: Tensor,
+    topk_indices: Tensor,
+    experts: nn.ModuleList,
+    var_beta: float,
+) -> Tensor:
+    """Orthogonality + routing variance loss (Guo et al., NeurIPS 2025)."""
+    num_tokens, top_k = topk_indices.shape
+    hidden = x_flat.size(-1)
+    device = x_flat.device
+    dtype = x_flat.dtype
+
+    expert_out = torch.zeros(num_tokens, top_k, hidden, device=device, dtype=dtype)
+    for k in range(top_k):
+        for expert_idx, expert in enumerate(experts):
+            mask = topk_indices[:, k] == expert_idx
+            if not mask.any():
+                continue
+            expert_out[mask, k] = expert(x_flat[mask])
+
+    e0 = expert_out[:, 0]
+    e1 = expert_out[:, 1]
+    cos = F.cosine_similarity(e0, e1, dim=-1).abs().mean()
+    full_probs = F.softmax(logits, dim=-1)
+    var_loss = -full_probs.var(dim=-1, unbiased=False).mean()
+    return cos + var_beta * var_loss
 
 
 class DroplessMoELayer(nn.Module):
@@ -475,17 +504,29 @@ class DroplessMoELayer(nn.Module):
         self.capacity_factor = capacity_factor
 
     def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        x: torch.Tensor,
+        compute_expert_loss: bool = False,
+        expert_var_beta: float = 0.5,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         orig_shape = x.shape
         x_flat = x.reshape(-1, orig_shape[-1])
         num_tokens = x_flat.size(0)
 
-        topk_weights, topk_indices, aux_loss, z_loss = self.router(x_flat)
+        topk_weights, topk_indices, aux_loss, z_loss, logits = self.router(x_flat)
         moe_output = torch.zeros_like(x_flat)
         applied_weights = torch.zeros(
             num_tokens, device=x_flat.device, dtype=x_flat.dtype
         )
+        expert_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
+        if compute_expert_loss and self.training:
+            expert_loss = expert_specialization_loss(
+                x_flat,
+                logits,
+                topk_indices,
+                self.experts,
+                var_beta=expert_var_beta,
+            )
 
         capacity = None
         if self.capacity_factor is not None:
@@ -536,7 +577,7 @@ class DroplessMoELayer(nn.Module):
             )
             moe_output = moe_output * renorm.unsqueeze(-1)
 
-        return moe_output.reshape(*orig_shape), aux_loss, z_loss
+        return moe_output.reshape(*orig_shape), aux_loss, z_loss, expert_loss
 
 
 class MixtralDecoderLayer(nn.Module):
@@ -588,7 +629,7 @@ class MixtralDecoderLayer(nn.Module):
         if attention_mask is not None and attention_mask.dim() == 2:
             token_mask = attention_mask[:, -x.size(1) :].unsqueeze(-1).to(moe_in.dtype)
             moe_in = moe_in * token_mask
-        moe_out, aux_loss, z_loss = self.moe_block(moe_in)
+        moe_out, aux_loss, z_loss, _ = self.moe_block(moe_in)
         x_out = x_attn + moe_out
 
         return x_out, aux_loss, z_loss, present_key_value
@@ -785,8 +826,210 @@ class HybridMambaMoEConfig(MixtralConfig):
     gradient_checkpointing: bool = False
     debug_state_checks: bool = False
 
+    # Auxiliary training losses (see loss-definitions.md). Training-only.
+    use_auxiliary_losses: bool = True
+    lambda_recon: float = 0.08
+    lambda_assoc: float = 0.03
+    assoc_warmup_fraction: float = 0.05
+    assoc_sample_count: int = 24
+    lambda_gate: float = 1e-3
+    gate_entropy_eps: float = 1e-6
+    lambda_read: float = 5e-3
+    read_util_min_fraction: float = 0.15
+    lambda_fusion: float = 8e-3
+    lambda_expert: float = 2e-3
+    expert_warmup_fraction: float = 0.10
+    expert_var_beta: float = 0.5
+    lambda_ssm: float = 1e-5
+    lambda_slot: float = 3e-3
+    slot_similarity_margin: float = 0.3
+    slot_cross_bank_alpha: float = 0.1
+    recon_decoder_heads: int = 2
+
 
 MambaCache = tuple[Tensor, Tensor]  # (conv_state, ssm_state)
+
+
+@dataclass
+class HybridLayerAuxLosses:
+    """Per-layer raw (unweighted) auxiliary loss scalars."""
+
+    recon: Tensor
+    assoc: Tensor
+    gate: Tensor
+    read: Tensor
+    fusion: Tensor
+    expert: Tensor
+    ssm: Tensor
+    slot: Tensor
+
+    @staticmethod
+    def zeros(device: torch.device, dtype: torch.dtype) -> "HybridLayerAuxLosses":
+        z = torch.tensor(0.0, device=device, dtype=dtype)
+        return HybridLayerAuxLosses(
+            recon=z, assoc=z, gate=z, read=z, fusion=z, expert=z, ssm=z, slot=z
+        )
+
+
+@dataclass
+class HybridAuxiliaryLossBreakdown:
+    """Model-level averaged auxiliary losses (unweighted)."""
+
+    recon: Tensor | None = None
+    assoc: Tensor | None = None
+    gate: Tensor | None = None
+    read: Tensor | None = None
+    fusion: Tensor | None = None
+    expert: Tensor | None = None
+    ssm: Tensor | None = None
+    slot: Tensor | None = None
+
+
+def _aux_loss_schedule(
+    step: int | None, max_steps: int | None, warmup_fraction: float
+) -> float:
+    if step is None or max_steps is None or max_steps <= 0:
+        return 1.0
+    warmup_steps = max(1, int(max_steps * warmup_fraction))
+    return min(1.0, step / warmup_steps)
+
+
+def _expert_loss_schedule(
+    step: int | None, max_steps: int | None, warmup_fraction: float
+) -> float:
+    if step is None or max_steps is None or max_steps <= 0:
+        return 1.0
+    start = int(max_steps * warmup_fraction)
+    return 1.0 if step >= start else 0.0
+
+
+def write_gate_entropy_loss(gate: Tensor, eps: float = 1e-6) -> Tensor:
+    ent = -(gate * torch.log(gate + eps) + (1.0 - gate) * torch.log(1.0 - gate + eps))
+    return -ent.mean()
+
+
+def combine_read_utilization_loss(
+    combine: nn.Linear, r_min: float, eps: float = 1e-6
+) -> Tensor:
+    weight = combine.weight
+    hidden = weight.size(0)
+    w_own = weight[:, :hidden]
+    w_mem = weight[:, hidden:]
+    r = w_mem.norm() / (w_own.norm() + w_mem.norm() + eps)
+    return torch.relu(r_min - r) ** 2
+
+
+def fusion_balance_loss(fusion_gate: Tensor) -> Tensor:
+    g_bar = fusion_gate.mean(dim=(0, 1))
+    hidden = g_bar.size(0)
+    return ((g_bar - 0.5) ** 2).sum() / hidden
+
+
+def memory_slot_diversity_loss(
+    attn_mem: Tensor,
+    state_mem: Tensor,
+    margin: float,
+    cross_alpha: float,
+    eps: float = 1e-6,
+) -> Tensor:
+    def _intra(mem: Tensor) -> Tensor:
+        mem_norm = mem / mem.norm(dim=-1, keepdim=True).clamp(min=eps)
+        sim = torch.matmul(mem_norm, mem_norm.transpose(-1, -2))
+        m = sim.size(-1)
+        mask = ~torch.eye(m, device=sim.device, dtype=torch.bool)
+        excess = torch.relu(sim - margin) ** 2
+        return excess.masked_select(mask.unsqueeze(0)).mean()
+
+    intra = _intra(attn_mem) + _intra(state_mem)
+    a_norm = attn_mem / attn_mem.norm(dim=-1, keepdim=True).clamp(min=eps)
+    s_norm = state_mem / state_mem.norm(dim=-1, keepdim=True).clamp(min=eps)
+    cross = (a_norm * s_norm).sum(dim=-1).mean()
+    return intra + cross_alpha * cross
+
+
+def ssm_state_norm_loss(ssm_state: Tensor, gamma: Tensor) -> Tensor:
+    s_bar = ssm_state.float().pow(2).mean()
+    return torch.relu(s_bar - gamma)
+
+
+class MemoryReconstructionDecoder(nn.Module):
+    """Training-only decoder: reconstruct x from compressed summary s."""
+
+    def __init__(self, hidden_size: int, num_heads: int) -> None:
+        super().__init__()
+        if hidden_size % num_heads != 0:
+            raise ValueError("hidden_size must be divisible by recon_decoder_heads.")
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.scale = self.head_dim**-0.5
+        self.q_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.k_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.v_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+
+    def _shape_heads(self, t: Tensor, seq_len: int) -> Tensor:
+        b = t.size(0)
+        return t.reshape(b, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def forward(self, x: Tensor, summary: Tensor) -> Tensor:
+        q_len = x.size(1)
+        k_len = summary.size(1)
+        q = self._shape_heads(self.q_proj(x), q_len)
+        k = self._shape_heads(self.k_proj(summary), k_len)
+        v = self._shape_heads(self.v_proj(summary), k_len)
+        scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(x.size(0), q_len, -1)
+        return self.out_proj(out)
+
+
+def memory_reconstruction_loss(
+    x: Tensor, summary: Tensor, decoder: nn.Module
+) -> Tensor:
+    recon = decoder(x, summary)
+    return F.mse_loss(recon, x)
+
+
+def associative_retrieval_loss(
+    bank: "CompressiveMemoryBank",
+    x: Tensor,
+    new_memory: Tensor,
+    per_token_residual: Tensor,
+    sample_count: int,
+    attention_mask: Tensor | None,
+) -> Tensor:
+    batch_size, seq_len, _ = x.shape
+    device = x.device
+    if attention_mask is not None:
+        valid = attention_mask.bool()
+    else:
+        valid = torch.ones(batch_size, seq_len, device=device, dtype=torch.bool)
+
+    losses: list[Tensor] = []
+    for b in range(batch_size):
+        idx = torch.nonzero(valid[b], as_tuple=False).squeeze(-1)
+        if idx.numel() == 0:
+            continue
+        n = min(sample_count, idx.numel())
+        if idx.numel() > n:
+            perm = torch.randperm(idx.numel(), device=device)[:n]
+            idx = idx[perm]
+        x_b = x[b : b + 1, idx]
+        keys = bank.assoc_key(x_b)
+        values = bank.assoc_val(x_b)
+        retrieved = bank.read_query(keys, new_memory[b : b + 1])
+        err = (retrieved - values).pow(2).mean(dim=-1).squeeze(0)
+        surprise = per_token_residual[b, idx].detach()
+        if surprise.numel() > 1:
+            sigma = surprise.std().clamp(min=1e-6)
+            surprise = surprise.clamp(max=3.0 * sigma)
+        surprise = surprise.clamp(min=0.0)
+        losses.append((surprise * err).mean())
+
+    if not losses:
+        return torch.tensor(0.0, device=device, dtype=x.dtype)
+    return torch.stack(losses).mean()
 
 
 def _materialize_write_buffer(
@@ -928,7 +1171,7 @@ class MambaBlock(nn.Module):
         use_cache: bool = False,
         attention_mask: Tensor | None = None,
         active_batch_mask: Tensor | None = None,
-    ) -> tuple[Tensor, MambaCache | None]:
+    ) -> tuple[Tensor, MambaCache | None, Tensor | None]:
         """
         x: [B, L, hidden_size]
         If use_cache and L==1 and cache is provided, runs a single decode step.
@@ -938,7 +1181,10 @@ class MambaBlock(nn.Module):
         _, seq_len, _ = x.shape
 
         if use_cache and cache is not None and seq_len == 1:
-            return self.step(x, cache[0], cache[1], active_batch_mask=active_batch_mask)
+            out, cache_out = self.step(
+                x, cache[0], cache[1], active_batch_mask=active_batch_mask
+            )
+            return out, cache_out, cache[1]
 
         xz = self.in_proj(x)
         x_in, z = xz.chunk(2, dim=-1)
@@ -988,7 +1234,7 @@ class MambaBlock(nn.Module):
             B_param,
             C_param,
             self.D,
-            return_final_state=use_cache,
+            return_final_state=True,
             use_parallel_scan=self.use_parallel_scan,
             training=self.training,
             attention_mask=attention_mask,
@@ -1000,7 +1246,7 @@ class MambaBlock(nn.Module):
         if use_cache:
             assert conv_state is not None and ssm_state is not None
             new_cache = (conv_state, ssm_state)
-        return out, new_cache
+        return out, new_cache, ssm_state
 
     def step(
         self,
@@ -1158,7 +1404,12 @@ class CompressiveMemoryBank(nn.Module):
     """
 
     def __init__(
-        self, hidden_size: int, memory_size: int = 64, num_heads: int = 8
+        self,
+        hidden_size: int,
+        memory_size: int = 64,
+        num_heads: int = 8,
+        recon_decoder_heads: int = 2,
+        enable_aux_modules: bool = True,
     ) -> None:
         super().__init__()
         if hidden_size % num_heads != 0:
@@ -1179,6 +1430,17 @@ class CompressiveMemoryBank(nn.Module):
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=False)
         self.write_gate = nn.Linear(hidden_size * 2, hidden_size)
         self.write_update = nn.Linear(hidden_size, hidden_size)
+
+        if enable_aux_modules:
+            self.recon_decoder = MemoryReconstructionDecoder(
+                hidden_size, recon_decoder_heads
+            )
+            self.assoc_key = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.assoc_val = nn.Linear(hidden_size, hidden_size, bias=False)
+        else:
+            self.recon_decoder = None
+            self.assoc_key = None
+            self.assoc_val = None
 
     def init_state(
         self, batch_size: int, device: torch.device, dtype: torch.dtype
@@ -1249,12 +1511,15 @@ class CompressiveMemoryBank(nn.Module):
         del attention_mask  # queries may be zeroed by caller for pads
         return self._attend(x, memory, memory, key_padding_mask=None)
 
+    def read_query(self, query: Tensor, memory: Tensor) -> Tensor:
+        return self._attend(query, memory, memory, key_padding_mask=None)
+
     def write(
         self,
         x: Tensor,
         memory: Tensor,
         attention_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         kpm = self._key_padding_mask(attention_mask)
         batch_size = x.size(0)
         query = self.summary_query.unsqueeze(0).expand(batch_size, -1, -1)
@@ -1269,7 +1534,7 @@ class CompressiveMemoryBank(nn.Module):
             if all_masked_rows.any():
                 new_memory = new_memory.clone()
                 new_memory[all_masked_rows] = memory[all_masked_rows]
-        return new_memory, gate
+        return new_memory, gate, chunk_summary
 
 
 class TokenGatedFusion(nn.Module):
@@ -1311,6 +1576,7 @@ def _hybrid_layer_forward(
     MambaCache | None,
     dict[str, Tensor],
     MemoryWriteBuffer | None,
+    HybridLayerAuxLosses,
 ]:
     return layer(
         hidden_states,
@@ -1339,7 +1605,9 @@ class HybridDecoderLayer(nn.Module):
 
     def __init__(self, config: HybridMambaMoEConfig) -> None:
         super().__init__()
+        self.config = config
         self.use_dual_memory = config.use_dual_memory
+        self.use_auxiliary_losses = config.use_auxiliary_losses
 
         self.rmsnorm_in = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attention_block = SlidingWindowGQA(config)
@@ -1353,11 +1621,20 @@ class HybridDecoderLayer(nn.Module):
         )
 
         if self.use_dual_memory:
+            enable_aux = config.use_auxiliary_losses
             self.attn_memory_bank = CompressiveMemoryBank(
-                config.hidden_size, config.memory_size, config.memory_num_heads
+                config.hidden_size,
+                config.memory_size,
+                config.memory_num_heads,
+                recon_decoder_heads=config.recon_decoder_heads,
+                enable_aux_modules=enable_aux,
             )
             self.state_memory_bank = CompressiveMemoryBank(
-                config.hidden_size, config.memory_size, config.memory_num_heads
+                config.hidden_size,
+                config.memory_size,
+                config.memory_num_heads,
+                recon_decoder_heads=config.recon_decoder_heads,
+                enable_aux_modules=enable_aux,
             )
             # Condition each branch's *input* with a memory read (diagram:
             # AM/SM -.read.-> GQA/Mamba), rather than mixing after the branch.
@@ -1430,10 +1707,13 @@ class HybridDecoderLayer(nn.Module):
         MambaCache | None,
         dict[str, Tensor],
         MemoryWriteBuffer | None,
+        HybridLayerAuxLosses,
     ]:
         residual = x
         x_norm = self.rmsnorm_in(x)
         seq_len = x.size(1)
+        cfg = self.config
+        layer_aux = HybridLayerAuxLosses.zeros(x.device, x.dtype)
 
         # Memory R/W keys are the current chunk tokens [B, seq_len]; GQA may
         # receive a longer window-aligned padding mask during cached decode.
@@ -1485,7 +1765,7 @@ class HybridDecoderLayer(nn.Module):
             active_batch_mask=active_batch_mask,
         )
         mamba_token_mask = token_attention_mask
-        mamba_out, new_mamba_cache = self.mamba_block(
+        mamba_out, new_mamba_cache, ssm_state = self.mamba_block(
             mamba_input,
             cache=mamba_cache,
             use_cache=use_cache,
@@ -1547,10 +1827,10 @@ class HybridDecoderLayer(nn.Module):
                         dtype=write_mask.dtype
                     )
 
-                new_a_mem, a_write_gate = self.attn_memory_bank.write(
+                new_a_mem, a_write_gate, a_summary = self.attn_memory_bank.write(
                     buf_attn_cat, a_mem, attention_mask=write_mask
                 )
-                new_s_mem, s_write_gate = self.state_memory_bank.write(
+                new_s_mem, s_write_gate, s_summary = self.state_memory_bank.write(
                     buf_mamba_cat, s_mem, attention_mask=write_mask
                 )
                 if active_batch_mask is not None and (~active_batch_mask).any():
@@ -1566,7 +1846,76 @@ class HybridDecoderLayer(nn.Module):
                     "state_write_gate_mean": s_write_gate.detach().mean(),
                 }
 
-        fused, _fusion_gate = self.fusion(attn_out, mamba_out)
+                if self.training and self.use_auxiliary_losses:
+                    attn_recon = memory_reconstruction_loss(
+                        buf_attn_cat,
+                        a_summary,
+                        self.attn_memory_bank.recon_decoder,
+                    )
+                    mamba_recon = memory_reconstruction_loss(
+                        buf_mamba_cat,
+                        s_summary,
+                        self.state_memory_bank.recon_decoder,
+                    )
+                    attn_recon_tok = (
+                        (
+                            buf_attn_cat
+                            - self.attn_memory_bank.recon_decoder(
+                                buf_attn_cat, a_summary
+                            )
+                        )
+                        .pow(2)
+                        .mean(dim=-1)
+                        .sqrt()
+                    )
+                    mamba_recon_tok = (
+                        (
+                            buf_mamba_cat
+                            - self.state_memory_bank.recon_decoder(
+                                buf_mamba_cat, s_summary
+                            )
+                        )
+                        .pow(2)
+                        .mean(dim=-1)
+                        .sqrt()
+                    )
+                    attn_assoc = associative_retrieval_loss(
+                        self.attn_memory_bank,
+                        buf_attn_cat,
+                        new_a_mem,
+                        attn_recon_tok,
+                        cfg.assoc_sample_count,
+                        write_mask,
+                    )
+                    mamba_assoc = associative_retrieval_loss(
+                        self.state_memory_bank,
+                        buf_mamba_cat,
+                        new_s_mem,
+                        mamba_recon_tok,
+                        cfg.assoc_sample_count,
+                        write_mask,
+                    )
+                    gate_loss = write_gate_entropy_loss(
+                        a_write_gate, cfg.gate_entropy_eps
+                    ) + write_gate_entropy_loss(s_write_gate, cfg.gate_entropy_eps)
+                    slot_loss = memory_slot_diversity_loss(
+                        new_a_mem,
+                        new_s_mem,
+                        cfg.slot_similarity_margin,
+                        cfg.slot_cross_bank_alpha,
+                    )
+                    layer_aux = HybridLayerAuxLosses(
+                        recon=(attn_recon + mamba_recon) / 2.0,
+                        assoc=(attn_assoc + mamba_assoc) / 2.0,
+                        gate=gate_loss / 2.0,
+                        read=layer_aux.read,
+                        fusion=layer_aux.fusion,
+                        expert=layer_aux.expert,
+                        ssm=layer_aux.ssm,
+                        slot=slot_loss,
+                    )
+
+        fused, fusion_gate = self.fusion(attn_out, mamba_out)
         if hidden_mask is not None:
             fused = fused * hidden_mask
         x = residual + fused
@@ -1574,8 +1923,37 @@ class HybridDecoderLayer(nn.Module):
         moe_in = self.rmsnorm_moe(x)
         if hidden_mask is not None:
             moe_in = moe_in * hidden_mask
-        moe_out, aux_loss, z_loss = self.moe_block(moe_in)
+        moe_out, aux_loss, z_loss, expert_loss = self.moe_block(
+            moe_in,
+            compute_expert_loss=self.training and self.use_auxiliary_losses,
+            expert_var_beta=cfg.expert_var_beta,
+        )
         x_out = x + moe_out
+
+        if self.training and self.use_auxiliary_losses:
+            read_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            if self.use_dual_memory:
+                read_loss = combine_read_utilization_loss(
+                    self.attn_memory_combine, cfg.read_util_min_fraction
+                ) + combine_read_utilization_loss(
+                    self.state_memory_combine, cfg.read_util_min_fraction
+                )
+            fusion_loss = fusion_balance_loss(fusion_gate)
+            ssm_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
+            if ssm_state is not None:
+                gamma = getattr(self, "ssm_norm_gamma", None)
+                if gamma is not None:
+                    ssm_loss = ssm_state_norm_loss(ssm_state, gamma)
+            layer_aux = HybridLayerAuxLosses(
+                recon=layer_aux.recon,
+                assoc=layer_aux.assoc,
+                gate=layer_aux.gate,
+                read=read_loss / 2.0 if self.use_dual_memory else read_loss,
+                fusion=fusion_loss,
+                expert=expert_loss,
+                ssm=ssm_loss,
+                slot=layer_aux.slot,
+            )
 
         return (
             x_out,
@@ -1586,6 +1964,7 @@ class HybridDecoderLayer(nn.Module):
             new_mamba_cache,
             gate_stats,
             new_write_buffer,
+            layer_aux,
         )
 
 
@@ -1622,6 +2001,7 @@ class HybridTrainingOutput:
     mamba_caches: list[MambaCache | None] | None = None
     gate_stats: dict[str, Tensor] | None = None
     write_buffers: list[MemoryWriteBuffer | None] | None = None
+    auxiliary_losses: HybridAuxiliaryLossBreakdown | None = None
 
 
 class HybridModel(nn.Module):
@@ -1633,6 +2013,29 @@ class HybridModel(nn.Module):
             [HybridDecoderLayer(config) for _ in range(config.num_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.register_buffer(
+            "ssm_norm_gammas",
+            torch.zeros(config.num_layers),
+            persistent=True,
+        )
+        self._ssm_gammas_calibrated = False
+
+    @torch.no_grad()
+    def calibrate_ssm_norm_thresholds(
+        self, batch_size: int = 1, seq_len: int = 8
+    ) -> None:
+        device = self.embed_tokens.weight.device
+        dtype = self.embed_tokens.weight.dtype
+        dummy = torch.randn(
+            batch_size, seq_len, self.config.hidden_size, device=device, dtype=dtype
+        )
+        for i, layer in enumerate(self.layers):
+            _, _, ssm_state = layer.mamba_block(dummy, use_cache=False)
+            assert ssm_state is not None
+            norms = ssm_state.float().pow(2).mean(dim=(1, 2))
+            self.ssm_norm_gammas[i] = torch.quantile(norms, 0.9)
+            layer.ssm_norm_gamma = self.ssm_norm_gammas[i]
+        self._ssm_gammas_calibrated = True
 
     def allocate_mamba_caches(
         self, batch_size: int, device: torch.device, dtype: torch.dtype
@@ -1679,9 +2082,17 @@ class HybridModel(nn.Module):
         list[MambaCache | None] | None,
         dict[str, Tensor],
         list[MemoryWriteBuffer | None] | None,
+        HybridAuxiliaryLossBreakdown,
     ]:
         hidden_states = self.embed_tokens(input_ids)
         batch_size, seq_len = hidden_states.shape[:2]
+
+        if (
+            self.training
+            and self.config.use_auxiliary_losses
+            and not self._ssm_gammas_calibrated
+        ):
+            self.calibrate_ssm_norm_thresholds(batch_size=batch_size, seq_len=seq_len)
 
         _validate_hybrid_cache_states(
             self.config,
@@ -1727,6 +2138,7 @@ class HybridModel(nn.Module):
             [] if self.config.use_dual_memory else None
         )
         all_gate_stats: dict[str, Tensor] = {}
+        aux_sums = HybridLayerAuxLosses.zeros(hidden_states.device, hidden_states.dtype)
 
         for i, layer in enumerate(self.layers):
             layer_past_kv = past_key_values[i] if past_key_values is not None else None
@@ -1745,6 +2157,7 @@ class HybridModel(nn.Module):
                     layer_new_mamba,
                     layer_gate_stats,
                     layer_new_buf,
+                    layer_aux,
                 ) = checkpoint(
                     layer_fn,
                     layer,
@@ -1770,6 +2183,7 @@ class HybridModel(nn.Module):
                     layer_new_mamba,
                     layer_gate_stats,
                     layer_new_buf,
+                    layer_aux,
                 ) = layer_fn(
                     layer,
                     hidden_states,
@@ -1790,12 +2204,42 @@ class HybridModel(nn.Module):
                 new_write_buffers.append(layer_new_buf)
             for k, v in layer_gate_stats.items():
                 all_gate_stats[f"layer_{i}_{k}"] = v
+            aux_sums = HybridLayerAuxLosses(
+                recon=aux_sums.recon + layer_aux.recon,
+                assoc=aux_sums.assoc + layer_aux.assoc,
+                gate=aux_sums.gate + layer_aux.gate,
+                read=aux_sums.read + layer_aux.read,
+                fusion=aux_sums.fusion + layer_aux.fusion,
+                expert=aux_sums.expert + layer_aux.expert,
+                ssm=aux_sums.ssm + layer_aux.ssm,
+                slot=aux_sums.slot + layer_aux.slot,
+            )
             if use_cache:
                 present_key_values.append(present_kv)
                 new_mamba_caches.append(layer_new_mamba)
 
         hidden_states = self.norm(hidden_states)
         n_layers = max(len(self.layers), 1)
+        aux_avg = HybridLayerAuxLosses(
+            recon=aux_sums.recon / n_layers,
+            assoc=aux_sums.assoc / n_layers,
+            gate=aux_sums.gate / n_layers,
+            read=aux_sums.read / n_layers,
+            fusion=aux_sums.fusion / n_layers,
+            expert=aux_sums.expert / n_layers,
+            ssm=aux_sums.ssm / n_layers,
+            slot=aux_sums.slot / n_layers,
+        )
+        aux_breakdown = HybridAuxiliaryLossBreakdown(
+            recon=aux_avg.recon,
+            assoc=aux_avg.assoc,
+            gate=aux_avg.gate,
+            read=aux_avg.read,
+            fusion=aux_avg.fusion,
+            expert=aux_avg.expert,
+            ssm=aux_avg.ssm,
+            slot=aux_avg.slot,
+        )
         return (
             hidden_states,
             total_aux_loss / n_layers,
@@ -1805,6 +2249,7 @@ class HybridModel(nn.Module):
             new_mamba_caches,
             all_gate_stats,
             new_write_buffers,
+            aux_breakdown,
         )
 
 
@@ -1863,6 +2308,34 @@ class HybridForCausalLM(nn.Module):
             )
         return labels
 
+    def _weighted_auxiliary_loss(
+        self,
+        aux: HybridAuxiliaryLossBreakdown | None,
+        device: torch.device,
+        dtype: torch.dtype,
+        training_step: int | None = None,
+        max_training_steps: int | None = None,
+    ) -> Tensor:
+        if not self.config.use_auxiliary_losses or aux is None:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        cfg = self.config
+        assoc_scale = _aux_loss_schedule(
+            training_step, max_training_steps, cfg.assoc_warmup_fraction
+        )
+        expert_scale = _expert_loss_schedule(
+            training_step, max_training_steps, cfg.expert_warmup_fraction
+        )
+        return (
+            cfg.lambda_recon * aux.recon
+            + cfg.lambda_assoc * assoc_scale * aux.assoc
+            + cfg.lambda_gate * aux.gate
+            + cfg.lambda_read * aux.read
+            + cfg.lambda_fusion * aux.fusion
+            + cfg.lambda_expert * expert_scale * aux.expert
+            + cfg.lambda_ssm * aux.ssm
+            + cfg.lambda_slot * aux.slot
+        )
+
     def forward(
         self,
         input_ids: Tensor,
@@ -1877,6 +2350,8 @@ class HybridForCausalLM(nn.Module):
         skip_memory_write: bool = False,
         write_buffers: list[MemoryWriteBuffer | None] | None = None,
         active_batch_mask: Tensor | None = None,
+        training_step: int | None = None,
+        max_training_steps: int | None = None,
     ) -> HybridTrainingOutput:
         seq_len = input_ids.size(1)
         if self._should_chunk_training(seq_len, use_cache, memory_states):
@@ -1896,6 +2371,7 @@ class HybridForCausalLM(nn.Module):
             new_mamba_caches,
             gate_stats,
             new_write_buffers,
+            auxiliary_losses,
         ) = self.model(
             input_ids=input_ids,
             memory_states=memory_states,
@@ -1917,10 +2393,18 @@ class HybridForCausalLM(nn.Module):
             labels = self._apply_label_ignore(labels, attention_mask)
             loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.label_ignore_index)
             ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
+            aux_total = self._weighted_auxiliary_loss(
+                auxiliary_losses,
+                device=logits.device,
+                dtype=logits.dtype,
+                training_step=training_step,
+                max_training_steps=max_training_steps,
+            )
             loss = (
                 ce_loss
                 + (self.router_aux_loss_coef * aux_loss)
                 + (self.router_z_loss_coef * z_loss)
+                + aux_total
             )
 
         return HybridTrainingOutput(
@@ -1934,6 +2418,7 @@ class HybridForCausalLM(nn.Module):
             mamba_caches=new_mamba_caches,
             gate_stats=gate_stats,
             write_buffers=new_write_buffers,
+            auxiliary_losses=auxiliary_losses,
         )
 
     def _forward_chunked(
@@ -1959,6 +2444,9 @@ class HybridForCausalLM(nn.Module):
         gate_stat_sums: dict[str, Tensor] = {}
         gate_stat_counts: dict[str, int] = {}
         token_weight = 0
+        aux_weighted = HybridLayerAuxLosses.zeros(
+            device, self.model.embed_tokens.weight.dtype
+        )
 
         for start in range(0, seq_len, chunk_size):
             end = min(start + chunk_size, seq_len)
@@ -1985,6 +2473,7 @@ class HybridForCausalLM(nn.Module):
                 _,
                 gate_stats,
                 _,
+                chunk_aux,
             ) = self.model(
                 input_ids=chunk_ids,
                 memory_states=memory_states,
@@ -1996,6 +2485,16 @@ class HybridForCausalLM(nn.Module):
             total_aux = total_aux + aux_loss * chunk_len
             total_z = total_z + z_loss * chunk_len
             token_weight += chunk_len
+            aux_weighted = HybridLayerAuxLosses(
+                recon=aux_weighted.recon + chunk_aux.recon * chunk_len,
+                assoc=aux_weighted.assoc + chunk_aux.assoc * chunk_len,
+                gate=aux_weighted.gate + chunk_aux.gate * chunk_len,
+                read=aux_weighted.read + chunk_aux.read * chunk_len,
+                fusion=aux_weighted.fusion + chunk_aux.fusion * chunk_len,
+                expert=aux_weighted.expert + chunk_aux.expert * chunk_len,
+                ssm=aux_weighted.ssm + chunk_aux.ssm * chunk_len,
+                slot=aux_weighted.slot + chunk_aux.slot * chunk_len,
+            )
             for key, val in gate_stats.items():
                 if key not in gate_stat_sums:
                     gate_stat_sums[key] = val.clone()
@@ -2010,6 +2509,17 @@ class HybridForCausalLM(nn.Module):
         all_gate_stats = {
             k: gate_stat_sums[k] / gate_stat_counts[k] for k in gate_stat_sums
         }
+        tw = max(token_weight, 1)
+        auxiliary_losses = HybridAuxiliaryLossBreakdown(
+            recon=aux_weighted.recon / tw,
+            assoc=aux_weighted.assoc / tw,
+            gate=aux_weighted.gate / tw,
+            read=aux_weighted.read / tw,
+            fusion=aux_weighted.fusion / tw,
+            expert=aux_weighted.expert / tw,
+            ssm=aux_weighted.ssm / tw,
+            slot=aux_weighted.slot / tw,
+        )
 
         loss = None
         ce_loss = None
@@ -2017,10 +2527,16 @@ class HybridForCausalLM(nn.Module):
             labels = self._apply_label_ignore(labels, attention_mask)
             loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.label_ignore_index)
             ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
+            aux_total = self._weighted_auxiliary_loss(
+                auxiliary_losses,
+                device=logits.device,
+                dtype=logits.dtype,
+            )
             loss = (
                 ce_loss
                 + (self.router_aux_loss_coef * aux_loss)
                 + (self.router_z_loss_coef * z_loss)
+                + aux_total
             )
 
         return HybridTrainingOutput(
@@ -2034,6 +2550,7 @@ class HybridForCausalLM(nn.Module):
             mamba_caches=None,
             gate_stats=all_gate_stats,
             write_buffers=None,
+            auxiliary_losses=auxiliary_losses,
         )
 
     def _flush_memory_write_buffers(
@@ -2060,8 +2577,8 @@ class HybridForCausalLM(nn.Module):
             a_mem, s_mem = mem
             buf_attn, buf_mamba = _materialize_write_buffer(buf)
             assert buf_attn is not None and buf_mamba is not None
-            new_a, _ = layer.attn_memory_bank.write(buf_attn, a_mem)
-            new_s, _ = layer.state_memory_bank.write(buf_mamba, s_mem)
+            new_a, _, _ = layer.attn_memory_bank.write(buf_attn, a_mem)
+            new_s, _, _ = layer.state_memory_bank.write(buf_mamba, s_mem)
             new_states.append((new_a, new_s))
         return new_states, None
 
@@ -2245,8 +2762,19 @@ class HybridForCausalLM(nn.Module):
         return generated_buf[:, :cur_len]
 
 
-def count_trainable_params(module: nn.Module) -> int:
-    return sum(p.numel() for p in module.parameters() if p.requires_grad)
+def count_trainable_params(
+    module: nn.Module, exclude_training_aux: bool = False
+) -> int:
+    total = 0
+    for name, param in module.named_parameters():
+        if not param.requires_grad:
+            continue
+        if exclude_training_aux and (
+            "recon_decoder" in name or "assoc_key" in name or "assoc_val" in name
+        ):
+            continue
+        total += param.numel()
+    return total
 
 
 def build_test3_null_baseline_config(
@@ -2258,7 +2786,9 @@ def build_test3_null_baseline_config(
     Binary-searches mamba_state_size (then mamba_expand) to match param count.
     Raises if a match within ``tolerance`` cannot be found.
     """
-    target = count_trainable_params(HybridForCausalLM(hybrid_config))
+    target = count_trainable_params(
+        HybridForCausalLM(hybrid_config), exclude_training_aux=True
+    )
     null_config = copy.deepcopy(hybrid_config)
     null_config.use_dual_memory = False
 
