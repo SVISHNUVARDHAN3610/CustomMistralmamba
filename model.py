@@ -25,6 +25,7 @@ Falsification hooks (design doc §6):
     - build_test3_null_baseline_config() for matched-parameter SSM-only null
 """
 
+import copy
 import json
 import math
 from dataclasses import asdict, dataclass
@@ -33,6 +34,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -55,8 +57,10 @@ class MixtralConfig:
     dropout: float = 0.1
 
     # Optional expert-capacity limiting for MoE (see DroplessMoELayer). None
-    # preserves the original fully dropless behavior.
-    capacity_factor: float | None = 1.25
+    # preserves fully dropless, batch-independent behavior (default for research).
+    # Set e.g. 1.25 only on memory-constrained hardware; logits then depend on
+    # batch composition.
+    capacity_factor: float | None = None
 
     # RoPE / positional configuration (previously hardcoded deep inside
     # RotaryEmbedding / SlidingWindowGQA).
@@ -227,6 +231,7 @@ class SlidingWindowGQA(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
         )
+        self._sliding_mask_cache: dict[tuple[int, int, str], Tensor] = {}
 
     def _repeat_kv(self, x: Tensor, n_rep: int) -> Tensor:
         batch_size, num_kv_heads, seq_len, head_dim = x.shape
@@ -295,13 +300,17 @@ class SlidingWindowGQA(nn.Module):
         key_states_r = self._repeat_kv(key_states, num_queries_per_kv)
         value_states_r = self._repeat_kv(value_states, num_queries_per_kv)
 
-        row_idx = torch.arange(seq_len, device=device).unsqueeze(1) + (
-            kv_seq_len - seq_len
-        )
-        col_idx = torch.arange(kv_seq_len, device=device).unsqueeze(0)
-        sliding_causal_mask = (row_idx >= col_idx) & (
-            (row_idx - col_idx) < self.window_size
-        )
+        mask_key = (seq_len, kv_seq_len, str(device))
+        sliding_causal_mask = self._sliding_mask_cache.get(mask_key)
+        if sliding_causal_mask is None:
+            row_idx = torch.arange(seq_len, device=device).unsqueeze(1) + (
+                kv_seq_len - seq_len
+            )
+            col_idx = torch.arange(kv_seq_len, device=device).unsqueeze(0)
+            sliding_causal_mask = (row_idx >= col_idx) & (
+                (row_idx - col_idx) < self.window_size
+            )
+            self._sliding_mask_cache[mask_key] = sliding_causal_mask
 
         if attention_mask is not None:
             padding_mask = (
@@ -447,11 +456,14 @@ class DroplessMoELayer(nn.Module):
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         orig_shape = x.shape
-        x_flat = x.view(-1, orig_shape[-1])
+        x_flat = x.reshape(-1, orig_shape[-1])
         num_tokens = x_flat.size(0)
 
         topk_weights, topk_indices, aux_loss, z_loss = self.router(x_flat)
         moe_output = torch.zeros_like(x_flat)
+        applied_weights = torch.zeros(
+            num_tokens, device=x_flat.device, dtype=x_flat.dtype
+        )
 
         capacity = None
         if self.capacity_factor is not None:
@@ -473,8 +485,6 @@ class DroplessMoELayer(nn.Module):
             row_indices, k_indices = torch.where(token_mask)
 
             if capacity is not None and row_indices.numel() > capacity:
-                # Keep first `capacity` tokens in original order; drop the
-                # rest (they simply get no contribution from this expert).
                 row_indices = row_indices[:capacity]
                 k_indices = k_indices[:capacity]
 
@@ -483,8 +493,21 @@ class DroplessMoELayer(nn.Module):
 
             gating_scale = topk_weights[row_indices, k_indices].unsqueeze(-1)
             moe_output.index_add_(0, row_indices, expert_outputs * gating_scale)
+            applied_weights.index_add_(
+                0, row_indices, gating_scale.squeeze(-1).to(applied_weights.dtype)
+            )
 
-        return moe_output.view(*orig_shape), aux_loss, z_loss
+        if self.capacity_factor is not None:
+            target_weights = topk_weights.sum(dim=-1)
+            renorm = target_weights / applied_weights.clamp(min=1e-9)
+            renorm = torch.where(
+                applied_weights > 0,
+                renorm.clamp(max=10.0),
+                torch.ones_like(renorm),
+            )
+            moe_output = moe_output * renorm.unsqueeze(-1)
+
+        return moe_output.reshape(*orig_shape), aux_loss, z_loss
 
 
 class MixtralDecoderLayer(nn.Module):
@@ -608,7 +631,13 @@ class MixtralModel(nn.Module):
                 present_key_values.append(present_kv)
 
         hidden_states = self.norm(hidden_states)
-        return hidden_states, total_aux_loss, total_z_loss, present_key_values
+        n_layers = max(len(self.layers), 1)
+        return (
+            hidden_states,
+            total_aux_loss / n_layers,
+            total_z_loss / n_layers,
+            present_key_values,
+        )
 
 
 class MixtralForCausalLM(nn.Module):
@@ -707,6 +736,14 @@ class HybridMambaMoEConfig(MixtralConfig):
     memory_size: int = 64
     memory_num_heads: int = 8
 
+    # Split long training sequences so memory write params get BPTT gradients.
+    memory_chunk_size: int | None = 512
+    # Decode: write memory banks every N new tokens (matches training chunking).
+    memory_write_interval: int | None = None
+
+    use_parallel_scan: bool = False
+    gradient_checkpointing: bool = False
+
 
 MambaCache = tuple[Tensor, Tensor]  # (conv_state, ssm_state)
 
@@ -715,10 +752,10 @@ class MambaBlock(nn.Module):
     """
     Selective SSM (Mamba / S6) in pure PyTorch.
 
-    Prefill/training uses a parallel associative scan (no per-token Python
-    loop). Autoregressive decode uses allocate_inference_cache() + step()
-    with (conv_state, ssm_state), matching the official mamba_ssm API shape.
-    No custom CUDA dependency — runs on any SDPA-capable device.
+    Training defaults to a checkpointed sequential associative scan (O(L)
+    work, bounded activation memory). Optional Hillis-Steele parallel scan
+    (`use_parallel_scan=True`) is faster on short sequences but O(L log L).
+    Decode uses allocate_inference_cache() + step().
     """
 
     def __init__(
@@ -728,6 +765,7 @@ class MambaBlock(nn.Module):
         conv_kernel: int = 4,
         expand: int = 2,
         dt_rank: int | None = None,
+        use_parallel_scan: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -735,6 +773,7 @@ class MambaBlock(nn.Module):
         self.conv_kernel = conv_kernel
         self.d_inner = expand * hidden_size
         self.dt_rank = dt_rank if dt_rank is not None else math.ceil(hidden_size / 16)
+        self.use_parallel_scan = use_parallel_scan
 
         self.in_proj = nn.Linear(hidden_size, 2 * self.d_inner, bias=False)
         self.conv1d = nn.Conv1d(
@@ -830,7 +869,15 @@ class MambaBlock(nn.Module):
 
         A = -torch.exp(self.A_log.float())
         y, ssm_state = self._selective_scan(
-            x_conv, dt, A, B_param, C_param, self.D, return_final_state=use_cache
+            x_conv,
+            dt,
+            A,
+            B_param,
+            C_param,
+            self.D,
+            return_final_state=use_cache,
+            use_parallel_scan=self.use_parallel_scan,
+            training=self.training,
         )
         y = y * F.silu(z)
         out = self.out_proj(y)
@@ -851,8 +898,8 @@ class MambaBlock(nn.Module):
         xz = self.in_proj(x.squeeze(1))
         x_in, z = xz.chunk(2, dim=-1)
 
-        # Roll causal-conv buffer and insert the new token.
-        conv_state = conv_state.roll(shifts=-1, dims=-1)
+        # Shift conv buffer in-place (slice copy, no full tensor roll).
+        conv_state[:, :, :-1].copy_(conv_state[:, :, 1:])
         conv_state[:, :, -1] = x_in
         x_conv = torch.sum(conv_state * self.conv1d.weight.squeeze(1), dim=-1)
         if self.conv1d.bias is not None:
@@ -883,13 +930,8 @@ class MambaBlock(nn.Module):
     @staticmethod
     def _parallel_associative_scan(delta_a: Tensor, delta_b_u: Tensor) -> Tensor:
         """
-        Inclusive parallel scan for h_t = delta_a_t * h_{t-1} + delta_b_u_t
-        with h_{-1} = 0.
-
-        delta_a, delta_b_u: [B, L, D, N] -> h: [B, L, D, N]
-
-        Uses doubling (Blelloch-style) with out-of-place updates so autograd
-        stays correct — no per-token Python loop over L.
+        Hillis-Steele inclusive scan: h_t = delta_a_t * h_{t-1} + delta_b_u_t.
+        O(L log L) work and training memory — use only when use_parallel_scan.
         """
         seq_len = delta_a.size(1)
         a = delta_a
@@ -905,6 +947,17 @@ class MambaBlock(nn.Module):
             n *= 2
         return b
 
+    @staticmethod
+    def _sequential_associative_scan(delta_a: Tensor, delta_b_u: Tensor) -> Tensor:
+        """O(L) work sequential scan; pair with checkpoint during training."""
+        _, seq_len, _, _ = delta_a.shape
+        state = torch.zeros_like(delta_b_u[:, 0])
+        outputs = []
+        for t in range(seq_len):
+            state = delta_a[:, t] * state + delta_b_u[:, t]
+            outputs.append(state)
+        return torch.stack(outputs, dim=1)
+
     @classmethod
     def _selective_scan(
         cls,
@@ -915,6 +968,8 @@ class MambaBlock(nn.Module):
         C: Tensor,
         D: Tensor,
         return_final_state: bool = False,
+        use_parallel_scan: bool = False,
+        training: bool = False,
     ) -> tuple[Tensor, Tensor | None]:
         """
         u, dt: [B, L, d_inner]; A: [d_inner, n]; B, C: [B, L, n]; D: [d_inner]
@@ -928,7 +983,18 @@ class MambaBlock(nn.Module):
         delta_a = torch.exp(dt_f.unsqueeze(-1) * A)  # [B, L, d_inner, n]
         delta_b_u = dt_f.unsqueeze(-1) * B_f.unsqueeze(2) * u_f.unsqueeze(-1)
 
-        states = cls._parallel_associative_scan(delta_a, delta_b_u)
+        if use_parallel_scan:
+            states = cls._parallel_associative_scan(delta_a, delta_b_u)
+        elif training:
+            states = checkpoint(
+                cls._sequential_associative_scan,
+                delta_a,
+                delta_b_u,
+                use_reentrant=False,
+            )
+        else:
+            states = cls._sequential_associative_scan(delta_a, delta_b_u)
+
         y = (states * C_f.unsqueeze(2)).sum(dim=-1)
         y = y + u_f * D.float()
         final_state = states[:, -1].contiguous() if return_final_state else None
@@ -939,11 +1005,7 @@ class CompressiveMemoryBank(nn.Module):
     """
     Fixed-size (m slots) gated read/write memory bank.
 
-    - read: tokens attend to memory as K/V — O(L * m)
-    - write: learned summary queries compress the chunk, GRU-style gate
-      blends into existing memory — O(L * m)
-
-    Memory is threaded through forward by the caller (not a module buffer).
+    Uses lightweight einsum attention (no nn.MultiheadAttention overhead).
     """
 
     def __init__(
@@ -956,13 +1018,10 @@ class CompressiveMemoryBank(nn.Module):
             )
         self.hidden_size = hidden_size
         self.memory_size = memory_size
+        self.scale = hidden_size**-0.5
 
         self.init_memory = nn.Parameter(torch.randn(memory_size, hidden_size) * 0.02)
-        self.read_attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
         self.summary_query = nn.Parameter(torch.randn(memory_size, hidden_size) * 0.02)
-        self.write_attn = nn.MultiheadAttention(
-            hidden_size, num_heads, batch_first=True
-        )
         self.write_gate = nn.Linear(hidden_size * 2, hidden_size)
         self.write_update = nn.Linear(hidden_size, hidden_size)
 
@@ -978,14 +1037,13 @@ class CompressiveMemoryBank(nn.Module):
 
     @staticmethod
     def _key_padding_mask(attention_mask: Tensor | None) -> Tensor | None:
-        """Convert 1=keep / 0=pad mask to MultiheadAttention key_padding_mask."""
+        """Convert 1=keep / 0=pad mask to key_padding_mask (True = ignore)."""
         if attention_mask is None:
             return None
         if attention_mask.dim() != 2:
             raise ValueError(
                 "CompressiveMemoryBank expects a 2D attention_mask [B, L]."
             )
-        # True = ignore that key position.
         return ~attention_mask.bool()
 
     def read(
@@ -994,10 +1052,10 @@ class CompressiveMemoryBank(nn.Module):
         memory: Tensor,
         attention_mask: Tensor | None = None,
     ) -> Tensor:
-        # Queries are sequence tokens; memory slots are never padded.
-        del attention_mask  # read attends to fixed memory slots, not sequence keys
-        out, _ = self.read_attn(x, memory, memory, need_weights=False)
-        return out
+        del attention_mask
+        scores = torch.matmul(x, memory.transpose(1, 2)) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        return torch.matmul(attn, memory)
 
     def write(
         self,
@@ -1007,10 +1065,12 @@ class CompressiveMemoryBank(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         batch_size = x.size(0)
         query = self.summary_query.unsqueeze(0).expand(batch_size, -1, -1)
+        scores = torch.matmul(query, x.transpose(1, 2)) * self.scale
         kpm = self._key_padding_mask(attention_mask)
-        chunk_summary, _ = self.write_attn(
-            query, x, x, key_padding_mask=kpm, need_weights=False
-        )
+        if kpm is not None:
+            scores = scores.masked_fill(kpm.unsqueeze(1), float("-inf"))
+        attn = F.softmax(scores, dim=-1)
+        chunk_summary = torch.matmul(attn, x)
 
         gate = torch.sigmoid(
             self.write_gate(torch.cat([memory, chunk_summary], dim=-1))
@@ -1033,6 +1093,37 @@ class TokenGatedFusion(nn.Module):
 
 
 HybridMemoryState = tuple[Tensor, Tensor]
+
+
+def _hybrid_layer_forward(
+    layer: "HybridDecoderLayer",
+    hidden_states: Tensor,
+    memory_state: HybridMemoryState | None,
+    attention_mask: Tensor | None,
+    position_ids: Tensor | None,
+    past_key_value: tuple[Tensor, Tensor] | None,
+    mamba_cache: MambaCache | None,
+    use_cache: bool,
+    skip_memory_write: bool,
+) -> tuple[
+    Tensor,
+    Tensor,
+    Tensor,
+    tuple[Tensor, Tensor] | None,
+    HybridMemoryState | None,
+    MambaCache | None,
+    dict[str, Tensor],
+]:
+    return layer(
+        hidden_states,
+        memory_state=memory_state,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_value=past_key_value,
+        mamba_cache=mamba_cache,
+        use_cache=use_cache,
+        skip_memory_write=skip_memory_write,
+    )
 
 
 class HybridDecoderLayer(nn.Module):
@@ -1058,6 +1149,7 @@ class HybridDecoderLayer(nn.Module):
             conv_kernel=config.mamba_conv_kernel,
             expand=config.mamba_expand,
             dt_rank=config.mamba_dt_rank,
+            use_parallel_scan=config.use_parallel_scan,
         )
 
         if self.use_dual_memory:
@@ -1126,6 +1218,7 @@ class HybridDecoderLayer(nn.Module):
         past_key_value: tuple[Tensor, Tensor] | None = None,
         mamba_cache: MambaCache | None = None,
         use_cache: bool = False,
+        skip_memory_write: bool = False,
     ) -> tuple[
         Tensor,
         Tensor,
@@ -1149,6 +1242,11 @@ class HybridDecoderLayer(nn.Module):
                 )
             token_attention_mask = attention_mask[:, -seq_len:]
 
+        hidden_mask: Tensor | None = None
+        if token_attention_mask is not None:
+            hidden_mask = token_attention_mask.unsqueeze(-1).to(x_norm.dtype)
+            x_norm = x_norm * hidden_mask
+
         new_memory_state = memory_state
         gate_stats: dict[str, Tensor] = {}
         attn_input = x_norm
@@ -1170,6 +1268,10 @@ class HybridDecoderLayer(nn.Module):
             )
             mamba_input = self.state_memory_combine(torch.cat([x_norm, s_read], dim=-1))
 
+        if hidden_mask is not None:
+            attn_input = attn_input * hidden_mask
+            mamba_input = mamba_input * hidden_mask
+
         attn_out, present_key_value = self.attention_block(
             attn_input,
             attention_mask=attention_mask,
@@ -1184,23 +1286,31 @@ class HybridDecoderLayer(nn.Module):
         if self.use_dual_memory:
             assert memory_state is not None
             a_mem, s_mem = memory_state
-            # Write *raw* branch outputs (research E/F), not memory-mixed tensors.
-            new_a_mem, a_write_gate = self.attn_memory_bank.write(
-                attn_out, a_mem, attention_mask=token_attention_mask
-            )
-            new_s_mem, s_write_gate = self.state_memory_bank.write(
-                mamba_out, s_mem, attention_mask=token_attention_mask
-            )
-            new_memory_state = (new_a_mem, new_s_mem)
-            gate_stats = {
-                "attn_write_gate_mean": a_write_gate.detach().mean(),
-                "state_write_gate_mean": s_write_gate.detach().mean(),
-            }
+            if skip_memory_write:
+                new_memory_state = memory_state
+            else:
+                # Write *raw* branch outputs (research E/F), not memory-mixed tensors.
+                new_a_mem, a_write_gate = self.attn_memory_bank.write(
+                    attn_out, a_mem, attention_mask=token_attention_mask
+                )
+                new_s_mem, s_write_gate = self.state_memory_bank.write(
+                    mamba_out, s_mem, attention_mask=token_attention_mask
+                )
+                new_memory_state = (new_a_mem, new_s_mem)
+                gate_stats = {
+                    "attn_write_gate_mean": a_write_gate.detach().mean(),
+                    "state_write_gate_mean": s_write_gate.detach().mean(),
+                }
 
         fused, _fusion_gate = self.fusion(attn_out, mamba_out)
+        if hidden_mask is not None:
+            fused = fused * hidden_mask
         x = residual + fused
 
-        moe_out, aux_loss, z_loss = self.moe_block(self.rmsnorm_moe(x))
+        moe_in = self.rmsnorm_moe(x)
+        if hidden_mask is not None:
+            moe_in = moe_in * hidden_mask
+        moe_out, aux_loss, z_loss = self.moe_block(moe_in)
         x_out = x + moe_out
 
         return (
@@ -1291,6 +1401,7 @@ class HybridModel(nn.Module):
         mamba_caches: list[MambaCache | None] | None = None,
         past_seen_tokens: int | None = None,
         use_cache: bool = False,
+        skip_memory_write: bool = False,
     ) -> tuple[
         Tensor,
         Tensor,
@@ -1339,23 +1450,49 @@ class HybridModel(nn.Module):
             layer_memory = memory_states[i] if memory_states is not None else None
             layer_mamba = mamba_caches[i] if mamba_caches is not None else None
 
-            (
-                hidden_states,
-                layer_aux_loss,
-                layer_z_loss,
-                present_kv,
-                layer_new_memory,
-                layer_new_mamba,
-                layer_gate_stats,
-            ) = layer(
-                hidden_states,
-                memory_state=layer_memory,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=layer_past_kv,
-                mamba_cache=layer_mamba,
-                use_cache=use_cache,
-            )
+            layer_fn = _hybrid_layer_forward
+            if self.config.gradient_checkpointing and self.training and not use_cache:
+                (
+                    hidden_states,
+                    layer_aux_loss,
+                    layer_z_loss,
+                    present_kv,
+                    layer_new_memory,
+                    layer_new_mamba,
+                    layer_gate_stats,
+                ) = checkpoint(
+                    layer_fn,
+                    layer,
+                    hidden_states,
+                    layer_memory,
+                    attention_mask,
+                    position_ids,
+                    layer_past_kv,
+                    layer_mamba,
+                    use_cache,
+                    skip_memory_write,
+                    use_reentrant=False,
+                )
+            else:
+                (
+                    hidden_states,
+                    layer_aux_loss,
+                    layer_z_loss,
+                    present_kv,
+                    layer_new_memory,
+                    layer_new_mamba,
+                    layer_gate_stats,
+                ) = layer_fn(
+                    layer,
+                    hidden_states,
+                    layer_memory,
+                    attention_mask,
+                    position_ids,
+                    layer_past_kv,
+                    layer_mamba,
+                    use_cache,
+                    skip_memory_write,
+                )
             total_aux_loss = total_aux_loss + layer_aux_loss
             total_z_loss = total_z_loss + layer_z_loss
             new_memory_states.append(layer_new_memory)
@@ -1366,10 +1503,11 @@ class HybridModel(nn.Module):
                 new_mamba_caches.append(layer_new_mamba)
 
         hidden_states = self.norm(hidden_states)
+        n_layers = max(len(self.layers), 1)
         return (
             hidden_states,
-            total_aux_loss,
-            total_z_loss,
+            total_aux_loss / n_layers,
+            total_z_loss / n_layers,
             present_key_values,
             new_memory_states,
             new_mamba_caches,
@@ -1401,6 +1539,25 @@ class HybridForCausalLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.init_range)
 
+    def _memory_write_interval(self) -> int:
+        interval = self.config.memory_write_interval
+        if interval is not None:
+            return max(1, interval)
+        chunk = self.config.memory_chunk_size
+        return max(1, chunk if chunk is not None else 512)
+
+    def _should_chunk_training(
+        self, seq_len: int, use_cache: bool, memory_states: list | None
+    ) -> bool:
+        chunk_size = self.config.memory_chunk_size
+        return (
+            self.config.use_dual_memory
+            and chunk_size is not None
+            and seq_len > chunk_size
+            and not use_cache
+            and memory_states is None
+        )
+
     def forward(
         self,
         input_ids: Tensor,
@@ -1412,7 +1569,17 @@ class HybridForCausalLM(nn.Module):
         past_seen_tokens: int | None = None,
         use_cache: bool = False,
         labels: Tensor | None = None,
+        skip_memory_write: bool = False,
     ) -> HybridTrainingOutput:
+        seq_len = input_ids.size(1)
+        if self._should_chunk_training(seq_len, use_cache, memory_states):
+            return self._forward_chunked(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                labels=labels,
+            )
+
         (
             hidden_states,
             aux_loss,
@@ -1430,6 +1597,7 @@ class HybridForCausalLM(nn.Module):
             mamba_caches=mamba_caches,
             past_seen_tokens=past_seen_tokens,
             use_cache=use_cache,
+            skip_memory_write=skip_memory_write,
         )
         logits = self.lm_head(hidden_states)
 
@@ -1454,6 +1622,90 @@ class HybridForCausalLM(nn.Module):
             memory_states=new_memory_states,
             mamba_caches=new_mamba_caches,
             gate_stats=gate_stats,
+        )
+
+    def _forward_chunked(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor | None,
+        position_ids: Tensor | None,
+        labels: Tensor | None,
+    ) -> HybridTrainingOutput:
+        """BPTT through memory banks within one backward pass."""
+        chunk_size = self.config.memory_chunk_size
+        assert chunk_size is not None
+        seq_len = input_ids.size(1)
+        batch_size = input_ids.size(0)
+        device = input_ids.device
+
+        memory_states: list[HybridMemoryState | None] | None = None
+        logits_chunks: list[Tensor] = []
+        total_aux = torch.tensor(0.0, device=device)
+        total_z = torch.tensor(0.0, device=device)
+        all_gate_stats: dict[str, Tensor] = {}
+        num_chunks = 0
+
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            chunk_ids = input_ids[:, start:end]
+            chunk_mask = (
+                attention_mask[:, start:end] if attention_mask is not None else None
+            )
+            if position_ids is not None:
+                chunk_pos = position_ids[:, start:end]
+            else:
+                chunk_pos = (
+                    torch.arange(start, end, dtype=torch.long, device=device)
+                    .unsqueeze(0)
+                    .expand(batch_size, -1)
+                )
+
+            (
+                hidden_states,
+                aux_loss,
+                z_loss,
+                _,
+                memory_states,
+                _,
+                gate_stats,
+            ) = self.model(
+                input_ids=chunk_ids,
+                memory_states=memory_states,
+                attention_mask=chunk_mask,
+                position_ids=chunk_pos,
+                use_cache=False,
+            )
+            logits_chunks.append(self.lm_head(hidden_states))
+            total_aux = total_aux + aux_loss
+            total_z = total_z + z_loss
+            all_gate_stats.update(gate_stats)
+            num_chunks += 1
+
+        logits = torch.cat(logits_chunks, dim=1)
+        aux_loss = total_aux / max(num_chunks, 1)
+        z_loss = total_z / max(num_chunks, 1)
+
+        loss = None
+        ce_loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
+            loss = (
+                ce_loss
+                + (self.router_aux_loss_coef * aux_loss)
+                + (self.router_z_loss_coef * z_loss)
+            )
+
+        return HybridTrainingOutput(
+            logits=logits,
+            loss=loss,
+            ce_loss=ce_loss,
+            router_aux_loss=aux_loss,
+            router_z_loss=z_loss,
+            past_key_values=None,
+            memory_states=memory_states,
+            mamba_caches=None,
+            gate_stats=all_gate_stats,
         )
 
     @torch.no_grad()
@@ -1518,6 +1770,8 @@ class HybridForCausalLM(nn.Module):
         memory_states = out.memory_states
         mamba_caches = out.mamba_caches
         past_seen_tokens = prompt_len
+        write_interval = self._memory_write_interval()
+        tokens_since_write = prompt_len
 
         try:
             for step in range(max_new_tokens):
@@ -1547,6 +1801,10 @@ class HybridForCausalLM(nn.Module):
                 if finished.all():
                     break
 
+                active = ~finished
+                if not active.any():
+                    break
+
                 step_position_ids = torch.full(
                     (batch_size, 1),
                     past_seen_tokens,
@@ -1557,8 +1815,13 @@ class HybridForCausalLM(nn.Module):
                 if step_attn_mask.size(1) > self.config.window_size:
                     step_attn_mask = step_attn_mask[:, -self.config.window_size :]
 
+                step_input = next_token.clone()
+                step_input[~active] = 0
+                tokens_since_write += 1
+                do_memory_write = tokens_since_write % write_interval == 0
+
                 out = self.forward(
-                    input_ids=next_token,
+                    input_ids=step_input,
                     attention_mask=step_attn_mask,
                     position_ids=step_position_ids,
                     past_key_values=past_key_values,
@@ -1566,6 +1829,7 @@ class HybridForCausalLM(nn.Module):
                     mamba_caches=mamba_caches,
                     past_seen_tokens=past_seen_tokens,
                     use_cache=True,
+                    skip_memory_write=not do_memory_write,
                 )
                 past_key_values = out.past_key_values
                 memory_states = out.memory_states
@@ -1583,14 +1847,38 @@ def count_trainable_params(module: nn.Module) -> int:
 
 def build_test3_null_baseline_config(
     hybrid_config: HybridMambaMoEConfig,
+    tolerance: float = 0.02,
 ) -> HybridMambaMoEConfig:
     """
     Test 3 null hypothesis: larger Mamba state, no explicit memory banks.
-    Heuristic bump — verify with count_trainable_params and adjust.
+    Binary-searches mamba_state_size (then mamba_expand) to match param count.
     """
-    import copy
-
+    target = count_trainable_params(HybridForCausalLM(hybrid_config))
     null_config = copy.deepcopy(hybrid_config)
     null_config.use_dual_memory = False
-    null_config.mamba_state_size = hybrid_config.mamba_state_size * 4
+
+    def _count(cfg: HybridMambaMoEConfig) -> int:
+        return count_trainable_params(HybridForCausalLM(cfg))
+
+    best_state = null_config.mamba_state_size
+    lo, hi = null_config.mamba_state_size, null_config.mamba_state_size * 128
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        null_config.mamba_state_size = mid
+        if _count(null_config) <= target:
+            best_state = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    null_config.mamba_state_size = best_state
+    if _count(null_config) < target * (1.0 - tolerance):
+        best_expand = null_config.mamba_expand
+        for expand in range(null_config.mamba_expand, 9):
+            null_config.mamba_expand = expand
+            if _count(null_config) > target * (1.0 + tolerance):
+                break
+            best_expand = expand
+        null_config.mamba_expand = best_expand
+
     return null_config

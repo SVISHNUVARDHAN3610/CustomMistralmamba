@@ -1,2 +1,6 @@
-ruff
-pre-commit
+# Runtime — model.py + tests/test_model.py
+torch>=2.1.0
+
+# Development — lint (CI) and local git hooks
+ruff>=0.6.0
+pre-commit>=3.0.0

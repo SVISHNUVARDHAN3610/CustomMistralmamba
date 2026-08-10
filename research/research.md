@@ -158,24 +158,23 @@ A full reference implementation exists in `model.py`:
 
 - ✅ `MixtralConfig` / `MixtralForCausalLM` — baseline (sliding-window GQA +
   Top-2 MoE), used as the control model for all comparisons below.
-- ✅ `MambaBlock` — selective SSM with a **pure-PyTorch parallel associative
-  scan** for prefill/training (no per-token Python loop) and incremental
-  `(conv_state, ssm_state)` step cache for decode. No custom CUDA kernel
-  dependency; runs on any SDPA-compatible device. Peak activation memory for
-  the scan is still O(L·d·n) because the unfused implementation materializes
-  the expanded state — acceptable on large training GPUs, a known limit vs
-  fused selective-scan kernels.
-- ✅ `CompressiveMemoryBank` — gated read/write memory. Banks are **read into**
-  each branch (condition GQA/Mamba inputs) and **written from raw branch
-  outputs**, matching §3.2. Padding masks are applied on write so pad tokens
-  do not pollute summaries. State is threaded across chunks.
+- ✅ `MambaBlock` — selective SSM with a **checkpointed sequential associative
+  scan** for training (O(L) work, bounded activation memory; default) and an
+  optional Hillis-Steele parallel scan (`use_parallel_scan=True`) for short
+  sequences. Incremental `(conv_state, ssm_state)` step cache for decode. No
+  custom CUDA kernel dependency.
+- ✅ `CompressiveMemoryBank` — lightweight einsum read/write memory. Banks are
+  **read into** each branch and **written from raw branch outputs**, matching
+  §3.2. Padding masks zero Mamba/MoE paths and mask memory writes.
 - ✅ `TokenGatedFusion` — O(L) branch fusion.
-- ✅ `HybridForCausalLM` — full model wiring; forward/backward verified;
-  memory-on, memory-off (`use_dual_memory=False`), and memory-zeroed-at-
-  inference (`zero_memory_states`) hooks for §6 tests.
-- ✅ `generate()` — autoregressive decoding (greedy + temperature/top-k/top-p,
-  per-sequence EOS) with incremental KV + Mamba + memory caches — O(L) total
-  cost. Absolute positions use `past_seen_tokens` (not truncated KV length).
+- ✅ `HybridForCausalLM` — full model wiring; **internal `memory_chunk_size`
+  chunking** threads memory across chunks in one backward (BPTT for write
+  params). Hooks: `use_dual_memory=False`, `zero_memory_states`, and
+  `build_test3_null_baseline_config()` (parameter-matched via binary search).
+- ✅ `generate()` — incremental KV + Mamba + memory caches; memory writes
+  batched every `memory_write_interval` tokens (defaults to `memory_chunk_size`).
+- ✅ `capacity_factor` defaults to `None` (fully dropless, batch-independent).
+  Set only for memory-constrained hardware.
 
 **Caching correctness:** `tests/test_model.py` checks incremental vs full-forward
 last-logit cosine similarity on a small config. Re-run before latency-sensitive
@@ -204,7 +203,7 @@ no benefit.
 | Test | Method | Pass condition |
 |---|---|---|
 | **1. Rare-fact recall** | Inject a single, non-recurring fact early in a long sequence; query for exact recall late. Compare memory-on vs. memory-zeroed at inference. | Recall degrades sharply when memory is zeroed |
-| **2. Write-gate activity monitoring** | Log gate values from the memory write rule across training | Gates show non-degenerate activity (not saturating near 0 or 1) |
+| **2. Write-gate activity monitoring** | Log gate values from the memory write rule across training | Gates show non-degenerate activity (not saturating near 0 or 1). **Requires** `memory_chunk_size` chunking (or explicit cross-chunk memory threading) so write params receive gradients — random init gates ≈0.5 are not sufficient evidence alone. |
 | **3. Matched-parameter null hypothesis** | Train a baseline with a larger Mamba state dimension instead of the memory subsystem, at roughly matched parameter count | Memory-bank model beats the bigger-state baseline on rare-fact recall |
 
 All three should point the same direction before this architecture is
@@ -218,7 +217,7 @@ more machinery on top of a mechanism that hasn't earned its place.
 
 | Challenge | Notes |
 |---|---|
-| Chunk size vs. memory size tradeoff | Smaller chunks → more frequent, more responsive memory writes but more overhead; needs empirical sweep |
+| Chunk size vs. memory size tradeoff | `memory_chunk_size` (training) and `memory_write_interval` (decode) should be matched; sweep empirically |
 | Write-gate saturation | Same failure mode as vanilla RNNs over very long sequences; may need periodic reset or regularization |
 | Router collapse (MoE) | Standard Mixtral-class issue; load-balancing auxiliary loss already implemented |
 | Hardware efficiency | Selective scan is parallelized in pure PyTorch but still **unfused** (materializes O(L·d·n) state); memory read/write is small-shaped and may not be GPU-efficient without custom kernels |

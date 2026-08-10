@@ -11,6 +11,7 @@ from model import (
     HybridMambaMoEConfig,
     MixtralConfig,
     MixtralForCausalLM,
+    build_test3_null_baseline_config,
     count_trainable_params,
 )
 
@@ -175,6 +176,80 @@ class TestHybridModel(unittest.TestCase):
         ids = torch.randint(0, 1000, (1, 8))
         out = m(input_ids=ids)
         self.assertEqual(out.logits.shape[-1], 1000)
+
+    def test_capacity_none_deterministic(self) -> None:
+        """Same prompt alone vs batched should match when capacity_factor=None."""
+        cfg = _small_hybrid_config(capacity_factor=None)
+        model = HybridForCausalLM(cfg).eval()
+        prompt = torch.randint(0, cfg.vocab_size, (1, 16))
+        alone = model(input_ids=prompt).logits
+        batched = model(input_ids=torch.cat([prompt] * 4, dim=0)).logits[:1]
+        diff = (alone - batched).abs().max().item()
+        self.assertLess(diff, 1e-5)
+
+    def test_memory_write_grad_multi_chunk(self) -> None:
+        """Internal chunked BPTT must train memory write parameters."""
+        cfg = _small_hybrid_config(memory_chunk_size=8)
+        model = HybridForCausalLM(cfg)
+        model.train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 24))
+        labels = torch.randint(0, cfg.vocab_size, (1, 24))
+        out = model(input_ids=ids, labels=labels)
+        out.loss.backward()
+        write_w = model.model.layers[0].attn_memory_bank.write_gate.weight
+        self.assertIsNotNone(write_w.grad)
+        self.assertGreater(write_w.grad.abs().sum().item(), 0.0)
+
+    def test_padding_mamba_moe(self) -> None:
+        """Valid positions should match between padded and trimmed batches."""
+        cfg = _small_hybrid_config()
+        model = HybridForCausalLM(cfg).eval()
+        ids = torch.randint(1, cfg.vocab_size, (1, 12))
+        padded = torch.cat([ids, torch.zeros(1, 4, dtype=torch.long)], dim=1)
+        mask = torch.cat(
+            [torch.ones(1, 12, dtype=torch.long), torch.zeros(1, 4, dtype=torch.long)],
+            dim=1,
+        )
+        trimmed_logits = model(input_ids=ids).logits
+        padded_logits = model(input_ids=padded, attention_mask=mask).logits[:, :12]
+        diff = (trimmed_logits - padded_logits).abs().max().item()
+        self.assertLess(diff, 1e-4)
+
+    def test_null_baseline_param_match(self) -> None:
+        cfg = _small_hybrid_config()
+        full = count_trainable_params(HybridForCausalLM(cfg))
+        null_cfg = build_test3_null_baseline_config(cfg)
+        null_n = count_trainable_params(HybridForCausalLM(null_cfg))
+        self.assertFalse(null_cfg.use_dual_memory)
+        ratio = null_n / full
+        self.assertGreater(ratio, 0.98)
+        self.assertLess(ratio, 1.02)
+
+    def test_scan_checkpoint_long_seq(self) -> None:
+        """Checkpointed sequential scan should run moderate L without error."""
+        cfg = _small_hybrid_config(
+            hidden_size=64,
+            num_heads=2,
+            num_kv_heads=1,
+            head_dim=32,
+            intermediate_size=128,
+            num_layers=1,
+            memory_chunk_size=None,
+            use_parallel_scan=False,
+        )
+        model = HybridForCausalLM(cfg)
+        model.train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 128))
+        labels = torch.randint(0, cfg.vocab_size, (1, 128))
+        out = model(input_ids=ids, labels=labels)
+        out.loss.backward()
+
+    def test_generate_memory_write_interval(self) -> None:
+        cfg = _small_hybrid_config(memory_write_interval=4, memory_chunk_size=4)
+        model = HybridForCausalLM(cfg).eval()
+        prompt = torch.randint(0, cfg.vocab_size, (1, 6))
+        gen = model.generate(prompt, max_new_tokens=8, do_sample=False)
+        self.assertEqual(gen.shape[1], 14)
 
 
 if __name__ == "__main__":
