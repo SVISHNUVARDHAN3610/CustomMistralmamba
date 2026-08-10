@@ -156,7 +156,7 @@ L_assoc = (1/T) · Σ_t  clip(s_t, 0, 3σ) · ‖ v̂_t − v_t ‖²₂
 
 | Param | Default | Range | Notes |
 |-------|---------|-------|-------|
-| `lambda_assoc` | `0.03` | `[0.02, 0.05]` | Ramp from 0 over first 5% of training steps |
+| `lambda_assoc` | `1.2e-4` | `[5e-5, 3e-4]` | Ramp from 0 over first 5% of training steps; scaled for `.sum(dim=-1)` squared L2 |
 | `T` | `24` | `[16, 32]` | Fixed sample count per chunk |
 | Warm-up | 0 → full over steps 0–5% | — | Memory needs basic content before retrieval scoring |
 
@@ -343,7 +343,7 @@ For memory `M ∈ ℝ^{B×m×d}`, row-normalize `M̂_p = M_p / ‖M_p‖`:
 ```
 L_slot_intra = (1/m²) · Σ_{p≠q} max(0, cos_sim(M̂_p, M̂_q) − τ)²
 
-L_slot_cross = (1/m) · Σ_p cos_sim(M̂_p^attn, M̂_p^state)    # weak decorrelation
+L_slot_cross = (1/m) · Σ_p |cos_sim(M̂_p^attn, M̂_p^state)|    # weak decorrelation (abs prevents anti-aligned slots)
 
 L_slot = L_slot_intra + α · L_slot_cross
 ```
@@ -370,7 +370,8 @@ L_total = (
     + router_aux_loss_coef * aux_loss  # 0.02
     + router_z_loss_coef * z_loss  # 5e-3
     + lambda_recon * L_recon  # 0.08
-    + assoc_weight(step) * L_assoc  # → 0.03 (5% warm-up)
+    + assoc_weight(step)
+    * L_assoc  # → 1.2e-4 (5% warm-up; squared L2 uses sum over hidden)
     + lambda_gate * L_gate  # 1e-3
     + lambda_read * L_read  # 5e-3
     + lambda_fusion * L_fusion  # 8e-3

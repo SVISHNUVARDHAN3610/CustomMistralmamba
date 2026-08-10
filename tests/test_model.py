@@ -12,7 +12,11 @@ from model import (
     HybridMambaMoEConfig,
     MixtralConfig,
     MixtralForCausalLM,
+    SwiGLUExpert,
+    _aux_loss_schedule,
+    _expert_loss_schedule,
     _write_buffer_token_len,
+    associative_retrieval_loss,
     build_test3_null_baseline_config,
     count_trainable_params,
 )
@@ -219,9 +223,7 @@ class TestHybridModel(unittest.TestCase):
 
     def test_null_baseline_param_match(self) -> None:
         cfg = _small_hybrid_config()
-        full = count_trainable_params(
-            HybridForCausalLM(cfg), exclude_training_aux=True
-        )
+        full = count_trainable_params(HybridForCausalLM(cfg), exclude_training_aux=True)
         null_cfg = build_test3_null_baseline_config(cfg)
         null_n = count_trainable_params(HybridForCausalLM(null_cfg))
         self.assertFalse(null_cfg.use_dual_memory)
@@ -723,6 +725,192 @@ class TestHybridModel(unittest.TestCase):
         grad = layer.attn_memory_bank.write_gate.weight.grad
         self.assertIsNotNone(grad)
         self.assertGreater(grad.abs().max().item(), 0.0)
+
+    def test_chunked_path_respects_assoc_warmup(self) -> None:
+        cfg = _small_hybrid_config(memory_chunk_size=8, lambda_assoc=1.0)
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 24))
+        labels = torch.randint(0, cfg.vocab_size, (1, 24))
+        out = model(
+            input_ids=ids,
+            labels=labels,
+            training_step=0,
+            max_training_steps=1000,
+        )
+        assert out.auxiliary_losses is not None
+        scale = _aux_loss_schedule(0, 1000, cfg.assoc_warmup_fraction)
+        self.assertEqual(scale, 0.0)
+        weighted_assoc = cfg.lambda_assoc * scale * out.auxiliary_losses.assoc
+        self.assertEqual(weighted_assoc.item(), 0.0)
+
+    def test_assoc_loss_uses_squared_l2_norm(self) -> None:
+        from model import CompressiveMemoryBank
+
+        hidden = 64
+        bank = CompressiveMemoryBank(hidden, memory_size=8, num_heads=4)
+        x = torch.randn(1, 4, hidden)
+        new_mem = bank.init_state(1, x.device, x.dtype)
+        residual = torch.ones(1, 4)
+        torch.manual_seed(0)
+        associative_retrieval_loss(
+            bank, x, new_mem, residual, sample_count=4, attention_mask=None
+        )
+        keys = bank.assoc_key(x)
+        values = bank.assoc_val(x)
+        retrieved = bank.read_query(keys, new_mem)
+        err_sum = (retrieved - values).pow(2).sum(dim=-1).mean()
+        self.assertGreater(err_sum.item(), 0.0)
+        err_mean = (retrieved - values).pow(2).mean(dim=-1).mean()
+        self.assertGreater(err_sum.item(), err_mean.item() * (hidden - 1))
+
+    def test_expert_loss_top_k_1_no_crash(self) -> None:
+        cfg = _small_hybrid_config(top_k=1, num_experts=4)
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 12))
+        labels = torch.randint(0, cfg.vocab_size, (1, 12))
+        out = model(
+            input_ids=ids,
+            labels=labels,
+            training_step=100,
+            max_training_steps=100,
+        )
+        assert out.auxiliary_losses is not None
+        self.assertFalse(torch.isnan(out.auxiliary_losses.expert))
+
+    def test_recon_decoder_single_call_per_bank(self) -> None:
+        cfg = _small_hybrid_config(memory_chunk_size=8, num_layers=1)
+        model = HybridForCausalLM(cfg).train()
+        layer = model.model.layers[0]
+        calls = {"attn": 0, "state": 0}
+        orig_attn = layer.attn_memory_bank.recon_decoder.forward
+        orig_state = layer.state_memory_bank.recon_decoder.forward
+
+        def attn_forward(*args, **kwargs):
+            calls["attn"] += 1
+            return orig_attn(*args, **kwargs)
+
+        def state_forward(*args, **kwargs):
+            calls["state"] += 1
+            return orig_state(*args, **kwargs)
+
+        layer.attn_memory_bank.recon_decoder.forward = attn_forward
+        layer.state_memory_bank.recon_decoder.forward = state_forward
+        ids = torch.randint(0, cfg.vocab_size, (1, 8))
+        labels = torch.randint(0, cfg.vocab_size, (1, 8))
+        out = model(input_ids=ids, labels=labels)
+        assert out.loss is not None
+        out.loss.backward()
+        self.assertEqual(calls["attn"], 1)
+        self.assertEqual(calls["state"], 1)
+
+    def test_expert_forward_count_no_duplicate_dispatch(self) -> None:
+        cfg = _small_hybrid_config(memory_chunk_size=None, num_layers=1)
+        model = HybridForCausalLM(cfg).train()
+        expert_calls = 0
+        orig = SwiGLUExpert.forward
+
+        def counted_forward(self, x):
+            nonlocal expert_calls
+            expert_calls += 1
+            return orig(self, x)
+
+        with mock.patch.object(SwiGLUExpert, "forward", counted_forward):
+            ids = torch.randint(0, cfg.vocab_size, (2, 12))
+            labels = torch.randint(0, cfg.vocab_size, (2, 12))
+            out = model(
+                input_ids=ids,
+                labels=labels,
+                training_step=100,
+                max_training_steps=100,
+            )
+            assert out.loss is not None
+            out.loss.backward()
+        baseline_calls = 0
+
+        def baseline_forward(self, x):
+            nonlocal baseline_calls
+            baseline_calls += 1
+            return orig(self, x)
+
+        with mock.patch.object(SwiGLUExpert, "forward", baseline_forward):
+            cfg_off = _small_hybrid_config(
+                memory_chunk_size=None, num_layers=1, use_auxiliary_losses=False
+            )
+            model_off = HybridForCausalLM(cfg_off).train()
+            model_off.load_state_dict(model.state_dict(), strict=False)
+            out_off = model_off(input_ids=ids, labels=labels)
+            assert out_off.loss is not None
+            out_off.loss.backward()
+        self.assertEqual(expert_calls, baseline_calls)
+
+    def test_expert_loss_gated_before_warmup(self) -> None:
+        cfg = _small_hybrid_config(memory_chunk_size=None, num_layers=1)
+        model = HybridForCausalLM(cfg).train()
+        expert_calls = 0
+        orig = SwiGLUExpert.forward
+
+        def counted_forward(self, x):
+            nonlocal expert_calls
+            expert_calls += 1
+            return orig(self, x)
+
+        with mock.patch.object(SwiGLUExpert, "forward", counted_forward):
+            ids = torch.randint(0, cfg.vocab_size, (2, 12))
+            labels = torch.randint(0, cfg.vocab_size, (2, 12))
+            out = model(
+                input_ids=ids,
+                labels=labels,
+                training_step=0,
+                max_training_steps=100,
+            )
+            assert out.loss is not None
+            out.loss.backward()
+        self.assertEqual(_expert_loss_schedule(0, 100, cfg.expert_warmup_fraction), 0.0)
+        assert out.auxiliary_losses is not None
+        self.assertEqual(out.auxiliary_losses.expert.item(), 0.0)
+
+    def test_mamba_right_pad_cache_init(self) -> None:
+        cfg = _small_hybrid_config(debug_state_checks=True)
+        model = HybridForCausalLM(cfg).eval()
+        ids = torch.randint(0, cfg.vocab_size, (1, 12))
+        mask = torch.ones(1, 12, dtype=torch.long)
+        out = model(input_ids=ids, attention_mask=mask, use_cache=True)
+        self.assertEqual(out.logits.shape[1], 12)
+        bad_mask = torch.tensor([[1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
+        with self.assertRaises(ValueError):
+            model(input_ids=ids, attention_mask=bad_mask, use_cache=True)
+
+    def test_chunked_streaming_ce_matches_full_ce(self) -> None:
+        torch.manual_seed(11)
+        cfg = _small_hybrid_config(
+            memory_chunk_size=8,
+            stream_chunked_ce_loss=True,
+            return_logits=True,
+        )
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 24))
+        labels = torch.randint(0, cfg.vocab_size, (1, 24))
+        out = model(input_ids=ids, labels=labels)
+        assert out.ce_loss is not None
+        assert out.logits is not None
+        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=cfg.label_ignore_index)
+        manual_ce = loss_fct(out.logits.view(-1, cfg.vocab_size), labels.reshape(-1))
+        self.assertLess(abs(out.ce_loss.item() - manual_ce.item()), 1e-5)
+
+    def test_chunked_streaming_ce_no_full_logits(self) -> None:
+        cfg = _small_hybrid_config(
+            memory_chunk_size=8,
+            stream_chunked_ce_loss=True,
+            return_logits=False,
+        )
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 24))
+        labels = torch.randint(0, cfg.vocab_size, (1, 24))
+        out = model(input_ids=ids, labels=labels)
+        self.assertIsNone(out.logits)
+        self.assertIsNotNone(out.loss)
+        assert out.loss is not None
+        out.loss.backward()
 
 
 if __name__ == "__main__":

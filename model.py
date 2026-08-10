@@ -444,32 +444,25 @@ class MOERouter(nn.Module):
 
 
 def expert_specialization_loss(
-    x_flat: Tensor,
+    expert_out: Tensor,
     logits: Tensor,
-    topk_indices: Tensor,
-    experts: nn.ModuleList,
     var_beta: float,
 ) -> Tensor:
     """Orthogonality + routing variance loss (Guo et al., NeurIPS 2025)."""
-    num_tokens, top_k = topk_indices.shape
-    hidden = x_flat.size(-1)
-    device = x_flat.device
-    dtype = x_flat.dtype
-
-    expert_out = torch.zeros(num_tokens, top_k, hidden, device=device, dtype=dtype)
-    for k in range(top_k):
-        for expert_idx, expert in enumerate(experts):
-            mask = topk_indices[:, k] == expert_idx
-            if not mask.any():
-                continue
-            expert_out[mask, k] = expert(x_flat[mask])
-
-    e0 = expert_out[:, 0]
-    e1 = expert_out[:, 1]
-    cos = F.cosine_similarity(e0, e1, dim=-1).abs().mean()
+    top_k = expert_out.size(1)
+    cos_terms: list[Tensor] = []
+    for i in range(top_k):
+        for j in range(i + 1, top_k):
+            cos_terms.append(
+                F.cosine_similarity(expert_out[:, i], expert_out[:, j], dim=-1).abs()
+            )
+    if cos_terms:
+        l_ortho = torch.stack(cos_terms, dim=0).mean()
+    else:
+        l_ortho = torch.tensor(0.0, device=expert_out.device, dtype=expert_out.dtype)
     full_probs = F.softmax(logits, dim=-1)
     var_loss = -full_probs.var(dim=-1, unbiased=False).mean()
-    return cos + var_beta * var_loss
+    return l_ortho + var_beta * var_loss
 
 
 class DroplessMoELayer(nn.Module):
@@ -514,18 +507,20 @@ class DroplessMoELayer(nn.Module):
         num_tokens = x_flat.size(0)
 
         topk_weights, topk_indices, aux_loss, z_loss, logits = self.router(x_flat)
+        top_k = topk_indices.size(1)
         moe_output = torch.zeros_like(x_flat)
         applied_weights = torch.zeros(
             num_tokens, device=x_flat.device, dtype=x_flat.dtype
         )
         expert_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
+        expert_out: Tensor | None = None
         if compute_expert_loss and self.training:
-            expert_loss = expert_specialization_loss(
-                x_flat,
-                logits,
-                topk_indices,
-                self.experts,
-                var_beta=expert_var_beta,
+            expert_out = torch.zeros(
+                num_tokens,
+                top_k,
+                x_flat.size(-1),
+                device=x_flat.device,
+                dtype=x_flat.dtype,
             )
 
         capacity = None
@@ -560,6 +555,8 @@ class DroplessMoELayer(nn.Module):
 
             expert_inputs = x_flat[row_indices]
             expert_outputs = self.experts[expert_idx](expert_inputs)
+            if expert_out is not None:
+                expert_out[row_indices, k_indices] = expert_outputs
 
             gating_scale = topk_weights[row_indices, k_indices].unsqueeze(-1)
             moe_output.index_add_(0, row_indices, expert_outputs * gating_scale)
@@ -576,6 +573,11 @@ class DroplessMoELayer(nn.Module):
                 torch.ones_like(renorm),
             )
             moe_output = moe_output * renorm.unsqueeze(-1)
+
+        if expert_out is not None:
+            expert_loss = expert_specialization_loss(
+                expert_out, logits, var_beta=expert_var_beta
+            )
 
         return moe_output.reshape(*orig_shape), aux_loss, z_loss, expert_loss
 
@@ -826,10 +828,14 @@ class HybridMambaMoEConfig(MixtralConfig):
     gradient_checkpointing: bool = False
     debug_state_checks: bool = False
 
+    # Chunked training: stream CE per chunk to avoid materializing [B, L, V].
+    stream_chunked_ce_loss: bool = True
+    return_logits: bool = True
+
     # Auxiliary training losses (see loss-definitions.md). Training-only.
     use_auxiliary_losses: bool = True
     lambda_recon: float = 0.08
-    lambda_assoc: float = 0.03
+    lambda_assoc: float = 1.2e-4
     assoc_warmup_fraction: float = 0.05
     assoc_sample_count: int = 24
     lambda_gate: float = 1e-3
@@ -943,7 +949,7 @@ def memory_slot_diversity_loss(
     intra = _intra(attn_mem) + _intra(state_mem)
     a_norm = attn_mem / attn_mem.norm(dim=-1, keepdim=True).clamp(min=eps)
     s_norm = state_mem / state_mem.norm(dim=-1, keepdim=True).clamp(min=eps)
-    cross = (a_norm * s_norm).sum(dim=-1).mean()
+    cross = (a_norm * s_norm).sum(dim=-1).abs().mean()
     return intra + cross_alpha * cross
 
 
@@ -999,37 +1005,74 @@ def associative_retrieval_loss(
     sample_count: int,
     attention_mask: Tensor | None,
 ) -> Tensor:
-    batch_size, seq_len, _ = x.shape
+    batch_size, seq_len, hidden = x.shape
     device = x.device
+    dtype = x.dtype
     if attention_mask is not None:
         valid = attention_mask.bool()
     else:
         valid = torch.ones(batch_size, seq_len, device=device, dtype=torch.bool)
 
-    losses: list[Tensor] = []
-    for b in range(batch_size):
-        idx = torch.nonzero(valid[b], as_tuple=False).squeeze(-1)
-        if idx.numel() == 0:
-            continue
-        n = min(sample_count, idx.numel())
-        if idx.numel() > n:
-            perm = torch.randperm(idx.numel(), device=device)[:n]
-            idx = idx[perm]
-        x_b = x[b : b + 1, idx]
-        keys = bank.assoc_key(x_b)
-        values = bank.assoc_val(x_b)
-        retrieved = bank.read_query(keys, new_memory[b : b + 1])
-        err = (retrieved - values).pow(2).mean(dim=-1).squeeze(0)
-        surprise = per_token_residual[b, idx].detach()
-        if surprise.numel() > 1:
-            sigma = surprise.std().clamp(min=1e-6)
-            surprise = surprise.clamp(max=3.0 * sigma)
-        surprise = surprise.clamp(min=0.0)
-        losses.append((surprise * err).mean())
+    if not valid.any():
+        return torch.tensor(0.0, device=device, dtype=dtype)
 
-    if not losses:
-        return torch.tensor(0.0, device=device, dtype=x.dtype)
-    return torch.stack(losses).mean()
+    positions = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
+    masked_pos = torch.where(valid, positions, seq_len)
+    sorted_pos, _ = masked_pos.sort(dim=1)
+    valid_counts = valid.sum(dim=1)
+    max_valid = int(valid_counts.max().item())
+    n_sel = min(sample_count, max_valid)
+    if n_sel == 0:
+        return torch.tensor(0.0, device=device, dtype=dtype)
+
+    candidates = sorted_pos[:, :max_valid]
+    col_idx = torch.arange(max_valid, device=device).unsqueeze(0)
+    row_valid_cols = col_idx < valid_counts.unsqueeze(1)
+    rand = torch.rand(batch_size, max_valid, device=device)
+    rand = rand.masked_fill(~row_valid_cols, -1.0)
+    _, perm = rand.sort(dim=1, descending=True)
+    sel_local = perm[:, :n_sel]
+    indices = candidates.gather(1, sel_local)
+    sample_mask = torch.arange(n_sel, device=device).unsqueeze(
+        0
+    ) < valid_counts.unsqueeze(1).clamp(max=n_sel)
+
+    x_sel = x.gather(1, indices.unsqueeze(-1).expand(-1, -1, hidden))
+    keys = bank.assoc_key(x_sel)
+    values = bank.assoc_val(x_sel)
+    retrieved = bank.read_query(keys, new_memory)
+    err = (retrieved - values).pow(2).sum(dim=-1)
+    surprise = per_token_residual.gather(1, indices).detach()
+    if n_sel > 1:
+        sigma = surprise.std(dim=1, keepdim=True, unbiased=False).clamp(min=1e-6)
+        surprise = surprise.clamp(max=3.0 * sigma)
+    surprise = surprise.clamp(min=0.0)
+    weighted = surprise * err
+    per_row = (weighted * sample_mask).sum(dim=1) / sample_mask.sum(dim=1).clamp(min=1)
+    row_mask = valid_counts > 0
+    if not row_mask.any():
+        return torch.tensor(0.0, device=device, dtype=dtype)
+    return per_row[row_mask].mean()
+
+
+def _assert_right_padded_attention_mask(
+    attention_mask: Tensor, debug_state_checks: bool
+) -> None:
+    """Valid tokens must form a left prefix (right-padding), not interior holes."""
+    if not debug_state_checks:
+        return
+    valid = attention_mask.bool()
+    for b in range(valid.size(0)):
+        row = valid[b]
+        n_valid = int(row.sum().item())
+        if n_valid == 0:
+            continue
+        prefix = row[:n_valid]
+        if not prefix.all() or row[n_valid:].any():
+            raise ValueError(
+                "Mamba prefill cache init requires right-padded attention_mask "
+                "(valid tokens form a left prefix)."
+            )
 
 
 def _materialize_write_buffer(
@@ -1171,6 +1214,7 @@ class MambaBlock(nn.Module):
         use_cache: bool = False,
         attention_mask: Tensor | None = None,
         active_batch_mask: Tensor | None = None,
+        debug_state_checks: bool = False,
     ) -> tuple[Tensor, MambaCache | None, Tensor | None]:
         """
         x: [B, L, hidden_size]
@@ -1194,6 +1238,7 @@ class MambaBlock(nn.Module):
             # Keep last conv_kernel *valid* tokens as the rolling conv buffer.
             if attention_mask is not None and attention_mask.dim() == 2:
                 token_mask = attention_mask[:, -seq_len:]
+                _assert_right_padded_attention_mask(token_mask, debug_state_checks)
                 # Right-padding assumption: valid prefix length per row.
                 valid_lens = token_mask.sum(dim=1)
                 conv_state = torch.zeros(
@@ -1567,6 +1612,8 @@ def _hybrid_layer_forward(
     skip_memory_write: bool,
     write_buffer: MemoryWriteBuffer | None,
     active_batch_mask: Tensor | None,
+    training_step: int | None = None,
+    max_training_steps: int | None = None,
 ) -> tuple[
     Tensor,
     Tensor,
@@ -1589,6 +1636,8 @@ def _hybrid_layer_forward(
         skip_memory_write=skip_memory_write,
         write_buffer=write_buffer,
         active_batch_mask=active_batch_mask,
+        training_step=training_step,
+        max_training_steps=max_training_steps,
     )
 
 
@@ -1698,6 +1747,8 @@ class HybridDecoderLayer(nn.Module):
         skip_memory_write: bool = False,
         write_buffer: MemoryWriteBuffer | None = None,
         active_batch_mask: Tensor | None = None,
+        training_step: int | None = None,
+        max_training_steps: int | None = None,
     ) -> tuple[
         Tensor,
         Tensor,
@@ -1771,6 +1822,7 @@ class HybridDecoderLayer(nn.Module):
             use_cache=use_cache,
             attention_mask=mamba_token_mask,
             active_batch_mask=active_batch_mask,
+            debug_state_checks=cfg.debug_state_checks,
         )
 
         if self.use_dual_memory:
@@ -1847,37 +1899,19 @@ class HybridDecoderLayer(nn.Module):
                 }
 
                 if self.training and self.use_auxiliary_losses:
-                    attn_recon = memory_reconstruction_loss(
-                        buf_attn_cat,
-                        a_summary,
-                        self.attn_memory_bank.recon_decoder,
+                    attn_recon_out = self.attn_memory_bank.recon_decoder(
+                        buf_attn_cat, a_summary
                     )
-                    mamba_recon = memory_reconstruction_loss(
-                        buf_mamba_cat,
-                        s_summary,
-                        self.state_memory_bank.recon_decoder,
+                    mamba_recon_out = self.state_memory_bank.recon_decoder(
+                        buf_mamba_cat, s_summary
                     )
+                    attn_recon = F.mse_loss(attn_recon_out, buf_attn_cat)
+                    mamba_recon = F.mse_loss(mamba_recon_out, buf_mamba_cat)
                     attn_recon_tok = (
-                        (
-                            buf_attn_cat
-                            - self.attn_memory_bank.recon_decoder(
-                                buf_attn_cat, a_summary
-                            )
-                        )
-                        .pow(2)
-                        .mean(dim=-1)
-                        .sqrt()
+                        (buf_attn_cat - attn_recon_out).pow(2).mean(dim=-1).sqrt()
                     )
                     mamba_recon_tok = (
-                        (
-                            buf_mamba_cat
-                            - self.state_memory_bank.recon_decoder(
-                                buf_mamba_cat, s_summary
-                            )
-                        )
-                        .pow(2)
-                        .mean(dim=-1)
-                        .sqrt()
+                        (buf_mamba_cat - mamba_recon_out).pow(2).mean(dim=-1).sqrt()
                     )
                     attn_assoc = associative_retrieval_loss(
                         self.attn_memory_bank,
@@ -1923,9 +1957,14 @@ class HybridDecoderLayer(nn.Module):
         moe_in = self.rmsnorm_moe(x)
         if hidden_mask is not None:
             moe_in = moe_in * hidden_mask
+        expert_scale = _expert_loss_schedule(
+            training_step, max_training_steps, cfg.expert_warmup_fraction
+        )
         moe_out, aux_loss, z_loss, expert_loss = self.moe_block(
             moe_in,
-            compute_expert_loss=self.training and self.use_auxiliary_losses,
+            compute_expert_loss=(
+                self.training and self.use_auxiliary_losses and expert_scale > 0.0
+            ),
             expert_var_beta=cfg.expert_var_beta,
         )
         x_out = x + moe_out
@@ -1991,7 +2030,7 @@ def _top_p_filter(logits: Tensor, top_p: float) -> Tensor:
 
 @dataclass
 class HybridTrainingOutput:
-    logits: Tensor
+    logits: Tensor | None
     loss: Tensor | None = None
     ce_loss: Tensor | None = None
     router_aux_loss: Tensor | None = None
@@ -2073,6 +2112,8 @@ class HybridModel(nn.Module):
         skip_memory_write: bool = False,
         write_buffers: list[MemoryWriteBuffer | None] | None = None,
         active_batch_mask: Tensor | None = None,
+        training_step: int | None = None,
+        max_training_steps: int | None = None,
     ) -> tuple[
         Tensor,
         Tensor,
@@ -2171,6 +2212,8 @@ class HybridModel(nn.Module):
                     skip_memory_write,
                     layer_buf,
                     active_batch_mask,
+                    training_step,
+                    max_training_steps,
                     use_reentrant=False,
                 )
             else:
@@ -2196,6 +2239,8 @@ class HybridModel(nn.Module):
                     skip_memory_write,
                     layer_buf,
                     active_batch_mask,
+                    training_step,
+                    max_training_steps,
                 )
             total_aux_loss = total_aux_loss + layer_aux_loss
             total_z_loss = total_z_loss + layer_z_loss
@@ -2360,6 +2405,8 @@ class HybridForCausalLM(nn.Module):
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 labels=labels,
+                training_step=training_step,
+                max_training_steps=max_training_steps,
             )
 
         (
@@ -2384,19 +2431,23 @@ class HybridForCausalLM(nn.Module):
             skip_memory_write=skip_memory_write,
             write_buffers=write_buffers,
             active_batch_mask=active_batch_mask,
+            training_step=training_step,
+            max_training_steps=max_training_steps,
         )
-        logits = self.lm_head(hidden_states)
+        need_logits = self.config.return_logits or labels is not None
+        logits = self.lm_head(hidden_states) if need_logits else None
 
         loss = None
         ce_loss = None
         if labels is not None:
             labels = self._apply_label_ignore(labels, attention_mask)
             loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.label_ignore_index)
+            assert logits is not None
             ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
             aux_total = self._weighted_auxiliary_loss(
                 auxiliary_losses,
-                device=logits.device,
-                dtype=logits.dtype,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
                 training_step=training_step,
                 max_training_steps=max_training_steps,
             )
@@ -2427,6 +2478,8 @@ class HybridForCausalLM(nn.Module):
         attention_mask: Tensor | None,
         position_ids: Tensor | None,
         labels: Tensor | None,
+        training_step: int | None = None,
+        max_training_steps: int | None = None,
     ) -> HybridTrainingOutput:
         """BPTT through memory banks within one backward pass."""
         chunk_size = self.config.memory_chunk_size
@@ -2434,6 +2487,8 @@ class HybridForCausalLM(nn.Module):
         seq_len = input_ids.size(1)
         batch_size = input_ids.size(0)
         device = input_ids.device
+        stream_ce = self.config.stream_chunked_ce_loss and labels is not None
+        materialize_logits = self.config.return_logits or not stream_ce
 
         memory_states: list[HybridMemoryState | None] | None = None
         logits_chunks: list[Tensor] = []
@@ -2444,6 +2499,12 @@ class HybridForCausalLM(nn.Module):
         gate_stat_sums: dict[str, Tensor] = {}
         gate_stat_counts: dict[str, int] = {}
         token_weight = 0
+        ce_loss_sum = torch.tensor(0.0, device=device)
+        loss_fct = (
+            nn.CrossEntropyLoss(ignore_index=self.config.label_ignore_index)
+            if labels is not None
+            else None
+        )
         aux_weighted = HybridLayerAuxLosses.zeros(
             device, self.model.embed_tokens.weight.dtype
         )
@@ -2480,8 +2541,20 @@ class HybridForCausalLM(nn.Module):
                 attention_mask=chunk_mask,
                 position_ids=chunk_pos,
                 use_cache=False,
+                training_step=training_step,
+                max_training_steps=max_training_steps,
             )
-            logits_chunks.append(self.lm_head(hidden_states))
+            chunk_logits = self.lm_head(hidden_states)
+            if materialize_logits:
+                logits_chunks.append(chunk_logits)
+            if labels is not None and loss_fct is not None:
+                chunk_labels = labels[:, start:end]
+                chunk_labels = self._apply_label_ignore(chunk_labels, chunk_mask)
+                chunk_ce = loss_fct(
+                    chunk_logits.view(-1, self.vocab_size), chunk_labels.reshape(-1)
+                )
+                ce_loss_sum = ce_loss_sum + chunk_ce * chunk_len
+            del chunk_logits
             total_aux = total_aux + aux_loss * chunk_len
             total_z = total_z + z_loss * chunk_len
             token_weight += chunk_len
@@ -2503,7 +2576,7 @@ class HybridForCausalLM(nn.Module):
                     gate_stat_sums[key] = gate_stat_sums[key] + val
                     gate_stat_counts[key] += 1
 
-        logits = torch.cat(logits_chunks, dim=1)
+        logits = torch.cat(logits_chunks, dim=1) if materialize_logits else None
         aux_loss = total_aux / max(token_weight, 1)
         z_loss = total_z / max(token_weight, 1)
         all_gate_stats = {
@@ -2524,13 +2597,13 @@ class HybridForCausalLM(nn.Module):
         loss = None
         ce_loss = None
         if labels is not None:
-            labels = self._apply_label_ignore(labels, attention_mask)
-            loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.label_ignore_index)
-            ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
+            ce_loss = ce_loss_sum / max(token_weight, 1)
             aux_total = self._weighted_auxiliary_loss(
                 auxiliary_losses,
-                device=logits.device,
-                dtype=logits.dtype,
+                device=device,
+                dtype=self.model.embed_tokens.weight.dtype,
+                training_step=training_step,
+                max_training_steps=max_training_steps,
             )
             loss = (
                 ce_loss
