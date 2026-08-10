@@ -4,3 +4,5 @@ config.yaml
 __pycache__/
 tests/__pycache__/
 reviews/
+*.log
+*.jsonl

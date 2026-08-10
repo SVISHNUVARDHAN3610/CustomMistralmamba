@@ -10,6 +10,7 @@ import torch
 from model import (
     HybridForCausalLM,
     HybridMambaMoEConfig,
+    MambaBlock,
     MixtralConfig,
     MixtralForCausalLM,
     SwiGLUExpert,
@@ -19,6 +20,7 @@ from model import (
     associative_retrieval_loss,
     build_test3_null_baseline_config,
     count_trainable_params,
+    fused_mamba_scan_available,
 )
 
 
@@ -763,6 +765,56 @@ class TestHybridModel(unittest.TestCase):
         err_mean = (retrieved - values).pow(2).mean(dim=-1).mean()
         self.assertGreater(err_sum.item(), err_mean.item() * (hidden - 1))
 
+    def test_assoc_loss_padded_batch_no_oob(self) -> None:
+        """Variable-length rows must not gather at sentinel index seq_len."""
+        from model import CompressiveMemoryBank
+
+        hidden = 64
+        bank = CompressiveMemoryBank(hidden, memory_size=8, num_heads=4)
+        seq_len = 32
+        x = torch.randn(4, seq_len, hidden)
+        new_mem = bank.init_state(4, x.device, x.dtype)
+        residual = torch.rand(4, seq_len)
+        mask = torch.zeros(4, seq_len, dtype=torch.long)
+        lengths = [8, 12, 20, 31]
+        for i, length in enumerate(lengths):
+            mask[i, :length] = 1
+        loss = associative_retrieval_loss(
+            bank,
+            x,
+            new_mem,
+            residual,
+            sample_count=24,
+            attention_mask=mask,
+        )
+        self.assertFalse(torch.isnan(loss))
+        self.assertFalse(torch.isinf(loss))
+
+    def test_assoc_loss_padded_batch_cuda(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required")
+        from model import CompressiveMemoryBank
+
+        hidden = 64
+        bank = CompressiveMemoryBank(hidden, memory_size=8, num_heads=4).cuda()
+        seq_len = 32
+        x = torch.randn(4, seq_len, hidden, device="cuda")
+        new_mem = bank.init_state(4, x.device, x.dtype)
+        residual = torch.rand(4, seq_len, device="cuda")
+        mask = torch.zeros(4, seq_len, dtype=torch.long, device="cuda")
+        for i, length in enumerate([8, 12, 20, 31]):
+            mask[i, :length] = 1
+        loss = associative_retrieval_loss(
+            bank,
+            x,
+            new_mem,
+            residual,
+            sample_count=24,
+            attention_mask=mask,
+        )
+        self.assertFalse(torch.isnan(loss))
+        self.assertFalse(torch.isinf(loss))
+
     def test_expert_loss_top_k_1_no_crash(self) -> None:
         cfg = _small_hybrid_config(top_k=1, num_experts=4)
         model = HybridForCausalLM(cfg).train()
@@ -911,6 +963,107 @@ class TestHybridModel(unittest.TestCase):
         self.assertIsNotNone(out.loss)
         assert out.loss is not None
         out.loss.backward()
+
+    def test_fused_mamba_scan_matches_pytorch(self) -> None:
+        if not fused_mamba_scan_available() or not torch.cuda.is_available():
+            self.skipTest("mamba-ssm fused selective_scan requires CUDA")
+
+        hidden_size = 64
+        state_size = 8
+        block = MambaBlock(
+            hidden_size=hidden_size,
+            state_size=state_size,
+            expand=2,
+            use_fused_scan=False,
+        ).cuda().eval()
+
+        batch_size, seq_len = 2, 32
+        d_inner = block.d_inner
+        u = torch.randn(batch_size, seq_len, d_inner, device="cuda")
+        dt = torch.randn(batch_size, seq_len, d_inner, device="cuda").abs() + 0.01
+        a = -torch.exp(block.A_log.float())
+        b_param = torch.randn(batch_size, seq_len, state_size, device="cuda")
+        c_param = torch.randn(batch_size, seq_len, state_size, device="cuda")
+        d_param = block.D.float()
+
+        y_ref, st_ref = MambaBlock._selective_scan(
+            u,
+            dt,
+            a,
+            b_param,
+            c_param,
+            d_param,
+            return_final_state=True,
+            use_fused_scan=False,
+        )
+        y_fused, st_fused = MambaBlock._selective_scan(
+            u,
+            dt,
+            a,
+            b_param,
+            c_param,
+            d_param,
+            return_final_state=True,
+            use_fused_scan=True,
+        )
+        self.assertLess((y_ref - y_fused).abs().max().item(), 1e-4)
+        self.assertLess((st_ref - st_fused).abs().max().item(), 1e-4)
+
+    def test_fused_mamba_forward_matches_pytorch(self) -> None:
+        if not fused_mamba_scan_available() or not torch.cuda.is_available():
+            self.skipTest("mamba-ssm fused selective_scan requires CUDA")
+
+        hidden_size = 64
+        block_ref = MambaBlock(
+            hidden_size=hidden_size,
+            state_size=8,
+            expand=2,
+            use_fused_scan=False,
+        ).cuda().eval()
+        block_fused = MambaBlock(
+            hidden_size=hidden_size,
+            state_size=8,
+            expand=2,
+            use_fused_scan=True,
+        ).cuda().eval()
+        block_fused.load_state_dict(block_ref.state_dict())
+
+        x = torch.randn(2, 32, hidden_size, device="cuda")
+        out_ref, _, st_ref = block_ref(x)
+        out_fused, _, st_fused = block_fused(x)
+        self.assertLess((out_ref - out_fused).abs().max().item(), 1e-4)
+        self.assertLess((st_ref - st_fused).abs().max().item(), 1e-4)
+
+    def test_fused_mamba_falls_back_with_padding_mask(self) -> None:
+        if not fused_mamba_scan_available() or not torch.cuda.is_available():
+            self.skipTest("mamba-ssm fused selective_scan requires CUDA")
+
+        hidden_size = 64
+        block_ref = MambaBlock(
+            hidden_size=hidden_size,
+            state_size=8,
+            expand=2,
+            use_fused_scan=False,
+        ).cuda().eval()
+        block_fused = MambaBlock(
+            hidden_size=hidden_size,
+            state_size=8,
+            expand=2,
+            use_fused_scan=True,
+        ).cuda().eval()
+        block_fused.load_state_dict(block_ref.state_dict())
+
+        x = torch.randn(1, 14, hidden_size, device="cuda")
+        mask = torch.cat(
+            [
+                torch.ones(1, 10, dtype=torch.long, device="cuda"),
+                torch.zeros(1, 4, dtype=torch.long, device="cuda"),
+            ],
+            dim=1,
+        )
+        out_ref, _, _ = block_ref(x, attention_mask=mask)
+        out_fused, _, _ = block_fused(x, attention_mask=mask)
+        self.assertLess((out_ref - out_fused).abs().max().item(), 1e-4)
 
 
 if __name__ == "__main__":

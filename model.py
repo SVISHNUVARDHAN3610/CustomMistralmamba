@@ -9,8 +9,9 @@ Contains two model families:
 2. HybridMambaMoEConfig / HybridForCausalLM -- Hybrid Mamba-MoE with Dual
    Memory (research/research.md v2.0):
        - Sliding window GQA branch (reuses SlidingWindowGQA)
-       - Mamba selective-SSM branch (MambaBlock) with checkpointed sequential
-         scan by default (optional Hillis-Steele parallel scan) and
+       - Mamba selective-SSM branch (MambaBlock) with fused CUDA selective
+         scan when `mamba-ssm` is installed (falls back to checkpointed
+         sequential PyTorch scan), optional Hillis-Steele parallel scan, and
          incremental (conv_state, ssm_state) caching for autoregressive decode
        - Two compressive memory banks (CompressiveMemoryBank), one per
          branch: read *into* branch inputs, write *raw* branch outputs
@@ -30,7 +31,7 @@ import copy
 import json
 import math
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.nn.functional as F
@@ -825,6 +826,8 @@ class HybridMambaMoEConfig(MixtralConfig):
     memory_write_interval: int | None = None
 
     use_parallel_scan: bool = False
+    # Use mamba-ssm fused CUDA selective_scan when available (CUDA, no padding).
+    use_fused_mamba_scan: bool = True
     gradient_checkpointing: bool = False
     debug_state_checks: bool = False
 
@@ -1036,6 +1039,12 @@ def associative_retrieval_loss(
     sample_mask = torch.arange(n_sel, device=device).unsqueeze(
         0
     ) < valid_counts.unsqueeze(1).clamp(max=n_sel)
+    # Rows with fewer than n_sel valid tokens still fill sel_local from padded
+    # candidate slots (sentinel position == seq_len). Clamp for gather safety;
+    # zero those slots in sample_mask so they do not affect the loss.
+    valid_index = indices < seq_len
+    indices = indices.clamp(max=seq_len - 1)
+    sample_mask = sample_mask & valid_index
 
     x_sel = x.gather(1, indices.unsqueeze(-1).expand(-1, -1, hidden))
     keys = bank.assoc_key(x_sel)
@@ -1125,13 +1134,50 @@ def _validate_hybrid_cache_states(
         assert active_batch_mask.size(0) == batch_size
 
 
+_SELECTIVE_SCAN_FN: Callable[..., Tensor] | None = None
+_SELECTIVE_SCAN_PROBE_DONE = False
+
+
+def fused_mamba_scan_available() -> bool:
+    """True when mamba-ssm fused selective_scan CUDA kernels can be imported."""
+    return _load_selective_scan_fn() is not None
+
+
+def _load_selective_scan_fn() -> Callable[..., Tensor] | None:
+    """Lazy import of mamba-ssm selective_scan_fn (optional dependency)."""
+    global _SELECTIVE_SCAN_FN, _SELECTIVE_SCAN_PROBE_DONE
+    if _SELECTIVE_SCAN_PROBE_DONE:
+        return _SELECTIVE_SCAN_FN
+    _SELECTIVE_SCAN_PROBE_DONE = True
+    try:
+        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+
+        _SELECTIVE_SCAN_FN = selective_scan_fn
+    except ImportError:
+        _SELECTIVE_SCAN_FN = None
+    return _SELECTIVE_SCAN_FN
+
+
+def _attention_mask_has_padding(
+    attention_mask: Tensor | None, seq_len: int
+) -> bool:
+    if attention_mask is None:
+        return False
+    if attention_mask.dim() != 2:
+        return True
+    if attention_mask.size(1) < seq_len:
+        return True
+    return not attention_mask[:, -seq_len:].all().item()
+
+
 class MambaBlock(nn.Module):
     """
-    Selective SSM (Mamba / S6) in pure PyTorch.
+    Selective SSM (Mamba / S6).
 
-    Training defaults to a checkpointed sequential associative scan (O(L)
-    work, bounded activation memory). Optional Hillis-Steele parallel scan
-    (`use_parallel_scan=True`) is faster on short sequences but O(L log L).
+    Prefill/training uses fused CUDA selective_scan from `mamba-ssm` when
+    available (`use_fused_scan=True`, CUDA, no padding). Otherwise falls back
+    to a checkpointed sequential associative scan (O(L) work). Optional
+    Hillis-Steele parallel scan (`use_parallel_scan=True`) bypasses fused CUDA.
     Decode uses allocate_inference_cache() + step().
     """
 
@@ -1143,6 +1189,7 @@ class MambaBlock(nn.Module):
         expand: int = 2,
         dt_rank: int | None = None,
         use_parallel_scan: bool = False,
+        use_fused_scan: bool = True,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1151,6 +1198,7 @@ class MambaBlock(nn.Module):
         self.d_inner = expand * hidden_size
         self.dt_rank = dt_rank if dt_rank is not None else math.ceil(hidden_size / 16)
         self.use_parallel_scan = use_parallel_scan
+        self.use_fused_scan = use_fused_scan
 
         self.in_proj = nn.Linear(hidden_size, 2 * self.d_inner, bias=False)
         self.conv1d = nn.Conv1d(
@@ -1281,6 +1329,7 @@ class MambaBlock(nn.Module):
             self.D,
             return_final_state=True,
             use_parallel_scan=self.use_parallel_scan,
+            use_fused_scan=self.use_fused_scan,
             training=self.training,
             attention_mask=attention_mask,
         )
@@ -1380,6 +1429,47 @@ class MambaBlock(nn.Module):
             outputs.append(state)
         return torch.stack(outputs, dim=1)
 
+    @staticmethod
+    def _fused_selective_scan(
+        u: Tensor,
+        dt: Tensor,
+        A: Tensor,
+        B: Tensor,
+        C: Tensor,
+        D: Tensor,
+        return_final_state: bool = False,
+    ) -> tuple[Tensor, Tensor | None]:
+        """
+        mamba-ssm fused CUDA selective scan.
+        u, dt: [B, L, d_inner]; A: [d_inner, n]; B, C: [B, L, n]; D: [d_inner]
+        """
+        selective_scan_fn = _load_selective_scan_fn()
+        if selective_scan_fn is None:
+            raise RuntimeError("mamba-ssm selective_scan_fn is not available.")
+
+        input_dtype = u.dtype
+        u_t = u.transpose(1, 2).contiguous()
+        dt_t = dt.transpose(1, 2).contiguous()
+        b_t = B.transpose(1, 2).contiguous()
+        c_t = C.transpose(1, 2).contiguous()
+
+        result = selective_scan_fn(
+            u_t.float(),
+            dt_t.float(),
+            A.float(),
+            b_t.float(),
+            c_t.float(),
+            D.float(),
+            delta_bias=None,
+            delta_softplus=False,
+            return_last_state=return_final_state,
+        )
+        if return_final_state:
+            y_t, final_state = result
+            return y_t.transpose(1, 2).to(input_dtype), final_state
+        y_t = result
+        return y_t.transpose(1, 2).to(input_dtype), None
+
     @classmethod
     def _selective_scan(
         cls,
@@ -1391,6 +1481,7 @@ class MambaBlock(nn.Module):
         D: Tensor,
         return_final_state: bool = False,
         use_parallel_scan: bool = False,
+        use_fused_scan: bool = True,
         training: bool = False,
         attention_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor | None]:
@@ -1399,6 +1490,28 @@ class MambaBlock(nn.Module):
         On pad positions (attention_mask==0), apply identity state transition
         so SSM state does not decay through padding.
         """
+        seq_len = u.size(1)
+        can_use_fused = (
+            use_fused_scan
+            and not use_parallel_scan
+            and u.is_cuda
+            and not _attention_mask_has_padding(attention_mask, seq_len)
+            and _load_selective_scan_fn() is not None
+        )
+        if can_use_fused:
+            try:
+                return cls._fused_selective_scan(
+                    u,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    D,
+                    return_final_state=return_final_state,
+                )
+            except Exception:
+                pass
+
         input_dtype = u.dtype
         u_f = u.float()
         dt_f = dt.float()
@@ -1408,14 +1521,15 @@ class MambaBlock(nn.Module):
         delta_a = torch.exp(dt_f.unsqueeze(-1) * A)  # [B, L, d_inner, n]
         delta_b_u = dt_f.unsqueeze(-1) * B_f.unsqueeze(2) * u_f.unsqueeze(-1)
 
+        token_mask: Tensor | None = None
         if attention_mask is not None:
             if attention_mask.dim() != 2:
                 raise ValueError("MambaBlock expects 2D attention_mask [B, L].")
-            if attention_mask.size(1) < u.size(1):
+            if attention_mask.size(1) < seq_len:
                 raise ValueError(
-                    f"attention_mask length {attention_mask.size(1)} < seq_len {u.size(1)}."
+                    f"attention_mask length {attention_mask.size(1)} < seq_len {seq_len}."
                 )
-            token_mask = attention_mask[:, -u.size(1) :].to(dtype=delta_a.dtype)
+            token_mask = attention_mask[:, -seq_len:].to(dtype=delta_a.dtype)
             m = token_mask.unsqueeze(-1).unsqueeze(-1)  # [B, L, 1, 1]
             # Pad steps: h_t = 1 * h_{t-1} + 0
             delta_a = delta_a * m + (1.0 - m)
@@ -1435,7 +1549,7 @@ class MambaBlock(nn.Module):
 
         y = (states * C_f.unsqueeze(2)).sum(dim=-1)
         y = y + u_f * D.float()
-        if attention_mask is not None:
+        if token_mask is not None:
             y = y * token_mask.unsqueeze(-1)
         final_state = states[:, -1].contiguous() if return_final_state else None
         return y.to(input_dtype), final_state
@@ -1667,6 +1781,7 @@ class HybridDecoderLayer(nn.Module):
             expand=config.mamba_expand,
             dt_rank=config.mamba_dt_rank,
             use_parallel_scan=config.use_parallel_scan,
+            use_fused_scan=config.use_fused_mamba_scan,
         )
 
         if self.use_dual_memory:
