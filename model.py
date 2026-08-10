@@ -783,9 +783,60 @@ class HybridMambaMoEConfig(MixtralConfig):
 
     use_parallel_scan: bool = False
     gradient_checkpointing: bool = False
+    debug_state_checks: bool = False
 
 
 MambaCache = tuple[Tensor, Tensor]  # (conv_state, ssm_state)
+
+
+def _materialize_write_buffer(
+    write_buffer: tuple[list[Tensor], list[Tensor]] | None,
+) -> tuple[Tensor | None, Tensor | None]:
+    """Concatenate list-of-chunks write buffer into single tensors for memory write."""
+    if write_buffer is None:
+        return None, None
+    attn_chunks, mamba_chunks = write_buffer
+    if not attn_chunks:
+        return None, None
+    return torch.cat(attn_chunks, dim=1), torch.cat(mamba_chunks, dim=1)
+
+
+def _write_buffer_token_len(
+    write_buffer: tuple[list[Tensor], list[Tensor]] | None,
+) -> int:
+    if write_buffer is None or not write_buffer[0]:
+        return 0
+    return sum(c.size(1) for c in write_buffer[0])
+
+
+def _validate_hybrid_cache_states(
+    config: HybridMambaMoEConfig,
+    num_layers: int,
+    batch_size: int,
+    memory_states: list | None,
+    mamba_caches: list | None,
+    write_buffers: list | None,
+    past_key_values: list | None,
+    active_batch_mask: Tensor | None,
+) -> None:
+    if not config.debug_state_checks:
+        return
+    if memory_states is not None:
+        assert len(memory_states) == num_layers
+    if mamba_caches is not None:
+        assert len(mamba_caches) == num_layers
+    if write_buffers is not None:
+        assert len(write_buffers) == num_layers
+        for buf in write_buffers:
+            if buf is not None:
+                assert len(buf[0]) == len(buf[1])
+                for chunk in buf[0]:
+                    assert chunk.size(0) == batch_size
+    if past_key_values is not None:
+        assert len(past_key_values) == num_layers
+    if active_batch_mask is not None:
+        assert active_batch_mask.dtype == torch.bool
+        assert active_batch_mask.size(0) == batch_size
 
 
 class MambaBlock(nn.Module):
@@ -1153,7 +1204,7 @@ class CompressiveMemoryBank(nn.Module):
     def _shape_heads(self, t: Tensor, seq_len: int) -> Tensor:
         # [B, L, H] -> [B, heads, L, head_dim]
         b = t.size(0)
-        return t.view(b, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        return t.reshape(b, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
     def _attend(
         self,
@@ -1213,6 +1264,11 @@ class CompressiveMemoryBank(nn.Module):
             self.write_gate(torch.cat([memory, chunk_summary], dim=-1))
         )
         new_memory = gate * memory + (1.0 - gate) * self.write_update(chunk_summary)
+        if kpm is not None:
+            all_masked_rows = kpm.all(dim=-1)
+            if all_masked_rows.any():
+                new_memory = new_memory.clone()
+                new_memory[all_masked_rows] = memory[all_masked_rows]
         return new_memory, gate
 
 
@@ -1230,8 +1286,8 @@ class TokenGatedFusion(nn.Module):
 
 
 HybridMemoryState = tuple[Tensor, Tensor]
-# Accumulated raw branch outputs awaiting a chunked memory write.
-MemoryWriteBuffer = tuple[Tensor, Tensor]
+# List of per-step/chunk branch outputs awaiting a chunked memory write.
+MemoryWriteBuffer = tuple[list[Tensor], list[Tensor]]
 
 
 def _hybrid_layer_forward(
@@ -1440,6 +1496,8 @@ class HybridDecoderLayer(nn.Module):
         if self.use_dual_memory:
             assert memory_state is not None
             a_mem, s_mem = memory_state
+            prev_a_mem = a_mem
+            prev_s_mem = s_mem
             if hidden_mask is not None:
                 attn_out = attn_out * hidden_mask
                 mamba_out = mamba_out * hidden_mask
@@ -1451,17 +1509,25 @@ class HybridDecoderLayer(nn.Module):
                 active = active_batch_mask.to(dtype=buf_attn.dtype).view(-1, 1, 1)
                 buf_attn = buf_attn * active
                 buf_mamba = buf_mamba * active
+
             if write_buffer is not None:
-                buf_attn = torch.cat([write_buffer[0], buf_attn], dim=1)
-                buf_mamba = torch.cat([write_buffer[1], buf_mamba], dim=1)
+                attn_chunks = list(write_buffer[0]) + [buf_attn]
+                mamba_chunks = list(write_buffer[1]) + [buf_mamba]
+            else:
+                attn_chunks = [buf_attn]
+                mamba_chunks = [buf_mamba]
 
             if skip_memory_write:
                 new_memory_state = memory_state
-                new_write_buffer = (buf_attn, buf_mamba)
+                new_write_buffer = (attn_chunks, mamba_chunks)
             else:
+                buf_attn_cat, buf_mamba_cat = (
+                    torch.cat(attn_chunks, dim=1),
+                    torch.cat(mamba_chunks, dim=1),
+                )
                 # Build mask for buffered tokens: prior buffer assumed valid,
                 # current tokens use token_attention_mask when present.
-                buf_len = buf_attn.size(1)
+                buf_len = buf_attn_cat.size(1)
                 cur_len = attn_out.size(1)
                 if token_attention_mask is not None:
                     if buf_len > cur_len:
@@ -1482,11 +1548,17 @@ class HybridDecoderLayer(nn.Module):
                     )
 
                 new_a_mem, a_write_gate = self.attn_memory_bank.write(
-                    buf_attn, a_mem, attention_mask=write_mask
+                    buf_attn_cat, a_mem, attention_mask=write_mask
                 )
                 new_s_mem, s_write_gate = self.state_memory_bank.write(
-                    buf_mamba, s_mem, attention_mask=write_mask
+                    buf_mamba_cat, s_mem, attention_mask=write_mask
                 )
+                if active_batch_mask is not None and (~active_batch_mask).any():
+                    inactive = ~active_batch_mask
+                    new_a_mem = new_a_mem.clone()
+                    new_s_mem = new_s_mem.clone()
+                    new_a_mem[inactive] = prev_a_mem[inactive]
+                    new_s_mem[inactive] = prev_s_mem[inactive]
                 new_memory_state = (new_a_mem, new_s_mem)
                 new_write_buffer = None
                 gate_stats = {
@@ -1610,6 +1682,17 @@ class HybridModel(nn.Module):
     ]:
         hidden_states = self.embed_tokens(input_ids)
         batch_size, seq_len = hidden_states.shape[:2]
+
+        _validate_hybrid_cache_states(
+            self.config,
+            len(self.layers),
+            batch_size,
+            memory_states,
+            mamba_caches,
+            write_buffers,
+            past_key_values,
+            active_batch_mask,
+        )
 
         if position_ids is None:
             # Absolute positions must track tokens *seen*, not truncated KV length.
@@ -1869,9 +1952,12 @@ class HybridForCausalLM(nn.Module):
 
         memory_states: list[HybridMemoryState | None] | None = None
         logits_chunks: list[Tensor] = []
+        # MOERouter aux/z are per-token means; HybridModel layer-averages them;
+        # here we token-weight across internal chunks.
         total_aux = torch.tensor(0.0, device=device)
         total_z = torch.tensor(0.0, device=device)
-        all_gate_stats: dict[str, Tensor] = {}
+        gate_stat_sums: dict[str, Tensor] = {}
+        gate_stat_counts: dict[str, int] = {}
         token_weight = 0
 
         for start in range(0, seq_len, chunk_size):
@@ -1910,11 +1996,20 @@ class HybridForCausalLM(nn.Module):
             total_aux = total_aux + aux_loss * chunk_len
             total_z = total_z + z_loss * chunk_len
             token_weight += chunk_len
-            all_gate_stats.update(gate_stats)
+            for key, val in gate_stats.items():
+                if key not in gate_stat_sums:
+                    gate_stat_sums[key] = val.clone()
+                    gate_stat_counts[key] = 1
+                else:
+                    gate_stat_sums[key] = gate_stat_sums[key] + val
+                    gate_stat_counts[key] += 1
 
         logits = torch.cat(logits_chunks, dim=1)
         aux_loss = total_aux / max(token_weight, 1)
         z_loss = total_z / max(token_weight, 1)
+        all_gate_stats = {
+            k: gate_stat_sums[k] / gate_stat_counts[k] for k in gate_stat_sums
+        }
 
         loss = None
         ce_loss = None
@@ -1963,8 +2058,10 @@ class HybridForCausalLM(nn.Module):
                 new_states.append(mem)
                 continue
             a_mem, s_mem = mem
-            new_a, _ = layer.attn_memory_bank.write(buf[0], a_mem)
-            new_s, _ = layer.state_memory_bank.write(buf[1], s_mem)
+            buf_attn, buf_mamba = _materialize_write_buffer(buf)
+            assert buf_attn is not None and buf_mamba is not None
+            new_a, _ = layer.attn_memory_bank.write(buf_attn, a_mem)
+            new_s, _ = layer.state_memory_bank.write(buf_mamba, s_mem)
             new_states.append((new_a, new_s))
         return new_states, None
 
@@ -2013,6 +2110,20 @@ class HybridForCausalLM(nn.Module):
                 f"max_position_embeddings={self.config.max_position_embeddings}."
             )
 
+        total_len = prompt_len + max_new_tokens
+        generated_buf = torch.full(
+            (batch_size, total_len),
+            self.config.pad_token_id,
+            dtype=input_ids.dtype,
+            device=device,
+        )
+        generated_buf[:, :prompt_len] = generated
+        attn_buf = torch.zeros(
+            batch_size, total_len, dtype=attention_mask.dtype, device=device
+        )
+        attn_buf[:, :prompt_len] = attention_mask
+        cur_len = prompt_len
+
         write_interval = self._memory_write_interval()
         past_key_values = None
         memory_states = None
@@ -2026,8 +2137,8 @@ class HybridForCausalLM(nn.Module):
             # Chunked prefill so memory writes match training chunk size.
             for start in range(0, prompt_len, write_interval):
                 end = min(start + write_interval, prompt_len)
-                chunk = generated[:, start:end]
-                chunk_mask = attention_mask[:, :end]
+                chunk = generated_buf[:, start:end]
+                chunk_mask = attn_buf[:, :end]
                 if chunk_mask.size(1) > self.config.window_size:
                     chunk_mask = chunk_mask[:, -self.config.window_size :]
                 chunk_pos = (
@@ -2076,10 +2187,9 @@ class HybridForCausalLM(nn.Module):
                     next_token,
                 )
 
-                generated = torch.cat([generated, next_token], dim=1)
-                attention_mask = torch.cat(
-                    [attention_mask, (~finished).long().unsqueeze(-1)], dim=1
-                )
+                generated_buf[:, cur_len : cur_len + 1] = next_token
+                attn_buf[:, cur_len : cur_len + 1] = (~finished).long().unsqueeze(-1)
+                cur_len += 1
                 finished = finished | (next_token.squeeze(-1) == eos_token_id)
                 if finished.all():
                     break
@@ -2094,7 +2204,7 @@ class HybridForCausalLM(nn.Module):
                     dtype=torch.long,
                     device=device,
                 )
-                step_attn_mask = attention_mask
+                step_attn_mask = attn_buf[:, :cur_len]
                 if step_attn_mask.size(1) > self.config.window_size:
                     step_attn_mask = step_attn_mask[:, -self.config.window_size :]
 
@@ -2132,7 +2242,7 @@ class HybridForCausalLM(nn.Module):
         finally:
             self.train(was_training)
 
-        return generated
+        return generated_buf[:, :cur_len]
 
 
 def count_trainable_params(module: nn.Module) -> int:
