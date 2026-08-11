@@ -30,8 +30,10 @@ Falsification hooks (design doc §6):
 import copy
 import json
 import math
+import warnings
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from typing import Any, Callable
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -483,6 +485,9 @@ class DroplessMoELayer(nn.Module):
     per-token MoE magnitude is preserved. During training, overflow tokens
     are chosen via a random permutation (not always the first ``capacity``
     indices) to reduce order bias; eval uses stable first-``capacity`` order.
+
+    `use_grouped_moe_dispatch=True` sorts token assignments by expert and
+    uses stacked weight tensors for fewer kernel launches (same math).
     """
 
     def __init__(
@@ -490,30 +495,64 @@ class DroplessMoELayer(nn.Module):
         router: nn.Module,
         experts: nn.ModuleList,
         capacity_factor: float | None = None,
+        use_grouped_moe_dispatch: bool = True,
+        use_grouped_gemm: bool = False,
     ):
         super().__init__()
         self.router = router
         self.experts = experts
         self.num_experts = len(experts)
         self.capacity_factor = capacity_factor
+        self.use_grouped_moe_dispatch = use_grouped_moe_dispatch
+        self.use_grouped_gemm = use_grouped_gemm
 
-    def forward(
+    @staticmethod
+    def _swiglu_forward(
+        x: Tensor, w_gate: Tensor, w_up: Tensor, w_down: Tensor
+    ) -> Tensor:
+        gate = F.linear(x, w_gate)
+        up = F.linear(x, w_up)
+        return F.linear(F.silu(gate) * up, w_down)
+
+    def _stack_expert_weights(
         self,
-        x: torch.Tensor,
-        compute_expert_loss: bool = False,
-        expert_var_beta: float = 0.5,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        orig_shape = x.shape
-        x_flat = x.reshape(-1, orig_shape[-1])
-        num_tokens = x_flat.size(0)
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        w_gate = torch.stack([e.w_gate.weight for e in self.experts], dim=0)
+        w_up = torch.stack([e.w_up.weight for e in self.experts], dim=0)
+        w_down = torch.stack([e.w_down.weight for e in self.experts], dim=0)
+        return w_gate, w_up, w_down
 
-        topk_weights, topk_indices, aux_loss, z_loss, logits = self.router(x_flat)
+    def _apply_capacity(
+        self,
+        row_indices: Tensor,
+        k_indices: Tensor,
+        capacity: int | None,
+    ) -> tuple[Tensor, Tensor]:
+        if capacity is None or row_indices.numel() <= capacity:
+            return row_indices, k_indices
+        if self.training:
+            perm = torch.randperm(row_indices.numel(), device=row_indices.device)[
+                :capacity
+            ]
+            return row_indices[perm], k_indices[perm]
+        return row_indices[:capacity], k_indices[:capacity]
+
+    def _forward_grouped(
+        self,
+        x_flat: Tensor,
+        topk_weights: Tensor,
+        topk_indices: Tensor,
+        capacity: int | None,
+        compute_expert_loss: bool,
+        expert_var_beta: float,
+        logits: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        num_tokens = x_flat.size(0)
         top_k = topk_indices.size(1)
         moe_output = torch.zeros_like(x_flat)
         applied_weights = torch.zeros(
             num_tokens, device=x_flat.device, dtype=x_flat.dtype
         )
-        expert_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
         expert_out: Tensor | None = None
         if compute_expert_loss and self.training:
             expert_out = torch.zeros(
@@ -524,16 +563,176 @@ class DroplessMoELayer(nn.Module):
                 dtype=x_flat.dtype,
             )
 
-        capacity = None
+        flat_expert = topk_indices.reshape(-1)
+        flat_token = torch.arange(num_tokens, device=x_flat.device).repeat_interleave(
+            top_k
+        )
+        flat_k = torch.arange(top_k, device=x_flat.device).repeat(num_tokens)
+
+        sort_order = flat_expert.argsort()
+        sorted_expert = flat_expert[sort_order]
+        sorted_token = flat_token[sort_order]
+        sorted_k = flat_k[sort_order]
+
+        w_gate, w_up, w_down = self._stack_expert_weights()
+
+        for expert_idx in range(self.num_experts):
+            mask = sorted_expert == expert_idx
+            if not mask.any():
+                continue
+            idx = torch.where(mask)[0]
+            row_indices = sorted_token[idx]
+            k_indices = sorted_k[idx]
+            row_indices, k_indices = self._apply_capacity(
+                row_indices, k_indices, capacity
+            )
+            expert_inputs = x_flat[row_indices]
+            expert_outputs = self._swiglu_forward(
+                expert_inputs, w_gate[expert_idx], w_up[expert_idx], w_down[expert_idx]
+            )
+            if expert_out is not None:
+                expert_out[row_indices, k_indices] = expert_outputs
+            gating_scale = topk_weights[row_indices, k_indices].unsqueeze(-1)
+            moe_output.index_add_(0, row_indices, expert_outputs * gating_scale)
+            applied_weights.index_add_(
+                0, row_indices, gating_scale.squeeze(-1).to(applied_weights.dtype)
+            )
+
         if self.capacity_factor is not None:
-            capacity = max(
-                1,
-                int(
-                    self.capacity_factor
-                    * num_tokens
-                    * topk_indices.size(1)
-                    / self.num_experts
-                ),
+            target_weights = topk_weights.sum(dim=-1)
+            renorm = target_weights / applied_weights.clamp(min=1e-9)
+            renorm = torch.where(
+                applied_weights > 0,
+                renorm.clamp(max=10.0),
+                torch.ones_like(renorm),
+            )
+            moe_output = moe_output * renorm.unsqueeze(-1)
+
+        expert_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
+        if expert_out is not None:
+            expert_loss = expert_specialization_loss(
+                expert_out, logits, var_beta=expert_var_beta
+            )
+        return moe_output, expert_loss
+
+    @staticmethod
+    def _grouped_mm_available() -> bool:
+        return hasattr(torch, "_grouped_mm")
+
+    def _forward_grouped_gemm(
+        self,
+        x_flat: Tensor,
+        topk_weights: Tensor,
+        topk_indices: Tensor,
+        capacity: int | None,
+        compute_expert_loss: bool,
+        expert_var_beta: float,
+        logits: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Grouped-GEMM MoE dispatch when torch._grouped_mm is available."""
+        if not self._grouped_mm_available() or capacity is not None:
+            return self._forward_grouped(
+                x_flat,
+                topk_weights,
+                topk_indices,
+                capacity,
+                compute_expert_loss,
+                expert_var_beta,
+                logits,
+            )
+
+        num_tokens = x_flat.size(0)
+        top_k = topk_indices.size(1)
+        moe_output = torch.zeros_like(x_flat)
+        applied_weights = torch.zeros(
+            num_tokens, device=x_flat.device, dtype=x_flat.dtype
+        )
+        expert_out: Tensor | None = None
+        if compute_expert_loss and self.training:
+            expert_out = torch.zeros(
+                num_tokens,
+                top_k,
+                x_flat.size(-1),
+                device=x_flat.device,
+                dtype=x_flat.dtype,
+            )
+
+        flat_expert = topk_indices.reshape(-1)
+        flat_token = torch.arange(num_tokens, device=x_flat.device).repeat_interleave(
+            top_k
+        )
+        flat_k = torch.arange(top_k, device=x_flat.device).repeat(num_tokens)
+        sort_order = flat_expert.argsort()
+        sorted_expert = flat_expert[sort_order]
+        sorted_token = flat_token[sort_order]
+        sorted_k = flat_k[sort_order]
+
+        if sorted_token.numel() == 0:
+            expert_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
+            return moe_output, expert_loss
+
+        sorted_inputs = x_flat[sorted_token]
+        counts = torch.bincount(sorted_expert, minlength=self.num_experts)
+        offs = torch.zeros(self.num_experts + 1, dtype=torch.long, device=x_flat.device)
+        offs[1:] = counts.cumsum(0)
+
+        w_gate, w_up, w_down = self._stack_expert_weights()
+        grouped_mm = torch._grouped_mm
+        try:
+            gate = grouped_mm(sorted_inputs, w_gate.transpose(1, 2), offs)
+            up = grouped_mm(sorted_inputs, w_up.transpose(1, 2), offs)
+            hidden = F.silu(gate) * up
+            expert_outputs = grouped_mm(hidden, w_down.transpose(1, 2), offs)
+        except (RuntimeError, TypeError):
+            return self._forward_grouped(
+                x_flat,
+                topk_weights,
+                topk_indices,
+                capacity,
+                compute_expert_loss,
+                expert_var_beta,
+                logits,
+            )
+
+        if expert_out is not None:
+            expert_out[sorted_token, sorted_k] = expert_outputs
+        gating_scale = topk_weights[sorted_token, sorted_k].unsqueeze(-1)
+        moe_output.index_add_(0, sorted_token, expert_outputs * gating_scale)
+        applied_weights.index_add_(
+            0, sorted_token, gating_scale.squeeze(-1).to(applied_weights.dtype)
+        )
+
+        expert_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
+        if expert_out is not None:
+            expert_loss = expert_specialization_loss(
+                expert_out, logits, var_beta=expert_var_beta
+            )
+        return moe_output, expert_loss
+
+    def _forward_loop(
+        self,
+        x_flat: Tensor,
+        topk_weights: Tensor,
+        topk_indices: Tensor,
+        capacity: int | None,
+        compute_expert_loss: bool,
+        expert_var_beta: float,
+        logits: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        num_tokens = x_flat.size(0)
+        top_k = topk_indices.size(1)
+        moe_output = torch.zeros_like(x_flat)
+        applied_weights = torch.zeros(
+            num_tokens, device=x_flat.device, dtype=x_flat.dtype
+        )
+        expert_out: Tensor | None = None
+        if compute_expert_loss and self.training:
+            expert_out = torch.zeros(
+                num_tokens,
+                top_k,
+                x_flat.size(-1),
+                device=x_flat.device,
+                dtype=x_flat.dtype,
             )
 
         for expert_idx in range(self.num_experts):
@@ -542,17 +741,9 @@ class DroplessMoELayer(nn.Module):
                 continue
 
             row_indices, k_indices = torch.where(token_mask)
-
-            if capacity is not None and row_indices.numel() > capacity:
-                if self.training:
-                    perm = torch.randperm(
-                        row_indices.numel(), device=row_indices.device
-                    )[:capacity]
-                    row_indices = row_indices[perm]
-                    k_indices = k_indices[perm]
-                else:
-                    row_indices = row_indices[:capacity]
-                    k_indices = k_indices[:capacity]
+            row_indices, k_indices = self._apply_capacity(
+                row_indices, k_indices, capacity
+            )
 
             expert_inputs = x_flat[row_indices]
             expert_outputs = self.experts[expert_idx](expert_inputs)
@@ -575,10 +766,53 @@ class DroplessMoELayer(nn.Module):
             )
             moe_output = moe_output * renorm.unsqueeze(-1)
 
+        expert_loss = torch.tensor(0.0, device=x_flat.device, dtype=x_flat.dtype)
         if expert_out is not None:
             expert_loss = expert_specialization_loss(
                 expert_out, logits, var_beta=expert_var_beta
             )
+        return moe_output, expert_loss
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        compute_expert_loss: bool = False,
+        expert_var_beta: float = 0.5,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, orig_shape[-1])
+        num_tokens = x_flat.size(0)
+
+        topk_weights, topk_indices, aux_loss, z_loss, logits = self.router(x_flat)
+
+        capacity = None
+        if self.capacity_factor is not None:
+            capacity = max(
+                1,
+                int(
+                    self.capacity_factor
+                    * num_tokens
+                    * topk_indices.size(1)
+                    / self.num_experts
+                ),
+            )
+
+        dispatch_fn = (
+            self._forward_grouped_gemm
+            if self.use_grouped_gemm
+            else self._forward_grouped
+            if self.use_grouped_moe_dispatch
+            else self._forward_loop
+        )
+        moe_output, expert_loss = dispatch_fn(
+            x_flat,
+            topk_weights,
+            topk_indices,
+            capacity,
+            compute_expert_loss,
+            expert_var_beta,
+            logits,
+        )
 
         return moe_output.reshape(*orig_shape), aux_loss, z_loss, expert_loss
 
@@ -828,8 +1062,20 @@ class HybridMambaMoEConfig(MixtralConfig):
     use_parallel_scan: bool = False
     # Use mamba-ssm fused CUDA selective_scan when available (CUDA, no padding).
     use_fused_mamba_scan: bool = True
+    # PyTorch fallback scan dispatch (when fused path unavailable).
+    parallel_scan_fallback_max_len: int = 4096
+    blocked_scan_chunk_size: int = 256
+    blocked_scan_min_len: int = 4096
+    sequential_scan_min_len: int = 65536
     gradient_checkpointing: bool = False
+    mamba_internal_checkpoint: bool = True
     debug_state_checks: bool = False
+    use_grouped_moe_dispatch: bool = True
+    use_grouped_gemm: bool = False
+    decode_write_fast_threshold: int = 4
+    use_torch_compile: bool = False
+    torch_compile_mode: str = "default"
+    use_cuda_graph: bool = False
 
     # Chunked training: stream CE per chunk to avoid materializing [B, L, V].
     stream_chunked_ce_loss: bool = True
@@ -1085,23 +1331,99 @@ def _assert_right_padded_attention_mask(
 
 
 def _materialize_write_buffer(
-    write_buffer: tuple[list[Tensor], list[Tensor]] | None,
+    write_buffer: "MemoryWriteBuffer | None",
 ) -> tuple[Tensor | None, Tensor | None]:
-    """Concatenate list-of-chunks write buffer into single tensors for memory write."""
-    if write_buffer is None:
+    """Materialize pre-allocated write buffer into tensors for memory write."""
+    if write_buffer is None or write_buffer.filled == 0:
         return None, None
-    attn_chunks, mamba_chunks = write_buffer
-    if not attn_chunks:
-        return None, None
-    return torch.cat(attn_chunks, dim=1), torch.cat(mamba_chunks, dim=1)
+    return write_buffer.materialize()
 
 
 def _write_buffer_token_len(
-    write_buffer: tuple[list[Tensor], list[Tensor]] | None,
+    write_buffer: "MemoryWriteBuffer | None",
 ) -> int:
-    if write_buffer is None or not write_buffer[0]:
+    if write_buffer is None:
         return 0
-    return sum(c.size(1) for c in write_buffer[0])
+    return write_buffer.token_len()
+
+
+class MemoryWriteBuffer:
+    """Pre-allocated buffer for chunked memory writes (amortized O(k) append)."""
+
+    __slots__ = (
+        "attn_buf",
+        "batch_size",
+        "capacity",
+        "filled",
+        "hidden_size",
+        "mamba_buf",
+    )
+
+    def __init__(
+        self,
+        batch_size: int,
+        hidden_size: int,
+        capacity: int = 512,
+    ) -> None:
+        self.batch_size = batch_size
+        self.hidden_size = hidden_size
+        self.capacity = max(1, capacity)
+        self.filled = 0
+        self.attn_buf: Tensor | None = None
+        self.mamba_buf: Tensor | None = None
+
+    def _ensure_capacity(
+        self, add_tokens: int, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        needed = self.filled + add_tokens
+        if self.attn_buf is None:
+            cap = max(self.capacity, needed)
+            self.attn_buf = torch.zeros(
+                self.batch_size, cap, self.hidden_size, device=device, dtype=dtype
+            )
+            self.mamba_buf = torch.zeros(
+                self.batch_size, cap, self.hidden_size, device=device, dtype=dtype
+            )
+            self.capacity = cap
+            return
+        if needed > self.capacity:
+            new_cap = max(self.capacity * 2, needed)
+            assert self.mamba_buf is not None
+            new_attn = torch.zeros(
+                self.batch_size, new_cap, self.hidden_size, device=device, dtype=dtype
+            )
+            new_mamba = torch.zeros(
+                self.batch_size, new_cap, self.hidden_size, device=device, dtype=dtype
+            )
+            new_attn[:, : self.filled] = self.attn_buf[:, : self.filled]
+            new_mamba[:, : self.filled] = self.mamba_buf[:, : self.filled]
+            self.attn_buf = new_attn
+            self.mamba_buf = new_mamba
+            self.capacity = new_cap
+
+    def append(self, attn: Tensor, mamba: Tensor) -> None:
+        add = attn.size(1)
+        self._ensure_capacity(add, attn.device, attn.dtype)
+        assert self.attn_buf is not None and self.mamba_buf is not None
+        self.attn_buf[:, self.filled : self.filled + add] = attn
+        self.mamba_buf[:, self.filled : self.filled + add] = mamba
+        self.filled += add
+
+    def append_single_token(self, attn: Tensor, mamba: Tensor) -> None:
+        """Fast path for decode: append one token without realloc after warm-up."""
+        if self.attn_buf is None or self.filled >= self.capacity:
+            self._ensure_capacity(1, attn.device, attn.dtype)
+        assert self.attn_buf is not None and self.mamba_buf is not None
+        self.attn_buf[:, self.filled : self.filled + 1] = attn
+        self.mamba_buf[:, self.filled : self.filled + 1] = mamba
+        self.filled += 1
+
+    def materialize(self) -> tuple[Tensor, Tensor]:
+        assert self.attn_buf is not None and self.mamba_buf is not None
+        return self.attn_buf[:, : self.filled], self.mamba_buf[:, : self.filled]
+
+    def token_len(self) -> int:
+        return self.filled
 
 
 def _validate_hybrid_cache_states(
@@ -1124,9 +1446,9 @@ def _validate_hybrid_cache_states(
         assert len(write_buffers) == num_layers
         for buf in write_buffers:
             if buf is not None:
-                assert len(buf[0]) == len(buf[1])
-                for chunk in buf[0]:
-                    assert chunk.size(0) == batch_size
+                assert buf.filled >= 0
+                if buf.attn_buf is not None:
+                    assert buf.attn_buf.size(0) == batch_size
     if past_key_values is not None:
         assert len(past_key_values) == num_layers
     if active_batch_mask is not None:
@@ -1136,11 +1458,104 @@ def _validate_hybrid_cache_states(
 
 _SELECTIVE_SCAN_FN: Callable[..., Tensor] | None = None
 _SELECTIVE_SCAN_PROBE_DONE = False
+_FUSED_SCAN_WARNED = False
 
 
 def fused_mamba_scan_available() -> bool:
     """True when mamba-ssm fused selective_scan CUDA kernels can be imported."""
     return _load_selective_scan_fn() is not None
+
+
+def log_mamba_backend(config: HybridMambaMoEConfig | None = None) -> str:
+    """Log which Mamba selective-scan backend will be used. Returns summary string."""
+    fused = fused_mamba_scan_available()
+    if config is None:
+        config = HybridMambaMoEConfig()
+    if fused and config.use_fused_mamba_scan:
+        msg = "Mamba backend: fused CUDA selective_scan (mamba-ssm)"
+    elif config.use_parallel_scan:
+        msg = "Mamba backend: Hillis-Steele parallel scan (explicit use_parallel_scan=True)"
+    else:
+        msg = (
+            "Mamba backend: PyTorch fallback "
+            f"(parallel L<={config.parallel_scan_fallback_max_len}, "
+            f"blocked {config.blocked_scan_min_len}<L<={config.sequential_scan_min_len}, "
+            f"sequential L>{config.sequential_scan_min_len})"
+        )
+        if torch.cuda.is_available() and not fused:
+            warnings.warn(
+                "CUDA is available but mamba-ssm is not installed; training will use "
+                "slow PyTorch scan fallbacks. Install mamba-ssm for production runs.",
+                stacklevel=2,
+            )
+    return msg
+
+
+def probe_mamba_scan_timing(
+    config: HybridMambaMoEConfig | None = None,
+    batch_size: int = 2,
+    seq_len: int = 512,
+    device: torch.device | None = None,
+) -> str:
+    """One-step timing probe: fused vs PyTorch fallback selective scan."""
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if config is None:
+        config = HybridMambaMoEConfig(
+            hidden_size=128,
+            mamba_state_size=8,
+            mamba_expand=2,
+        )
+    if not torch.cuda.is_available():
+        return "mamba_scan_probe: skipped (CPU only)"
+
+    import time
+
+    block = MambaBlock(
+        hidden_size=config.hidden_size,
+        state_size=config.mamba_state_size,
+        expand=config.mamba_expand,
+        use_fused_scan=False,
+    ).to(device)
+    x = torch.randn(batch_size, seq_len, config.hidden_size, device=device)
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        block(x)
+    torch.cuda.synchronize()
+    fallback_ms = (time.perf_counter() - t0) * 1000
+
+    if fused_mamba_scan_available():
+        block_fused = MambaBlock(
+            hidden_size=config.hidden_size,
+            state_size=config.mamba_state_size,
+            expand=config.mamba_expand,
+            use_fused_scan=True,
+        ).to(device)
+        block_fused.load_state_dict(block.state_dict())
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            block_fused(x)
+        torch.cuda.synchronize()
+        fused_ms = (time.perf_counter() - t0) * 1000
+        return (
+            f"mamba_scan_probe: fused={fused_ms:.1f}ms fallback={fallback_ms:.1f}ms "
+            f"speedup={fallback_ms / max(fused_ms, 1e-6):.2f}x"
+        )
+    return f"mamba_scan_probe: fallback={fallback_ms:.1f}ms (mamba-ssm not installed)"
+
+
+def _compute_batch_has_padding(attention_mask: Tensor | None, seq_len: int) -> bool:
+    """Single sync point per forward for padding detection."""
+    if attention_mask is None:
+        return False
+    if attention_mask.dim() != 2:
+        return True
+    if attention_mask.size(1) < seq_len:
+        return True
+    return not attention_mask[:, -seq_len:].all().item()
 
 
 def _load_selective_scan_fn() -> Callable[..., Tensor] | None:
@@ -1158,9 +1573,7 @@ def _load_selective_scan_fn() -> Callable[..., Tensor] | None:
     return _SELECTIVE_SCAN_FN
 
 
-def _attention_mask_has_padding(
-    attention_mask: Tensor | None, seq_len: int
-) -> bool:
+def _attention_mask_has_padding(attention_mask: Tensor | None, seq_len: int) -> bool:
     if attention_mask is None:
         return False
     if attention_mask.dim() != 2:
@@ -1176,8 +1589,9 @@ class MambaBlock(nn.Module):
 
     Prefill/training uses fused CUDA selective_scan from `mamba-ssm` when
     available (`use_fused_scan=True`, CUDA, no padding). Otherwise falls back
-    to a checkpointed sequential associative scan (O(L) work). Optional
-    Hillis-Steele parallel scan (`use_parallel_scan=True`) bypasses fused CUDA.
+    to length-aware PyTorch scans: parallel (short L), blocked (medium L),
+    sequential+checkpoint (very long L). Optional Hillis-Steele parallel scan
+    (`use_parallel_scan=True`) bypasses fused CUDA.
     Decode uses allocate_inference_cache() + step().
     """
 
@@ -1190,6 +1604,10 @@ class MambaBlock(nn.Module):
         dt_rank: int | None = None,
         use_parallel_scan: bool = False,
         use_fused_scan: bool = True,
+        parallel_scan_fallback_max_len: int = 4096,
+        blocked_scan_chunk_size: int = 256,
+        blocked_scan_min_len: int = 4096,
+        sequential_scan_min_len: int = 65536,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1199,6 +1617,10 @@ class MambaBlock(nn.Module):
         self.dt_rank = dt_rank if dt_rank is not None else math.ceil(hidden_size / 16)
         self.use_parallel_scan = use_parallel_scan
         self.use_fused_scan = use_fused_scan
+        self.parallel_scan_fallback_max_len = parallel_scan_fallback_max_len
+        self.blocked_scan_chunk_size = blocked_scan_chunk_size
+        self.blocked_scan_min_len = blocked_scan_min_len
+        self.sequential_scan_min_len = sequential_scan_min_len
 
         self.in_proj = nn.Linear(hidden_size, 2 * self.d_inner, bias=False)
         self.conv1d = nn.Conv1d(
@@ -1263,6 +1685,9 @@ class MambaBlock(nn.Module):
         attention_mask: Tensor | None = None,
         active_batch_mask: Tensor | None = None,
         debug_state_checks: bool = False,
+        batch_has_padding: bool | None = None,
+        mamba_internal_checkpoint: bool = True,
+        layer_checkpointing_active: bool = False,
     ) -> tuple[Tensor, MambaCache | None, Tensor | None]:
         """
         x: [B, L, hidden_size]
@@ -1332,6 +1757,13 @@ class MambaBlock(nn.Module):
             use_fused_scan=self.use_fused_scan,
             training=self.training,
             attention_mask=attention_mask,
+            batch_has_padding=batch_has_padding,
+            parallel_scan_fallback_max_len=self.parallel_scan_fallback_max_len,
+            blocked_scan_chunk_size=self.blocked_scan_chunk_size,
+            blocked_scan_min_len=self.blocked_scan_min_len,
+            sequential_scan_min_len=self.sequential_scan_min_len,
+            mamba_internal_checkpoint=mamba_internal_checkpoint,
+            layer_checkpointing_active=layer_checkpointing_active,
         )
         y = y * F.silu(z)
         out = self.out_proj(y)
@@ -1430,6 +1862,63 @@ class MambaBlock(nn.Module):
         return torch.stack(outputs, dim=1)
 
     @staticmethod
+    def _blocked_associative_scan(
+        delta_a: Tensor, delta_b_u: Tensor, block_size: int
+    ) -> Tensor:
+        """Vectorized scan within blocks; carry state between blocks."""
+        _, seq_len, _, _ = delta_a.shape
+        state = torch.zeros_like(delta_b_u[:, 0])
+        outputs: list[Tensor] = []
+        for start in range(0, seq_len, block_size):
+            end = min(start + block_size, seq_len)
+            block_a = delta_a[:, start:end]
+            block_b = delta_b_u[:, start:end]
+            if start > 0:
+                block_b = block_b.clone()
+                block_b[:, 0] = block_a[:, 0] * state + block_b[:, 0]
+            block_out = MambaBlock._parallel_associative_scan(block_a, block_b)
+            outputs.append(block_out)
+            state = block_out[:, -1]
+        return torch.cat(outputs, dim=1)
+
+    @classmethod
+    def _run_associative_scan(
+        cls,
+        delta_a: Tensor,
+        delta_b_u: Tensor,
+        *,
+        use_parallel_scan: bool,
+        training: bool,
+        seq_len: int,
+        parallel_scan_fallback_max_len: int,
+        blocked_scan_chunk_size: int,
+        blocked_scan_min_len: int,
+        sequential_scan_min_len: int,
+        mamba_internal_checkpoint: bool = True,
+        layer_checkpointing_active: bool = False,
+    ) -> Tensor:
+        use_scan_checkpoint = (
+            training and mamba_internal_checkpoint and not layer_checkpointing_active
+        )
+        if use_parallel_scan or seq_len <= parallel_scan_fallback_max_len:
+            return cls._parallel_associative_scan(delta_a, delta_b_u)
+        if seq_len <= sequential_scan_min_len:
+            scan_fn = lambda a, b: cls._blocked_associative_scan(
+                a, b, blocked_scan_chunk_size
+            )
+            if use_scan_checkpoint:
+                return checkpoint(scan_fn, delta_a, delta_b_u, use_reentrant=False)
+            return scan_fn(delta_a, delta_b_u)
+        if use_scan_checkpoint:
+            return checkpoint(
+                cls._sequential_associative_scan,
+                delta_a,
+                delta_b_u,
+                use_reentrant=False,
+            )
+        return cls._sequential_associative_scan(delta_a, delta_b_u)
+
+    @staticmethod
     def _fused_selective_scan(
         u: Tensor,
         dt: Tensor,
@@ -1484,18 +1973,31 @@ class MambaBlock(nn.Module):
         use_fused_scan: bool = True,
         training: bool = False,
         attention_mask: Tensor | None = None,
+        batch_has_padding: bool | None = None,
+        parallel_scan_fallback_max_len: int = 4096,
+        blocked_scan_chunk_size: int = 256,
+        blocked_scan_min_len: int = 4096,
+        sequential_scan_min_len: int = 65536,
+        mamba_internal_checkpoint: bool = True,
+        layer_checkpointing_active: bool = False,
     ) -> tuple[Tensor, Tensor | None]:
         """
         u, dt: [B, L, d_inner]; A: [d_inner, n]; B, C: [B, L, n]; D: [d_inner]
         On pad positions (attention_mask==0), apply identity state transition
         so SSM state does not decay through padding.
         """
+        global _FUSED_SCAN_WARNED
         seq_len = u.size(1)
+        has_padding = (
+            batch_has_padding
+            if batch_has_padding is not None
+            else _attention_mask_has_padding(attention_mask, seq_len)
+        )
         can_use_fused = (
             use_fused_scan
             and not use_parallel_scan
             and u.is_cuda
-            and not _attention_mask_has_padding(attention_mask, seq_len)
+            and not has_padding
             and _load_selective_scan_fn() is not None
         )
         if can_use_fused:
@@ -1509,8 +2011,14 @@ class MambaBlock(nn.Module):
                     D,
                     return_final_state=return_final_state,
                 )
-            except Exception:
-                pass
+            except (RuntimeError, ValueError, TypeError) as exc:
+                if not _FUSED_SCAN_WARNED:
+                    warnings.warn(
+                        f"mamba-ssm fused selective_scan failed ({type(exc).__name__}: "
+                        f"{exc}); falling back to PyTorch scan.",
+                        stacklevel=2,
+                    )
+                    _FUSED_SCAN_WARNED = True
 
         input_dtype = u.dtype
         u_f = u.float()
@@ -1535,17 +2043,19 @@ class MambaBlock(nn.Module):
             delta_a = delta_a * m + (1.0 - m)
             delta_b_u = delta_b_u * m
 
-        if use_parallel_scan:
-            states = cls._parallel_associative_scan(delta_a, delta_b_u)
-        elif training:
-            states = checkpoint(
-                cls._sequential_associative_scan,
-                delta_a,
-                delta_b_u,
-                use_reentrant=False,
-            )
-        else:
-            states = cls._sequential_associative_scan(delta_a, delta_b_u)
+        states = cls._run_associative_scan(
+            delta_a,
+            delta_b_u,
+            use_parallel_scan=use_parallel_scan,
+            training=training,
+            seq_len=seq_len,
+            parallel_scan_fallback_max_len=parallel_scan_fallback_max_len,
+            blocked_scan_chunk_size=blocked_scan_chunk_size,
+            blocked_scan_min_len=blocked_scan_min_len,
+            sequential_scan_min_len=sequential_scan_min_len,
+            mamba_internal_checkpoint=mamba_internal_checkpoint,
+            layer_checkpointing_active=layer_checkpointing_active,
+        )
 
         y = (states * C_f.unsqueeze(2)).sum(dim=-1)
         y = y + u_f * D.float()
@@ -1633,6 +2143,7 @@ class CompressiveMemoryBank(nn.Module):
         key: Tensor,
         value: Tensor,
         key_padding_mask: Tensor | None = None,
+        fast_path: bool = False,
     ) -> Tensor:
         """
         query: [B, Q, H], key/value: [B, K, H]
@@ -1640,6 +2151,20 @@ class CompressiveMemoryBank(nn.Module):
         """
         bsz, q_len, _ = query.shape
         k_len = key.size(1)
+        if fast_path and q_len * k_len <= 256:
+            q = self.q_proj(query).view(bsz, q_len, self.num_heads, self.head_dim)
+            k = self.k_proj(key).view(bsz, k_len, self.num_heads, self.head_dim)
+            v = self.v_proj(value).view(bsz, k_len, self.num_heads, self.head_dim)
+            scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * self.scale
+            if key_padding_mask is not None:
+                scores = scores.masked_fill(
+                    key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf")
+                )
+            attn = F.softmax(scores, dim=-1)
+            out = torch.einsum("bhqk,bkhd->bqhd", attn, v)
+            out = out.reshape(bsz, q_len, self.hidden_size)
+            return self.out_proj(out)
+
         q = self._shape_heads(self.q_proj(query), q_len)
         k = self._shape_heads(self.k_proj(key), k_len)
         v = self._shape_heads(self.v_proj(value), k_len)
@@ -1678,11 +2203,14 @@ class CompressiveMemoryBank(nn.Module):
         x: Tensor,
         memory: Tensor,
         attention_mask: Tensor | None = None,
+        fast_path: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor]:
         kpm = self._key_padding_mask(attention_mask)
         batch_size = x.size(0)
         query = self.summary_query.unsqueeze(0).expand(batch_size, -1, -1)
-        chunk_summary = self._attend(query, x, x, key_padding_mask=kpm)
+        chunk_summary = self._attend(
+            query, x, x, key_padding_mask=kpm, fast_path=fast_path
+        )
 
         gate = torch.sigmoid(
             self.write_gate(torch.cat([memory, chunk_summary], dim=-1))
@@ -1694,6 +2222,163 @@ class CompressiveMemoryBank(nn.Module):
                 new_memory = new_memory.clone()
                 new_memory[all_masked_rows] = memory[all_masked_rows]
         return new_memory, gate, chunk_summary
+
+
+def batched_dual_memory_read(
+    bank_a: CompressiveMemoryBank,
+    bank_b: CompressiveMemoryBank,
+    x: Tensor,
+    mem_a: Tensor,
+    mem_b: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Single batched attention for both memory banks (stacked projections)."""
+    bsz, seq_len, hidden = x.shape
+    m_len = mem_a.size(1)
+    num_heads = bank_a.num_heads
+    head_dim = bank_a.head_dim
+    scale = bank_a.scale
+
+    queries = torch.cat([x, x], dim=0)
+    keys = torch.cat([mem_a, mem_b], dim=0)
+    values = keys
+    bank_idx = torch.arange(2 * bsz, device=x.device) // bsz
+
+    q_w = torch.stack([bank_a.q_proj.weight, bank_b.q_proj.weight], dim=0)
+    k_w = torch.stack([bank_a.k_proj.weight, bank_b.k_proj.weight], dim=0)
+    v_w = torch.stack([bank_a.v_proj.weight, bank_b.v_proj.weight], dim=0)
+    out_w = torch.stack([bank_a.out_proj.weight, bank_b.out_proj.weight], dim=0)
+
+    q = torch.bmm(queries, q_w[bank_idx].transpose(1, 2))
+    k = torch.bmm(keys, k_w[bank_idx].transpose(1, 2))
+    v = torch.bmm(values, v_w[bank_idx].transpose(1, 2))
+
+    q = q.view(2 * bsz, seq_len, num_heads, head_dim)
+    k = k.view(2 * bsz, m_len, num_heads, head_dim)
+    v = v.view(2 * bsz, m_len, num_heads, head_dim)
+
+    scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * scale
+    attn = F.softmax(scores, dim=-1)
+    out = torch.einsum("bhqk,bkhd->bqhd", attn, v)
+    out = out.reshape(2 * bsz, seq_len, hidden)
+    out = torch.bmm(out, out_w[bank_idx].transpose(1, 2))
+
+    return out[:bsz], out[bsz:]
+
+
+def _batched_memory_summarize(
+    bank_a: CompressiveMemoryBank,
+    bank_b: CompressiveMemoryBank,
+    buf_a: Tensor,
+    buf_b: Tensor,
+    key_padding_mask: Tensor | None,
+    fast_path: bool,
+) -> tuple[Tensor, Tensor]:
+    """Batched summary_query attention for dual-bank writes."""
+    bsz = buf_a.size(0)
+    m_len = bank_a.memory_size
+    num_heads = bank_a.num_heads
+    head_dim = bank_a.head_dim
+    scale = bank_a.scale
+    buf_len = buf_a.size(1)
+
+    queries = torch.cat(
+        [
+            bank_a.summary_query.unsqueeze(0).expand(bsz, -1, -1),
+            bank_b.summary_query.unsqueeze(0).expand(bsz, -1, -1),
+        ],
+        dim=0,
+    )
+    keys = torch.cat([buf_a, buf_b], dim=0)
+    values = keys
+    bank_idx = torch.arange(2 * bsz, device=buf_a.device) // bsz
+
+    q_w = torch.stack([bank_a.q_proj.weight, bank_b.q_proj.weight], dim=0)
+    k_w = torch.stack([bank_a.k_proj.weight, bank_b.k_proj.weight], dim=0)
+    v_w = torch.stack([bank_a.v_proj.weight, bank_b.v_proj.weight], dim=0)
+    out_w = torch.stack([bank_a.out_proj.weight, bank_b.out_proj.weight], dim=0)
+
+    q = torch.bmm(queries, q_w[bank_idx].transpose(1, 2))
+    k = torch.bmm(keys, k_w[bank_idx].transpose(1, 2))
+    v = torch.bmm(values, v_w[bank_idx].transpose(1, 2))
+    q = q.view(2 * bsz, m_len, num_heads, head_dim)
+    k = k.view(2 * bsz, buf_len, num_heads, head_dim)
+    v = v.view(2 * bsz, buf_len, num_heads, head_dim)
+    scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * scale
+    if key_padding_mask is not None:
+        kpm = torch.cat([key_padding_mask, key_padding_mask], dim=0)
+        scores = scores.masked_fill(kpm.unsqueeze(1).unsqueeze(2), float("-inf"))
+    attn = F.softmax(scores, dim=-1)
+    out = torch.einsum("bhqk,bkhd->bqhd", attn, v)
+    out = out.reshape(2 * bsz, m_len, bank_a.hidden_size)
+    out = torch.bmm(out, out_w[bank_idx].transpose(1, 2))
+
+    return out[:bsz], out[bsz:]
+
+
+def batched_dual_memory_write(
+    bank_a: CompressiveMemoryBank,
+    bank_b: CompressiveMemoryBank,
+    buf_attn: Tensor,
+    buf_mamba: Tensor,
+    mem_a: Tensor,
+    mem_b: Tensor,
+    attention_mask: Tensor | None = None,
+    fast_path: bool = False,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Fused write for both memory banks (stacked projections)."""
+    kpm: Tensor | None = None
+    if attention_mask is not None:
+        kpm = ~attention_mask.bool()
+
+    a_summary, s_summary = _batched_memory_summarize(
+        bank_a, bank_b, buf_attn, buf_mamba, kpm, fast_path
+    )
+
+    gate_w = torch.stack([bank_a.write_gate.weight, bank_b.write_gate.weight], dim=0)
+    gate_b = torch.stack(
+        [
+            bank_a.write_gate.bias
+            if bank_a.write_gate.bias is not None
+            else torch.zeros(
+                bank_a.hidden_size, device=buf_attn.device, dtype=buf_attn.dtype
+            ),
+            bank_b.write_gate.bias
+            if bank_b.write_gate.bias is not None
+            else torch.zeros(
+                bank_b.hidden_size, device=buf_attn.device, dtype=buf_attn.dtype
+            ),
+        ],
+        dim=0,
+    )
+    update_w = torch.stack(
+        [bank_a.write_update.weight, bank_b.write_update.weight], dim=0
+    )
+    bsz = buf_attn.size(0)
+    bank_idx = torch.arange(2 * bsz, device=buf_attn.device) // bsz
+
+    mem_stacked = torch.cat([mem_a, mem_b], dim=0)
+    summary_stacked = torch.cat([a_summary, s_summary], dim=0)
+    gate_in = torch.cat([mem_stacked, summary_stacked], dim=-1)
+    gate_logits = torch.bmm(gate_in, gate_w[bank_idx].transpose(1, 2)) + gate_b[
+        bank_idx
+    ].unsqueeze(1)
+    gate = torch.sigmoid(gate_logits)
+    updates = torch.bmm(summary_stacked, update_w[bank_idx].transpose(1, 2))
+    new_mem_stacked = gate * mem_stacked + (1.0 - gate) * updates
+    new_a = new_mem_stacked[:bsz]
+    new_s = new_mem_stacked[bsz:]
+
+    if kpm is not None:
+        all_masked_rows = kpm.all(dim=-1)
+        if all_masked_rows.any():
+            new_a = new_a.clone()
+            new_s = new_s.clone()
+            new_a[all_masked_rows] = mem_a[all_masked_rows]
+            new_s[all_masked_rows] = mem_b[all_masked_rows]
+
+    a_gate = gate[:bsz]
+    s_gate = gate[bsz:]
+    return new_a, a_gate, a_summary, new_s, s_gate, s_summary
 
 
 class TokenGatedFusion(nn.Module):
@@ -1710,8 +2395,6 @@ class TokenGatedFusion(nn.Module):
 
 
 HybridMemoryState = tuple[Tensor, Tensor]
-# List of per-step/chunk branch outputs awaiting a chunked memory write.
-MemoryWriteBuffer = tuple[list[Tensor], list[Tensor]]
 
 
 def _hybrid_layer_forward(
@@ -1728,6 +2411,9 @@ def _hybrid_layer_forward(
     active_batch_mask: Tensor | None,
     training_step: int | None = None,
     max_training_steps: int | None = None,
+    batch_has_padding: bool | None = None,
+    layer_checkpointing_active: bool = False,
+    decode_accumulate_only: bool = False,
 ) -> tuple[
     Tensor,
     Tensor,
@@ -1752,6 +2438,9 @@ def _hybrid_layer_forward(
         active_batch_mask=active_batch_mask,
         training_step=training_step,
         max_training_steps=max_training_steps,
+        batch_has_padding=batch_has_padding,
+        layer_checkpointing_active=layer_checkpointing_active,
+        decode_accumulate_only=decode_accumulate_only,
     )
 
 
@@ -1782,6 +2471,10 @@ class HybridDecoderLayer(nn.Module):
             dt_rank=config.mamba_dt_rank,
             use_parallel_scan=config.use_parallel_scan,
             use_fused_scan=config.use_fused_mamba_scan,
+            parallel_scan_fallback_max_len=config.parallel_scan_fallback_max_len,
+            blocked_scan_chunk_size=config.blocked_scan_chunk_size,
+            blocked_scan_min_len=config.blocked_scan_min_len,
+            sequential_scan_min_len=config.sequential_scan_min_len,
         )
 
         if self.use_dual_memory:
@@ -1823,7 +2516,11 @@ class HybridDecoderLayer(nn.Module):
             ]
         )
         self.moe_block = DroplessMoELayer(
-            router, experts, capacity_factor=config.capacity_factor
+            router,
+            experts,
+            capacity_factor=config.capacity_factor,
+            use_grouped_moe_dispatch=config.use_grouped_moe_dispatch,
+            use_grouped_gemm=config.use_grouped_gemm,
         )
 
     def init_memory_state(
@@ -1864,6 +2561,9 @@ class HybridDecoderLayer(nn.Module):
         active_batch_mask: Tensor | None = None,
         training_step: int | None = None,
         max_training_steps: int | None = None,
+        batch_has_padding: bool | None = None,
+        layer_checkpointing_active: bool = False,
+        decode_accumulate_only: bool = False,
     ) -> tuple[
         Tensor,
         Tensor,
@@ -1907,15 +2607,11 @@ class HybridDecoderLayer(nn.Module):
                 memory_state = self.init_memory_state(x.size(0), x.device, x.dtype)
             a_mem, s_mem = memory_state
 
-            # Read memory *into* each branch (condition inputs before GQA/Mamba).
-            a_read = self.attn_memory_bank.read(
-                x_norm, a_mem, attention_mask=token_attention_mask
+            # Batched read into both branches (single stacked attention pass).
+            a_read, s_read = batched_dual_memory_read(
+                self.attn_memory_bank, self.state_memory_bank, x_norm, a_mem, s_mem
             )
             attn_input = self.attn_memory_combine(torch.cat([x_norm, a_read], dim=-1))
-
-            s_read = self.state_memory_bank.read(
-                x_norm, s_mem, attention_mask=token_attention_mask
-            )
             mamba_input = self.state_memory_combine(torch.cat([x_norm, s_read], dim=-1))
 
         if hidden_mask is not None:
@@ -1938,6 +2634,9 @@ class HybridDecoderLayer(nn.Module):
             attention_mask=mamba_token_mask,
             active_batch_mask=active_batch_mask,
             debug_state_checks=cfg.debug_state_checks,
+            batch_has_padding=batch_has_padding,
+            mamba_internal_checkpoint=cfg.mamba_internal_checkpoint,
+            layer_checkpointing_active=layer_checkpointing_active,
         )
 
         if self.use_dual_memory:
@@ -1952,26 +2651,39 @@ class HybridDecoderLayer(nn.Module):
             # Accumulate raw branch outputs for chunk-aligned memory writes.
             buf_attn = attn_out
             buf_mamba = mamba_out
-            if active_batch_mask is not None:
+            skip_active_mask = (
+                decode_accumulate_only
+                and active_batch_mask is not None
+                and active_batch_mask.all()
+            )
+            if active_batch_mask is not None and not skip_active_mask:
                 active = active_batch_mask.to(dtype=buf_attn.dtype).view(-1, 1, 1)
                 buf_attn = buf_attn * active
                 buf_mamba = buf_mamba * active
 
-            if write_buffer is not None:
-                attn_chunks = list(write_buffer[0]) + [buf_attn]
-                mamba_chunks = list(write_buffer[1]) + [buf_mamba]
+            write_cap = self.config.memory_write_interval
+            if write_cap is None:
+                write_cap = self.config.memory_chunk_size
+            if write_cap is None:
+                write_cap = 512
+
+            if write_buffer is None:
+                new_buf = MemoryWriteBuffer(
+                    x.size(0), cfg.hidden_size, capacity=write_cap
+                )
             else:
-                attn_chunks = [buf_attn]
-                mamba_chunks = [buf_mamba]
+                new_buf = write_buffer
+
+            if decode_accumulate_only and seq_len == 1:
+                new_buf.append_single_token(buf_attn, buf_mamba)
+            else:
+                new_buf.append(buf_attn, buf_mamba)
 
             if skip_memory_write:
                 new_memory_state = memory_state
-                new_write_buffer = (attn_chunks, mamba_chunks)
+                new_write_buffer = new_buf
             else:
-                buf_attn_cat, buf_mamba_cat = (
-                    torch.cat(attn_chunks, dim=1),
-                    torch.cat(mamba_chunks, dim=1),
-                )
+                buf_attn_cat, buf_mamba_cat = new_buf.materialize()
                 # Build mask for buffered tokens: prior buffer assumed valid,
                 # current tokens use token_attention_mask when present.
                 buf_len = buf_attn_cat.size(1)
@@ -1994,11 +2706,23 @@ class HybridDecoderLayer(nn.Module):
                         dtype=write_mask.dtype
                     )
 
-                new_a_mem, a_write_gate, a_summary = self.attn_memory_bank.write(
-                    buf_attn_cat, a_mem, attention_mask=write_mask
-                )
-                new_s_mem, s_write_gate, s_summary = self.state_memory_bank.write(
-                    buf_mamba_cat, s_mem, attention_mask=write_mask
+                write_fast = buf_len <= cfg.decode_write_fast_threshold
+                (
+                    new_a_mem,
+                    a_write_gate,
+                    a_summary,
+                    new_s_mem,
+                    s_write_gate,
+                    s_summary,
+                ) = batched_dual_memory_write(
+                    self.attn_memory_bank,
+                    self.state_memory_bank,
+                    buf_attn_cat,
+                    buf_mamba_cat,
+                    a_mem,
+                    s_mem,
+                    attention_mask=write_mask,
+                    fast_path=write_fast,
                 )
                 if active_batch_mask is not None and (~active_batch_mask).any():
                     inactive = ~active_batch_mask
@@ -2163,33 +2887,80 @@ class HybridModel(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [HybridDecoderLayer(config) for _ in range(config.num_layers)]
-        )
+        layers: list[HybridDecoderLayer] = [
+            HybridDecoderLayer(config) for _ in range(config.num_layers)
+        ]
+        if config.use_torch_compile:
+            if config.gradient_checkpointing:
+                warnings.warn(
+                    "use_torch_compile and gradient_checkpointing are mutually "
+                    "exclusive; disabling gradient_checkpointing for compile.",
+                    stacklevel=2,
+                )
+                config.gradient_checkpointing = False
+            compile_backend = "inductor" if torch.cuda.is_available() else "aot_eager"
+            layers = [
+                torch.compile(
+                    layer,
+                    mode=config.torch_compile_mode,
+                    backend=compile_backend,
+                )  # type: ignore[assignment]
+                for layer in layers
+            ]
+        self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.register_buffer(
             "ssm_norm_gammas",
             torch.zeros(config.num_layers),
             persistent=True,
         )
-        self._ssm_gammas_calibrated = False
+        self.register_buffer(
+            "ssm_gammas_calibrated",
+            torch.tensor(0.0),
+            persistent=True,
+        )
+
+    def _ssm_calibration_done(self) -> bool:
+        return bool(self.ssm_gammas_calibrated.item() > 0) or bool(
+            self.ssm_norm_gammas.any().item()
+        )
 
     @torch.no_grad()
     def calibrate_ssm_norm_thresholds(
         self, batch_size: int = 1, seq_len: int = 8
     ) -> None:
+        if self._ssm_calibration_done():
+            for i, layer in enumerate(self.layers):
+                layer.ssm_norm_gamma = self.ssm_norm_gammas[i]
+            return
+
         device = self.embed_tokens.weight.device
         dtype = self.embed_tokens.weight.dtype
         dummy = torch.randn(
             batch_size, seq_len, self.config.hidden_size, device=device, dtype=dtype
         )
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(dummy, src=0)
+
         for i, layer in enumerate(self.layers):
-            _, _, ssm_state = layer.mamba_block(dummy, use_cache=False)
+            _, _, ssm_state = layer.mamba_block(
+                dummy,
+                use_cache=False,
+                mamba_internal_checkpoint=False,
+                layer_checkpointing_active=self.config.gradient_checkpointing,
+            )
             assert ssm_state is not None
             norms = ssm_state.float().pow(2).mean(dim=(1, 2))
             self.ssm_norm_gammas[i] = torch.quantile(norms, 0.9)
             layer.ssm_norm_gamma = self.ssm_norm_gammas[i]
-        self._ssm_gammas_calibrated = True
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.broadcast(self.ssm_norm_gammas, src=0)
+            for i, layer in enumerate(self.layers):
+                layer.ssm_norm_gamma = self.ssm_norm_gammas[i]
+
+        self.ssm_gammas_calibrated.fill_(1.0)
 
     def allocate_mamba_caches(
         self, batch_size: int, device: torch.device, dtype: torch.dtype
@@ -2229,6 +3000,7 @@ class HybridModel(nn.Module):
         active_batch_mask: Tensor | None = None,
         training_step: int | None = None,
         max_training_steps: int | None = None,
+        decode_accumulate_only: bool = False,
     ) -> tuple[
         Tensor,
         Tensor,
@@ -2243,12 +3015,16 @@ class HybridModel(nn.Module):
         hidden_states = self.embed_tokens(input_ids)
         batch_size, seq_len = hidden_states.shape[:2]
 
+        batch_has_padding = _compute_batch_has_padding(attention_mask, seq_len)
+
         if (
             self.training
             and self.config.use_auxiliary_losses
-            and not self._ssm_gammas_calibrated
+            and not self._ssm_calibration_done()
         ):
-            self.calibrate_ssm_norm_thresholds(batch_size=batch_size, seq_len=seq_len)
+            # Use a short dummy sequence; full-seq calibration is wasteful and
+            # can trigger Mamba scan checkpoints on the first training step.
+            self.calibrate_ssm_norm_thresholds(batch_size=batch_size)
 
         _validate_hybrid_cache_states(
             self.config,
@@ -2296,6 +3072,10 @@ class HybridModel(nn.Module):
         all_gate_stats: dict[str, Tensor] = {}
         aux_sums = HybridLayerAuxLosses.zeros(hidden_states.device, hidden_states.dtype)
 
+        layer_checkpointing_active = (
+            self.config.gradient_checkpointing and self.training and not use_cache
+        )
+
         for i, layer in enumerate(self.layers):
             layer_past_kv = past_key_values[i] if past_key_values is not None else None
             layer_memory = memory_states[i] if memory_states is not None else None
@@ -2329,6 +3109,9 @@ class HybridModel(nn.Module):
                     active_batch_mask,
                     training_step,
                     max_training_steps,
+                    batch_has_padding,
+                    layer_checkpointing_active,
+                    decode_accumulate_only,
                     use_reentrant=False,
                 )
             else:
@@ -2356,6 +3139,9 @@ class HybridModel(nn.Module):
                     active_batch_mask,
                     training_step,
                     max_training_steps,
+                    batch_has_padding,
+                    layer_checkpointing_active,
+                    decode_accumulate_only,
                 )
             total_aux_loss = total_aux_loss + layer_aux_loss
             total_z_loss = total_z_loss + layer_z_loss
@@ -2413,10 +3199,110 @@ class HybridModel(nn.Module):
         )
 
 
+@dataclass
+class _CudaDecodeGraphRunner:
+    """CUDA graph replay for fixed-shape single-token decode steps."""
+
+    model: "HybridForCausalLM"
+    graph: torch.cuda.CUDAGraph | None = None
+    static_input_ids: Tensor | None = None
+    static_attention_mask: Tensor | None = None
+    static_position_ids: Tensor | None = None
+    static_out: HybridTrainingOutput | None = None
+    mask_width: int = 0
+
+    def capture(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        position_ids: Tensor,
+        past_key_values: list | None,
+        memory_states: list | None,
+        mamba_caches: list | None,
+        write_buffers: list | None,
+        past_seen_tokens: int,
+        active_batch_mask: Tensor,
+    ) -> bool:
+        if not torch.cuda.is_available():
+            return False
+        try:
+            self.mask_width = attention_mask.size(1)
+            self.static_input_ids = input_ids.clone()
+            self.static_attention_mask = attention_mask.clone()
+            self.static_position_ids = position_ids.clone()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):
+                    self.static_out = self.model.forward(
+                        input_ids=self.static_input_ids,
+                        attention_mask=self.static_attention_mask,
+                        position_ids=self.static_position_ids,
+                        past_key_values=past_key_values,
+                        mamba_caches=mamba_caches,
+                        memory_states=memory_states,
+                        write_buffers=write_buffers,
+                        past_seen_tokens=past_seen_tokens,
+                        use_cache=True,
+                        skip_memory_write=True,
+                        active_batch_mask=active_batch_mask,
+                        decode_accumulate_only=True,
+                    )
+            torch.cuda.current_stream().wait_stream(stream)
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.static_out = self.model.forward(
+                    input_ids=self.static_input_ids,
+                    attention_mask=self.static_attention_mask,
+                    position_ids=self.static_position_ids,
+                    past_key_values=past_key_values,
+                    mamba_caches=mamba_caches,
+                    memory_states=memory_states,
+                    write_buffers=write_buffers,
+                    past_seen_tokens=past_seen_tokens,
+                    use_cache=True,
+                    skip_memory_write=True,
+                    active_batch_mask=active_batch_mask,
+                    decode_accumulate_only=True,
+                )
+            return True
+        except (RuntimeError, ValueError):
+            self.graph = None
+            self.static_out = None
+            self.static_attention_mask = None
+            self.static_position_ids = None
+            return False
+
+    def replay(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        position_ids: Tensor,
+    ) -> HybridTrainingOutput:
+        assert self.graph is not None and self.static_input_ids is not None
+        assert self.static_out is not None
+        assert self.static_attention_mask is not None
+        assert self.static_position_ids is not None
+        self.static_input_ids.copy_(input_ids)
+        self.static_attention_mask.copy_(attention_mask)
+        self.static_position_ids.copy_(position_ids)
+        self.graph.replay()
+        return self.static_out
+
+
 class HybridForCausalLM(nn.Module):
     def __init__(self, config: HybridMambaMoEConfig) -> None:
         super().__init__()
         self.config = config
+        if config.use_dual_memory and not config.use_auxiliary_losses:
+            msg = (
+                "use_dual_memory=True with use_auxiliary_losses=False leaves memory "
+                "write-path parameters without gradients on short chunks. Enable "
+                "auxiliary losses for correct dual-memory training."
+            )
+            if config.debug_state_checks:
+                raise ValueError(msg)
+            warnings.warn(msg, stacklevel=2)
         self.vocab_size = config.vocab_size
         self.router_aux_loss_coef = config.router_aux_loss_coef
         self.router_z_loss_coef = config.router_z_loss_coef
@@ -2512,6 +3398,7 @@ class HybridForCausalLM(nn.Module):
         active_batch_mask: Tensor | None = None,
         training_step: int | None = None,
         max_training_steps: int | None = None,
+        decode_accumulate_only: bool = False,
     ) -> HybridTrainingOutput:
         seq_len = input_ids.size(1)
         if self._should_chunk_training(seq_len, use_cache, memory_states):
@@ -2548,9 +3435,9 @@ class HybridForCausalLM(nn.Module):
             active_batch_mask=active_batch_mask,
             training_step=training_step,
             max_training_steps=max_training_steps,
+            decode_accumulate_only=decode_accumulate_only,
         )
-        need_logits = self.config.return_logits or labels is not None
-        logits = self.lm_head(hidden_states) if need_logits else None
+        logits = self.lm_head(hidden_states)
 
         loss = None
         ce_loss = None
@@ -2765,8 +3652,14 @@ class HybridForCausalLM(nn.Module):
             a_mem, s_mem = mem
             buf_attn, buf_mamba = _materialize_write_buffer(buf)
             assert buf_attn is not None and buf_mamba is not None
-            new_a, _, _ = layer.attn_memory_bank.write(buf_attn, a_mem)
-            new_s, _, _ = layer.state_memory_bank.write(buf_mamba, s_mem)
+            new_a, _, _, new_s, _, _ = batched_dual_memory_write(
+                layer.attn_memory_bank,
+                layer.state_memory_bank,
+                buf_attn,
+                buf_mamba,
+                a_mem,
+                s_mem,
+            )
             new_states.append((new_a, new_s))
         return new_states, None
 
@@ -2837,6 +3730,7 @@ class HybridForCausalLM(nn.Module):
         past_seen_tokens = 0
         tokens_in_write_buffer = 0
         out = None
+        cuda_runner: _CudaDecodeGraphRunner | None = None
 
         try:
             # Chunked prefill so memory writes match training chunk size.
@@ -2917,20 +3811,71 @@ class HybridForCausalLM(nn.Module):
                 step_input[~active] = self.config.pad_token_id
                 tokens_in_write_buffer += 1
                 do_memory_write = tokens_in_write_buffer >= write_interval
+                decode_accumulate = not do_memory_write
 
-                out = self.forward(
-                    input_ids=step_input,
-                    attention_mask=step_attn_mask,
-                    position_ids=step_position_ids,
-                    past_key_values=past_key_values,
-                    memory_states=memory_states,
-                    mamba_caches=mamba_caches,
-                    write_buffers=write_buffers,
-                    past_seen_tokens=past_seen_tokens,
-                    use_cache=True,
-                    skip_memory_write=not do_memory_write,
-                    active_batch_mask=active,
+                use_graph = (
+                    self.config.use_cuda_graph
+                    and not do_sample
+                    and decode_accumulate
+                    and active.all()
+                    and torch.cuda.is_available()
                 )
+
+                if use_graph:
+                    if (
+                        cuda_runner is not None
+                        and cuda_runner.mask_width != step_attn_mask.size(1)
+                    ):
+                        cuda_runner = None
+                    if cuda_runner is None:
+                        cuda_runner = _CudaDecodeGraphRunner(self)
+                        if not cuda_runner.capture(
+                            step_input,
+                            step_attn_mask,
+                            step_position_ids,
+                            past_key_values,
+                            memory_states,
+                            mamba_caches,
+                            write_buffers,
+                            past_seen_tokens,
+                            active,
+                        ):
+                            cuda_runner = None
+                    if cuda_runner is not None:
+                        out = cuda_runner.replay(
+                            step_input, step_attn_mask, step_position_ids
+                        )
+                    else:
+                        out = self.forward(
+                            input_ids=step_input,
+                            attention_mask=step_attn_mask,
+                            position_ids=step_position_ids,
+                            past_key_values=past_key_values,
+                            memory_states=memory_states,
+                            mamba_caches=mamba_caches,
+                            write_buffers=write_buffers,
+                            past_seen_tokens=past_seen_tokens,
+                            use_cache=True,
+                            skip_memory_write=True,
+                            active_batch_mask=active,
+                            decode_accumulate_only=True,
+                        )
+                else:
+                    cuda_runner = None
+                    out = self.forward(
+                        input_ids=step_input,
+                        attention_mask=step_attn_mask,
+                        position_ids=step_position_ids,
+                        past_key_values=past_key_values,
+                        memory_states=memory_states,
+                        mamba_caches=mamba_caches,
+                        write_buffers=write_buffers,
+                        past_seen_tokens=past_seen_tokens,
+                        use_cache=True,
+                        skip_memory_write=not do_memory_write,
+                        active_batch_mask=active,
+                        decode_accumulate_only=decode_accumulate,
+                    )
                 past_key_values = out.past_key_values
                 memory_states = out.memory_states
                 mamba_caches = out.mamba_caches

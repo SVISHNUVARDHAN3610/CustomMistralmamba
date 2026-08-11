@@ -14,7 +14,12 @@ if str(_ROOT) not in sys.path:
 import torch
 from torch.nn.utils import clip_grad_norm_
 
-from model import HybridForCausalLM, HybridMambaMoEConfig, count_trainable_params
+from model import (
+    HybridForCausalLM,
+    HybridMambaMoEConfig,
+    count_trainable_params,
+    log_mamba_backend,
+)
 
 
 def build_toy_config() -> HybridMambaMoEConfig:
@@ -88,11 +93,24 @@ def main() -> None:
         help="Optional JSONL log path (set empty to disable)",
     )
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument(
+        "--compile", action="store_true", help="torch.compile decoder layers"
+    )
+    parser.add_argument(
+        "--compile-mode",
+        type=str,
+        default="default",
+        help="torch.compile mode (default, reduce-overhead, max-autotune)",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
     cfg = build_toy_config()
+    if args.compile:
+        cfg.use_torch_compile = True
+        cfg.torch_compile_mode = args.compile_mode
+    print(log_mamba_backend(cfg))
     model = HybridForCausalLM(cfg).to(device)
     n_params = count_trainable_params(model)
     print(f"trainable_params={n_params:,} (target ~5M)")

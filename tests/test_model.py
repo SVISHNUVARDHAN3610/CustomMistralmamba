@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+import warnings
 from unittest import mock
 
 import torch
@@ -11,13 +12,17 @@ from model import (
     HybridForCausalLM,
     HybridMambaMoEConfig,
     MambaBlock,
+    MemoryWriteBuffer,
     MixtralConfig,
     MixtralForCausalLM,
     SwiGLUExpert,
     _aux_loss_schedule,
+    _compute_batch_has_padding,
     _expert_loss_schedule,
     _write_buffer_token_len,
     associative_retrieval_loss,
+    batched_dual_memory_read,
+    batched_dual_memory_write,
     build_test3_null_baseline_config,
     count_trainable_params,
     fused_mamba_scan_available,
@@ -458,7 +463,9 @@ class TestHybridModel(unittest.TestCase):
         h = cfg.hidden_size
         attn_chunks = [torch.randn(1, 2, h), torch.randn(1, 2, h)]
         mamba_chunks = [torch.randn(1, 2, h), torch.randn(1, 2, h)]
-        buf: tuple[list[torch.Tensor], list[torch.Tensor]] = (attn_chunks, mamba_chunks)
+        buf = MemoryWriteBuffer(1, h, capacity=4)
+        buf.append(attn_chunks[0], mamba_chunks[0])
+        buf.append(attn_chunks[1], mamba_chunks[1])
 
         flushed, _ = model._flush_memory_write_buffers([mem], [buf])
         assert flushed is not None
@@ -970,12 +977,16 @@ class TestHybridModel(unittest.TestCase):
 
         hidden_size = 64
         state_size = 8
-        block = MambaBlock(
-            hidden_size=hidden_size,
-            state_size=state_size,
-            expand=2,
-            use_fused_scan=False,
-        ).cuda().eval()
+        block = (
+            MambaBlock(
+                hidden_size=hidden_size,
+                state_size=state_size,
+                expand=2,
+                use_fused_scan=False,
+            )
+            .cuda()
+            .eval()
+        )
 
         batch_size, seq_len = 2, 32
         d_inner = block.d_inner
@@ -1014,18 +1025,26 @@ class TestHybridModel(unittest.TestCase):
             self.skipTest("mamba-ssm fused selective_scan requires CUDA")
 
         hidden_size = 64
-        block_ref = MambaBlock(
-            hidden_size=hidden_size,
-            state_size=8,
-            expand=2,
-            use_fused_scan=False,
-        ).cuda().eval()
-        block_fused = MambaBlock(
-            hidden_size=hidden_size,
-            state_size=8,
-            expand=2,
-            use_fused_scan=True,
-        ).cuda().eval()
+        block_ref = (
+            MambaBlock(
+                hidden_size=hidden_size,
+                state_size=8,
+                expand=2,
+                use_fused_scan=False,
+            )
+            .cuda()
+            .eval()
+        )
+        block_fused = (
+            MambaBlock(
+                hidden_size=hidden_size,
+                state_size=8,
+                expand=2,
+                use_fused_scan=True,
+            )
+            .cuda()
+            .eval()
+        )
         block_fused.load_state_dict(block_ref.state_dict())
 
         x = torch.randn(2, 32, hidden_size, device="cuda")
@@ -1039,18 +1058,26 @@ class TestHybridModel(unittest.TestCase):
             self.skipTest("mamba-ssm fused selective_scan requires CUDA")
 
         hidden_size = 64
-        block_ref = MambaBlock(
-            hidden_size=hidden_size,
-            state_size=8,
-            expand=2,
-            use_fused_scan=False,
-        ).cuda().eval()
-        block_fused = MambaBlock(
-            hidden_size=hidden_size,
-            state_size=8,
-            expand=2,
-            use_fused_scan=True,
-        ).cuda().eval()
+        block_ref = (
+            MambaBlock(
+                hidden_size=hidden_size,
+                state_size=8,
+                expand=2,
+                use_fused_scan=False,
+            )
+            .cuda()
+            .eval()
+        )
+        block_fused = (
+            MambaBlock(
+                hidden_size=hidden_size,
+                state_size=8,
+                expand=2,
+                use_fused_scan=True,
+            )
+            .cuda()
+            .eval()
+        )
         block_fused.load_state_dict(block_ref.state_dict())
 
         x = torch.randn(1, 14, hidden_size, device="cuda")
@@ -1064,6 +1091,312 @@ class TestHybridModel(unittest.TestCase):
         out_ref, _, _ = block_ref(x, attention_mask=mask)
         out_fused, _, _ = block_fused(x, attention_mask=mask)
         self.assertLess((out_ref - out_fused).abs().max().item(), 1e-4)
+
+    def test_aux_loss_disabled_warns_with_dual_memory(self) -> None:
+        cfg = _small_hybrid_config(use_auxiliary_losses=False)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            HybridForCausalLM(cfg)
+        self.assertTrue(
+            any("use_auxiliary_losses=False" in str(w.message) for w in caught)
+        )
+
+    def test_ssm_gamma_survives_state_dict_roundtrip(self) -> None:
+        cfg = _small_hybrid_config(num_layers=2, use_auxiliary_losses=True)
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 8))
+        model(input_ids=ids, labels=ids)
+        gammas_before = model.model.ssm_norm_gammas.clone()
+        cal_before = model.model.ssm_gammas_calibrated.clone()
+        state = {k: v.clone() for k, v in model.state_dict().items()}
+        model2 = HybridForCausalLM(cfg).train()
+        model2.load_state_dict(state)
+        with mock.patch.object(
+            model2.model,
+            "calibrate_ssm_norm_thresholds",
+            wraps=model2.model.calibrate_ssm_norm_thresholds,
+        ) as spy:
+            model2(input_ids=ids, labels=ids)
+            spy.assert_not_called()
+        self.assertTrue(torch.allclose(model2.model.ssm_norm_gammas, gammas_before))
+        self.assertTrue(torch.allclose(model2.model.ssm_gammas_calibrated, cal_before))
+
+    def test_blocked_scan_matches_sequential(self) -> None:
+        torch.manual_seed(0)
+        b, seq_len, d, n = 2, 128, 16, 8
+        delta_a = torch.rand(b, seq_len, d, n) * 0.5 + 0.5
+        delta_b_u = torch.randn(b, seq_len, d, n)
+        blocked = MambaBlock._blocked_associative_scan(
+            delta_a, delta_b_u, block_size=32
+        )
+        sequential = MambaBlock._sequential_associative_scan(delta_a, delta_b_u)
+        self.assertLess((blocked - sequential).abs().max().item(), 1e-5)
+
+    def test_scan_dispatch_parallel_for_short_seq(self) -> None:
+        with mock.patch.object(
+            MambaBlock,
+            "_parallel_associative_scan",
+            wraps=MambaBlock._parallel_associative_scan,
+        ) as spy:
+            cfg = _small_hybrid_config(
+                use_fused_mamba_scan=False, parallel_scan_fallback_max_len=512
+            )
+            model = HybridForCausalLM(cfg).train()
+            ids = torch.randint(0, cfg.vocab_size, (1, 64))
+            model(input_ids=ids, labels=ids)
+            self.assertGreater(spy.call_count, 0)
+
+    def test_fused_scan_failure_warns_once(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for fused scan failure test")
+        import model as model_mod
+
+        model_mod._FUSED_SCAN_WARNED = False
+        hidden_size = 64
+        d_inner = hidden_size * 2
+        u = torch.randn(1, 8, d_inner, device="cuda")
+        dt = torch.rand(1, 8, d_inner, device="cuda")
+        a = -torch.exp(torch.randn(d_inner, 8, device="cuda"))
+        b = torch.randn(1, 8, 8, device="cuda")
+        c = torch.randn(1, 8, 8, device="cuda")
+        d = torch.ones(d_inner, device="cuda")
+        with (
+            mock.patch.object(
+                MambaBlock, "_fused_selective_scan", side_effect=RuntimeError("boom")
+            ),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            MambaBlock._selective_scan(
+                u, dt, a, b, c, d, use_fused_scan=True, training=False
+            )
+            MambaBlock._selective_scan(
+                u, dt, a, b, c, d, use_fused_scan=True, training=False
+            )
+        fused_warnings = [
+            w for w in caught if "fused selective_scan failed" in str(w.message)
+        ]
+        self.assertEqual(len(fused_warnings), 1)
+        model_mod._FUSED_SCAN_WARNED = False
+
+    def test_write_buffer_append_linear_cost(self) -> None:
+        buf = MemoryWriteBuffer(2, 16, capacity=4)
+        for i in range(3):
+            t = torch.randn(2, 1, 16)
+            buf.append(t, t)
+        self.assertEqual(buf.filled, 3)
+        self.assertIsNotNone(buf.attn_buf)
+        assert buf.attn_buf is not None
+        self.assertGreaterEqual(buf.attn_buf.size(1), 3)
+        out_a, _out_m = buf.materialize()
+        self.assertEqual(out_a.size(1), 3)
+
+    def test_grouped_moe_matches_loop_dispatch(self) -> None:
+        from model import DroplessMoELayer, MOERouter
+
+        torch.manual_seed(3)
+        hidden, inter, experts, top_k = 64, 128, 4, 2
+        router = MOERouter(hidden, experts, top_k)
+        expert_list = torch.nn.ModuleList(
+            [SwiGLUExpert(hidden, inter) for _ in range(experts)]
+        )
+        x = torch.randn(3, 7, hidden)
+        grouped = DroplessMoELayer(
+            router, expert_list, capacity_factor=None, use_grouped_moe_dispatch=True
+        )
+        loop = DroplessMoELayer(
+            router, expert_list, capacity_factor=None, use_grouped_moe_dispatch=False
+        )
+        loop.load_state_dict(grouped.state_dict())
+        out_g, aux_g, z_g, _ = grouped(x)
+        out_l, aux_l, z_l, _ = loop(x)
+        self.assertLess((out_g - out_l).abs().max().item(), 1e-5)
+        self.assertLess(abs(aux_g.item() - aux_l.item()), 1e-5)
+        self.assertLess(abs(z_g.item() - z_l.item()), 1e-5)
+
+    def test_batched_memory_read_matches_separate(self) -> None:
+        cfg = _small_hybrid_config(num_layers=1)
+        model = HybridForCausalLM(cfg).eval()
+        layer = model.model.layers[0]
+        x = torch.randn(2, 5, cfg.hidden_size)
+        a_mem = layer.attn_memory_bank.init_state(2, x.device, x.dtype)
+        s_mem = layer.state_memory_bank.init_state(2, x.device, x.dtype)
+        a_sep = layer.attn_memory_bank.read(x, a_mem)
+        s_sep = layer.state_memory_bank.read(x, s_mem)
+        a_bat, s_bat = batched_dual_memory_read(
+            layer.attn_memory_bank, layer.state_memory_bank, x, a_mem, s_mem
+        )
+        self.assertLess((a_sep - a_bat).abs().max().item(), 1e-5)
+        self.assertLess((s_sep - s_bat).abs().max().item(), 1e-5)
+
+    def test_padding_flag_hoisted(self) -> None:
+        cfg = _small_hybrid_config(num_layers=3)
+        model = HybridForCausalLM(cfg).eval()
+        ids = torch.randint(0, cfg.vocab_size, (2, 12))
+        mask = torch.ones(2, 12, dtype=torch.long)
+        mask[0, -2:] = 0
+        with mock.patch(
+            "model._compute_batch_has_padding", wraps=_compute_batch_has_padding
+        ) as spy:
+            model(input_ids=ids, attention_mask=mask)
+            self.assertEqual(spy.call_count, 1)
+
+    def test_no_double_checkpoint_when_layer_ckpt_on(self) -> None:
+        from model import _hybrid_layer_forward
+
+        cfg = _small_hybrid_config(
+            gradient_checkpointing=True,
+            memory_chunk_size=None,
+            use_parallel_scan=False,
+            parallel_scan_fallback_max_len=8,
+            sequential_scan_min_len=64,
+        )
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 32))
+        labels = torch.randint(0, cfg.vocab_size, (1, 32))
+        with mock.patch(
+            "model.checkpoint", wraps=torch.utils.checkpoint.checkpoint
+        ) as spy:
+            out = model(input_ids=ids, labels=labels)
+            assert out.loss is not None
+            forward_calls = spy.call_args_list[: spy.call_count]
+        out.loss.backward()
+
+        layer_ckpts = [
+            c for c in forward_calls if c[0] and c[0][0] is _hybrid_layer_forward
+        ]
+        scan_ckpts = [
+            c for c in forward_calls if c[0] and c[0][0] is not _hybrid_layer_forward
+        ]
+        self.assertEqual(len(layer_ckpts), cfg.num_layers)
+        self.assertEqual(len(scan_ckpts), 0)
+
+    def test_torch_compile_forward_parity(self) -> None:
+        if not hasattr(torch, "compile"):
+            self.skipTest("torch.compile unavailable")
+        torch.manual_seed(0)
+        cfg = _small_hybrid_config(use_torch_compile=False, memory_chunk_size=None)
+        model = HybridForCausalLM(cfg).eval()
+        ids = torch.randint(0, cfg.vocab_size, (2, 16))
+        with torch.no_grad():
+            logits_ref = model(input_ids=ids).logits
+        compile_backend = "inductor" if torch.cuda.is_available() else "aot_eager"
+        try:
+            model.model.layers = torch.nn.ModuleList(
+                [
+                    torch.compile(
+                        layer,
+                        mode=cfg.torch_compile_mode,
+                        backend=compile_backend,
+                    )  # type: ignore[arg-type]
+                    for layer in model.model.layers
+                ]
+            )
+        except (RuntimeError, TypeError) as exc:
+            self.skipTest(f"torch.compile unavailable: {exc}")
+        try:
+            with torch.no_grad():
+                logits_cmp = model(input_ids=ids).logits
+        except (RuntimeError, TypeError, OSError) as exc:
+            self.skipTest(f"torch.compile unavailable: {exc}")
+        assert logits_ref is not None and logits_cmp is not None
+        self.assertLess((logits_ref - logits_cmp).abs().max().item(), 1e-3)
+
+    def test_grouped_gemm_moe_matches_loop(self) -> None:
+        from model import DroplessMoELayer, MOERouter
+
+        torch.manual_seed(5)
+        hidden, inter, experts, top_k = 64, 128, 4, 2
+        router = MOERouter(hidden, experts, top_k)
+        expert_list = torch.nn.ModuleList(
+            [SwiGLUExpert(hidden, inter) for _ in range(experts)]
+        )
+        x = torch.randn(3, 7, hidden)
+        gemm = DroplessMoELayer(
+            router,
+            expert_list,
+            capacity_factor=None,
+            use_grouped_moe_dispatch=False,
+            use_grouped_gemm=True,
+        )
+        loop = DroplessMoELayer(
+            router,
+            expert_list,
+            capacity_factor=None,
+            use_grouped_moe_dispatch=False,
+            use_grouped_gemm=False,
+        )
+        loop.load_state_dict(gemm.state_dict())
+        out_g, _, _, _ = gemm(x)
+        out_l, _, _, _ = loop(x)
+        self.assertLess((out_g - out_l).abs().max().item(), 1e-4)
+
+    def test_batched_dual_memory_write_matches_separate(self) -> None:
+        cfg = _small_hybrid_config(num_layers=1)
+        model = HybridForCausalLM(cfg).eval()
+        layer = model.model.layers[0]
+        h = cfg.hidden_size
+        buf_attn = torch.randn(2, 4, h)
+        buf_mamba = torch.randn(2, 4, h)
+        a_mem = layer.attn_memory_bank.init_state(2, buf_attn.device, buf_attn.dtype)
+        s_mem = layer.state_memory_bank.init_state(2, buf_mamba.device, buf_mamba.dtype)
+        exp_a, _, _ = layer.attn_memory_bank.write(buf_attn, a_mem)
+        exp_s, _, _ = layer.state_memory_bank.write(buf_mamba, s_mem)
+        new_a, _, _, new_s, _, _ = batched_dual_memory_write(
+            layer.attn_memory_bank,
+            layer.state_memory_bank,
+            buf_attn,
+            buf_mamba,
+            a_mem,
+            s_mem,
+        )
+        self.assertLess((exp_a - new_a).abs().max().item(), 1e-4)
+        self.assertLess((exp_s - new_s).abs().max().item(), 1e-4)
+
+    def test_decode_accumulate_fast_path_buffer_lens(self) -> None:
+        buf = MemoryWriteBuffer(1, 16, capacity=8)
+        t1 = torch.randn(1, 1, 16)
+        buf.append_single_token(t1, t1)
+        buf.append_single_token(t1, t1)
+        self.assertEqual(buf.filled, 2)
+        buf.append(torch.randn(1, 2, 16), torch.randn(1, 2, 16))
+        self.assertEqual(buf.filled, 4)
+
+        cfg = _small_hybrid_config(memory_write_interval=4, memory_chunk_size=4)
+        model = HybridForCausalLM(cfg).eval()
+        prompt = torch.randint(1, cfg.vocab_size, (1, 6))
+        decode_flags: list[bool] = []
+        orig_forward = model.forward
+
+        def spy_forward(*args, **kwargs):
+            decode_flags.append(kwargs.get("decode_accumulate_only", False))
+            return orig_forward(*args, **kwargs)
+
+        model.forward = spy_forward  # type: ignore[method-assign]
+        model.generate(prompt, max_new_tokens=4, do_sample=False)
+        self.assertIn(True, decode_flags)
+
+    def test_cuda_graph_decode_parity(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA required for CUDA graph decode test")
+        torch.manual_seed(9)
+        cfg = _small_hybrid_config(
+            memory_write_interval=8,
+            memory_chunk_size=8,
+            use_cuda_graph=True,
+        )
+        model = HybridForCausalLM(cfg).eval().cuda()
+        prompt = torch.randint(1, cfg.vocab_size, (1, 6), device="cuda")
+        eager_cfg = _small_hybrid_config(
+            memory_write_interval=8,
+            memory_chunk_size=8,
+            use_cuda_graph=False,
+        )
+        eager = HybridForCausalLM(eager_cfg).eval().cuda()
+        eager.load_state_dict(model.state_dict())
+        gen_graph = model.generate(prompt, max_new_tokens=4, do_sample=False)
+        gen_eager = eager.generate(prompt, max_new_tokens=4, do_sample=False)
+        self.assertTrue(torch.equal(gen_graph, gen_eager))
 
 
 if __name__ == "__main__":
