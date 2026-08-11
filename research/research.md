@@ -158,11 +158,14 @@ A full reference implementation exists in `model.py`:
 
 - ✅ `MixtralConfig` / `MixtralForCausalLM` — baseline (sliding-window GQA +
   Top-2 MoE), used as the control model for all comparisons below.
-- ✅ `MambaBlock` — selective SSM with a **checkpointed sequential associative
-  scan** for training (O(L) work, bounded activation memory; default) and an
-  optional Hillis-Steele parallel scan (`use_parallel_scan=True`) for short
-  sequences. Incremental `(conv_state, ssm_state)` step cache for decode. No
-  custom CUDA kernel dependency.
+- ✅ `MambaBlock` — selective SSM with **four-tier scan dispatch** when the fused
+  CUDA kernel is unavailable: (1) optional `mamba-ssm` fused selective_scan on
+  CUDA with unpadded batches; (2) Hillis-Steele parallel scan for
+  `L <= parallel_scan_fallback_max_len` (default 4096); (3) blocked
+  vectorized scan for longer sequences up to `sequential_scan_min_len`; (4)
+  checkpointed sequential scan for very long `L`. Explicit
+  `use_parallel_scan=True` forces tier-2. Incremental `(conv_state, ssm_state)`
+  step cache for decode.
 - ✅ `CompressiveMemoryBank` — lightweight einsum read/write memory. Banks are
   **read into** each branch and **written from raw branch outputs**, matching
   §3.2. Padding masks zero Mamba/MoE paths and mask memory writes.
@@ -175,6 +178,10 @@ A full reference implementation exists in `model.py`:
   batched every `memory_write_interval` tokens (defaults to `memory_chunk_size`).
 - ✅ `capacity_factor` defaults to `None` (fully dropless, batch-independent).
   Set only for memory-constrained hardware.
+- **Throughput note:** fused `mamba-ssm` is disabled whenever a batch contains
+  padding (variable-length rows). For best GPU throughput, bucket sequences by
+  length or use unpadded batches; `log_mamba_backend()` and
+  `probe_mamba_scan_timing()` report the active scan backend at startup.
 
 **Caching correctness:** `tests/test_model.py` checks incremental vs full-forward
 last-logit cosine similarity on a small config. Re-run before latency-sensitive
