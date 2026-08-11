@@ -2,7 +2,7 @@ import json
 
 
 input_file, output_file= "training_logs.jsonl" , "training_logs_every_100.jsonl"
-
+invalid = "./tmp" 
 with open(input_file, "r", encoding="utf-8") as infile, \
      open(output_file, "w", encoding="utf-8") as outfile:
 
