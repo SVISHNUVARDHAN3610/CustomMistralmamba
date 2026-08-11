@@ -165,6 +165,98 @@ def _weighted_terms(
     }
 
 
+def _scalar_finite_label(value: torch.Tensor | None) -> str:
+    """Human-readable scalar value with nan/inf markers for debug logs."""
+    if value is None:
+        return "none"
+    scalar = float(value.detach().float().item())
+    if math.isnan(scalar):
+        return "nan"
+    if math.isinf(scalar):
+        return "inf"
+    return f"{scalar:.8g}"
+
+
+def _non_finite_loss_diagnosis(
+    model: HybridForCausalLM,
+    out,
+    step: int,
+    max_steps: int,
+    attention_mask: torch.Tensor,
+) -> dict[str, object]:
+    """Identify which loss terms are non-finite and capture values for logging."""
+    cfg = model.config
+    aux = out.auxiliary_losses
+    weighted = _weighted_terms(model, out, step, max_steps)
+
+    router_aux_w: torch.Tensor | None = None
+    router_z_w: torch.Tensor | None = None
+    if out.router_aux_loss is not None:
+        router_aux_w = cfg.router_aux_loss_coef * out.router_aux_loss
+    if out.router_z_loss is not None:
+        router_z_w = cfg.router_z_loss_coef * out.router_z_loss
+
+    raw_terms: dict[str, torch.Tensor | None] = {
+        "loss": out.loss,
+        "ce_loss": out.ce_loss,
+        "router_aux": out.router_aux_loss,
+        "router_z": out.router_z_loss,
+        "router_aux_w": router_aux_w,
+        "router_z_w": router_z_w,
+    }
+    if aux is not None:
+        for name in ("recon", "assoc", "gate", "read", "fusion", "expert", "ssm", "slot"):
+            raw_terms[name] = getattr(aux, name)
+
+    non_finite_terms = [
+        name
+        for name, tensor in raw_terms.items()
+        if tensor is not None and not torch.isfinite(tensor).all().item()
+    ]
+
+    valid_lens = [int(x) for x in attention_mask.sum(dim=1).tolist()]
+    seq_len = int(attention_mask.size(1))
+
+    values = {name: _scalar_finite_label(tensor) for name, tensor in raw_terms.items()}
+    for key, val in weighted.items():
+        if key.endswith("_w"):
+            values[key] = f"{val:.8g}"
+
+    return {
+        "non_finite_terms": non_finite_terms,
+        "values": values,
+        "assoc_scale": weighted["assoc_scale"],
+        "expert_scale": weighted["expert_scale"],
+        "batch_valid_lens": valid_lens,
+        "seq_len": seq_len,
+        "has_padding": any(length < seq_len for length in valid_lens),
+    }
+
+
+def _format_non_finite_warning(step: int, diagnosis: dict[str, object]) -> str:
+    bad = diagnosis["non_finite_terms"]
+    values = diagnosis["values"]
+    valid_lens = diagnosis["batch_valid_lens"]
+    return (
+        f"WARNING: non-finite loss at step={step} "
+        f"non_finite_terms={bad} "
+        f"valid_lens={valid_lens} seq_len={diagnosis['seq_len']} "
+        f"has_padding={diagnosis['has_padding']} "
+        f"assoc_scale={diagnosis['assoc_scale']:.4f} "
+        f"expert_scale={diagnosis['expert_scale']:.4f} "
+        f"loss={values['loss']} ce={values['ce_loss']} "
+        f"router_aux={values['router_aux']} router_z={values['router_z']} "
+        f"router_aux_w={values['router_aux_w']} router_z_w={values['router_z_w']} "
+        f"recon={values['recon']} assoc={values['assoc']} gate={values['gate']} "
+        f"read={values['read']} fusion={values['fusion']} expert={values['expert']} "
+        f"ssm={values['ssm']} slot={values['slot']} "
+        f"recon_w={values['recon_w']} assoc_w={values['assoc_w']} "
+        f"gate_w={values['gate_w']} read_w={values['read_w']} "
+        f"fusion_w={values['fusion_w']} expert_w={values['expert_w']} "
+        f"ssm_w={values['ssm_w']} slot_w={values['slot_w']}"
+    )
+
+
 def _collate_batch(batch: list[dict], pad_token_id: int) -> dict[str, torch.Tensor]:
     max_len = max(item["input_ids"].size(0) for item in batch)
     input_ids = torch.full((len(batch), max_len), pad_token_id, dtype=torch.long)
@@ -432,6 +524,11 @@ def main() -> None:
         default="default",
         help="torch.compile mode (default, reduce-overhead, max-autotune)",
     )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Disable FP16 autocast + GradScaler (full-precision forward on CUDA)",
+    )
     args = parser.parse_args()
 
     if args.device == "cpu":
@@ -497,9 +594,11 @@ def main() -> None:
     n_params = count_trainable_params(model)
     print(f"trainable_params={n_params:,} (target ~150M) vocab_size={cfg.vocab_size}")
 
-    use_amp = device.type == "cuda"
+    use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:
         print("mixed_precision=fp16 torch.autocast(cuda) + GradScaler enabled")
+    elif device.type == "cuda" and args.no_amp:
+        print("mixed_precision=disabled (--no-amp, full precision on CUDA)")
     else:
         print("mixed_precision=disabled (CPU or non-CUDA device)")
     scaler = torch.amp.GradScaler("cuda") if use_amp else None
@@ -550,6 +649,27 @@ def main() -> None:
                     max_training_steps=total_steps,
                 )
             assert out.loss is not None
+            if not torch.isfinite(out.loss):
+                diagnosis = _non_finite_loss_diagnosis(
+                    model, out, global_step, total_steps, attention_mask
+                )
+                print(_format_non_finite_warning(global_step, diagnosis))
+                if log_path is not None:
+                    with log_path.open("a", encoding="utf-8") as f:
+                        f.write(
+                            json.dumps(
+                                {
+                                    "event": "non_finite_loss",
+                                    "step": global_step,
+                                    "epoch": epoch,
+                                    **diagnosis,
+                                }
+                            )
+                            + "\n"
+                        )
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                continue
             if scaler is not None:
                 scaler.scale(out.loss).backward()
                 scaler.unscale_(optimizer)

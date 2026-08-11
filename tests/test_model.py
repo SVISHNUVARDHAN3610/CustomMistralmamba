@@ -1099,7 +1099,133 @@ class TestHybridModel(unittest.TestCase):
         self.assertEqual(stats["fused_unpadded_batch"], 1)
         self.assertEqual(stats["pytorch_fallback"], 0)
 
-    def test_aux_loss_disabled_warns_with_dual_memory(self) -> None:
+    def test_fused_mamba_unpadded_backward_no_nan(self) -> None:
+        """Regression: in-place pad restore broke autograd → NaNs in training."""
+        if not fused_mamba_scan_available() or not torch.cuda.is_available():
+            self.skipTest("mamba-ssm fused selective_scan requires CUDA")
+
+        hidden_size = 64
+        block = (
+            MambaBlock(
+                hidden_size=hidden_size,
+                state_size=8,
+                expand=2,
+                use_fused_scan=True,
+            )
+            .cuda()
+            .train()
+        )
+        x = torch.randn(2, 16, hidden_size, device="cuda", requires_grad=True)
+        mask = torch.tensor(
+            [[1] * 12 + [0] * 4, [1] * 8 + [0] * 8],
+            dtype=torch.long,
+            device="cuda",
+        )
+        reset_mamba_scan_stats()
+        out, _, ssm_state = block(x, attention_mask=mask)
+        loss = out.pow(2).mean()
+        if ssm_state is not None:
+            loss = loss + ssm_state.pow(2).mean()
+        loss.backward()
+
+        self.assertFalse(torch.isnan(out).any().item())
+        self.assertIsNotNone(x.grad)
+        assert x.grad is not None
+        self.assertFalse(torch.isnan(x.grad).any().item())
+        self.assertGreater(x.grad.abs().sum().item(), 0.0)
+        for name, param in block.named_parameters():
+            if param.grad is not None:
+                self.assertFalse(
+                    torch.isnan(param.grad).any().item(),
+                    msg=f"NaN grad in {name}",
+                )
+        stats = get_mamba_scan_stats()
+        self.assertEqual(stats["fused_unpadded_batch"], 1)
+        self.assertEqual(stats["pytorch_fallback"], 0)
+
+    def test_unpadded_fused_restore_preserves_autograd(self) -> None:
+        """CPU: F.pad+stack restore keeps grad into per-row scan outputs."""
+
+        def fake_fused(u, dt, A, B, C, D, return_final_state=False):
+            y = u * 2.0 + dt.sum(dim=-1, keepdim=True)
+            st = None
+            if return_final_state:
+                # Match fused scan final state shape [B, d_inner, n].
+                st = B[:, -1, :].unsqueeze(1).expand(-1, u.size(-1), -1).contiguous()
+            return y, st
+
+        batch, seq_len, d_inner, n = 2, 8, 4, 3
+        u = torch.randn(batch, seq_len, d_inner, requires_grad=True)
+        dt = torch.randn(batch, seq_len, d_inner, requires_grad=True)
+        A = torch.randn(d_inner, n)
+        B = torch.randn(batch, seq_len, n, requires_grad=True)
+        C = torch.randn(batch, seq_len, n)
+        D = torch.ones(d_inner)
+        mask = torch.tensor(
+            [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]],
+            dtype=torch.long,
+        )
+        with mock.patch.object(MambaBlock, "_fused_selective_scan", side_effect=fake_fused):
+            y, st = MambaBlock._fused_selective_scan_unpadded(
+                u, dt, A, B, C, D, mask, return_final_state=True
+            )
+        self.assertEqual(tuple(y.shape), (batch, seq_len, d_inner))
+        self.assertTrue(torch.equal(y[0, 5:], torch.zeros(3, d_inner)))
+        self.assertTrue(torch.equal(y[1, 3:], torch.zeros(5, d_inner)))
+        loss = y.pow(2).mean() + st.pow(2).mean()
+        loss.backward()
+        self.assertIsNotNone(u.grad)
+        assert u.grad is not None
+        self.assertFalse(torch.isnan(u.grad).any().item())
+        # Gradients only on valid prefixes.
+        self.assertGreater(u.grad[0, :5].abs().sum().item(), 0.0)
+        self.assertEqual(u.grad[0, 5:].abs().sum().item(), 0.0)
+        self.assertGreater(u.grad[1, :3].abs().sum().item(), 0.0)
+        self.assertEqual(u.grad[1, 3:].abs().sum().item(), 0.0)
+
+    def test_hybrid_padded_train_step_no_nan(self) -> None:
+        """Full hybrid train step with padding must not NaN after one backward."""
+        if not fused_mamba_scan_available() or not torch.cuda.is_available():
+            self.skipTest("mamba-ssm fused selective_scan requires CUDA")
+
+        cfg = _small_hybrid_config(
+            num_layers=2,
+            use_fused_mamba_scan=True,
+            use_auxiliary_losses=True,
+            memory_chunk_size=8,
+            return_logits=False,
+            stream_chunked_ce_loss=True,
+        )
+        model = HybridForCausalLM(cfg).cuda().train()
+        ids = torch.randint(0, cfg.vocab_size, (2, 12), device="cuda")
+        mask = torch.tensor(
+            [[1] * 10 + [0] * 2, [1] * 7 + [0] * 5],
+            dtype=torch.long,
+            device="cuda",
+        )
+        labels = ids.clone()
+        labels = labels.masked_fill(mask == 0, cfg.label_ignore_index)
+        reset_mamba_scan_stats()
+        out = model(
+            input_ids=ids,
+            attention_mask=mask,
+            labels=labels,
+            training_step=5,
+            max_training_steps=100,
+        )
+        self.assertIsNotNone(out.loss)
+        assert out.loss is not None
+        self.assertFalse(torch.isnan(out.loss).item())
+        out.loss.backward()
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                self.assertFalse(
+                    torch.isnan(param.grad).any().item(),
+                    msg=f"NaN grad in {name}",
+                )
+        stats = get_mamba_scan_stats()
+        self.assertGreater(stats["fused_unpadded_batch"], 0)
+        self.assertEqual(stats["pytorch_fallback"], 0)
         cfg = _small_hybrid_config(use_auxiliary_losses=False)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -1359,6 +1485,62 @@ class TestHybridModel(unittest.TestCase):
         )
         self.assertLess((exp_a - new_a).abs().max().item(), 1e-4)
         self.assertLess((exp_s - new_s).abs().max().item(), 1e-4)
+
+    def test_batched_memory_summarize_all_masked_no_nan(self) -> None:
+        """All-padding write chunks must not NaN summary attention (chunked training)."""
+        from model import _batched_memory_summarize
+
+        cfg = _small_hybrid_config(num_layers=1)
+        model = HybridForCausalLM(cfg).eval()
+        layer = model.model.layers[0]
+        h = cfg.hidden_size
+        buf_attn = torch.randn(2, 8, h)
+        buf_mamba = torch.randn(2, 8, h)
+        kpm = torch.ones(2, 8, dtype=torch.bool)
+        a_sum, s_sum = _batched_memory_summarize(
+            layer.attn_memory_bank,
+            layer.state_memory_bank,
+            buf_attn,
+            buf_mamba,
+            kpm,
+            fast_path=False,
+        )
+        self.assertFalse(torch.isnan(a_sum).any())
+        self.assertFalse(torch.isnan(s_sum).any())
+        self.assertEqual(a_sum[0].abs().sum().item(), 0.0)
+        self.assertEqual(s_sum[0].abs().sum().item(), 0.0)
+
+    def test_chunked_train_short_row_second_chunk_no_nan(self) -> None:
+        """valid_len < chunk_size with seq_len > chunk_size must not NaN aux losses."""
+        cfg = _small_hybrid_config(
+            num_layers=2,
+            use_auxiliary_losses=True,
+            memory_chunk_size=16,
+            stream_chunked_ce_loss=True,
+            return_logits=False,
+            use_fused_mamba_scan=False,
+        )
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(1, cfg.vocab_size, (2, 32))
+        mask = torch.zeros(2, 32, dtype=torch.long)
+        mask[0, :] = 1
+        mask[1, :10] = 1
+        labels = ids.clone()
+        labels = labels.masked_fill(mask == 0, cfg.label_ignore_index)
+        out = model(
+            input_ids=ids,
+            attention_mask=mask,
+            labels=labels,
+            training_step=10,
+            max_training_steps=100,
+        )
+        self.assertIsNotNone(out.loss)
+        assert out.loss is not None
+        self.assertTrue(torch.isfinite(out.loss).item())
+        aux = out.auxiliary_losses
+        assert aux is not None
+        self.assertTrue(torch.isfinite(aux.recon).item())
+        self.assertTrue(torch.isfinite(aux.gate).item())
 
     def test_decode_accumulate_fast_path_buffer_lens(self) -> None:
         buf = MemoryWriteBuffer(1, 16, capacity=8)

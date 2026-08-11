@@ -41,6 +41,19 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 
+def _is_low_precision(dtype: torch.dtype) -> bool:
+    return dtype in (torch.float16, torch.bfloat16)
+
+
+def _promote_fp32(x: Tensor) -> Tensor:
+    """Promote activations to fp32 for numerically sensitive ops under AMP."""
+    return x.float() if _is_low_precision(x.dtype) else x
+
+
+def _restore_dtype(x: Tensor, dtype: torch.dtype) -> Tensor:
+    return x.to(dtype) if x.dtype != dtype else x
+
+
 @dataclass
 class MixtralConfig:
     vocab_size: int = 32000
@@ -596,9 +609,16 @@ class DroplessMoELayer(nn.Module):
                 expert_inputs, w_gate[expert_idx], w_up[expert_idx], w_down[expert_idx]
             )
             if expert_out is not None:
-                expert_out[row_indices, k_indices] = expert_outputs
+                # AMP: expert_outputs may be fp16 while expert_out is fp32.
+                expert_out[row_indices, k_indices] = expert_outputs.to(
+                    dtype=expert_out.dtype
+                )
             gating_scale = topk_weights[row_indices, k_indices].unsqueeze(-1)
-            moe_output.index_add_(0, row_indices, expert_outputs * gating_scale)
+            moe_output.index_add_(
+                0,
+                row_indices,
+                (expert_outputs * gating_scale).to(dtype=moe_output.dtype),
+            )
             applied_weights.index_add_(
                 0, row_indices, gating_scale.squeeze(-1).to(applied_weights.dtype)
             )
@@ -702,9 +722,15 @@ class DroplessMoELayer(nn.Module):
             )
 
         if expert_out is not None:
-            expert_out[sorted_token, sorted_k] = expert_outputs
+            expert_out[sorted_token, sorted_k] = expert_outputs.to(
+                dtype=expert_out.dtype
+            )
         gating_scale = topk_weights[sorted_token, sorted_k].unsqueeze(-1)
-        moe_output.index_add_(0, sorted_token, expert_outputs * gating_scale)
+        moe_output.index_add_(
+            0,
+            sorted_token,
+            (expert_outputs * gating_scale).to(dtype=moe_output.dtype),
+        )
         applied_weights.index_add_(
             0, sorted_token, gating_scale.squeeze(-1).to(applied_weights.dtype)
         )
@@ -757,10 +783,16 @@ class DroplessMoELayer(nn.Module):
             expert_inputs = x_flat[row_indices]
             expert_outputs = self.experts[expert_idx](expert_inputs)
             if expert_out is not None:
-                expert_out[row_indices, k_indices] = expert_outputs
+                expert_out[row_indices, k_indices] = expert_outputs.to(
+                    dtype=expert_out.dtype
+                )
 
             gating_scale = topk_weights[row_indices, k_indices].unsqueeze(-1)
-            moe_output.index_add_(0, row_indices, expert_outputs * gating_scale)
+            moe_output.index_add_(
+                0,
+                row_indices,
+                (expert_outputs * gating_scale).to(dtype=moe_output.dtype),
+            )
             applied_weights.index_add_(
                 0, row_indices, gating_scale.squeeze(-1).to(applied_weights.dtype)
             )
@@ -1168,8 +1200,10 @@ def _expert_loss_schedule(
 
 
 def write_gate_entropy_loss(gate: Tensor, eps: float = 1e-6) -> Tensor:
-    ent = -(gate * torch.log(gate + eps) + (1.0 - gate) * torch.log(1.0 - gate + eps))
-    return -ent.mean()
+    # FP16: clamp before log to avoid NaNs when gates saturate or drift slightly.
+    gate_f = _promote_fp32(gate).clamp(min=eps, max=1.0 - eps)
+    ent = -(gate_f * torch.log(gate_f) + (1.0 - gate_f) * torch.log(1.0 - gate_f))
+    return -ent.mean().to(dtype=gate.dtype)
 
 
 def combine_read_utilization_loss(
@@ -1196,6 +1230,10 @@ def memory_slot_diversity_loss(
     cross_alpha: float,
     eps: float = 1e-6,
 ) -> Tensor:
+    out_dtype = attn_mem.dtype
+    attn_f = _promote_fp32(attn_mem)
+    state_f = _promote_fp32(state_mem)
+
     def _intra(mem: Tensor) -> Tensor:
         mem_norm = mem / mem.norm(dim=-1, keepdim=True).clamp(min=eps)
         sim = torch.matmul(mem_norm, mem_norm.transpose(-1, -2))
@@ -1204,11 +1242,11 @@ def memory_slot_diversity_loss(
         excess = torch.relu(sim - margin) ** 2
         return excess.masked_select(mask.unsqueeze(0)).mean()
 
-    intra = _intra(attn_mem) + _intra(state_mem)
-    a_norm = attn_mem / attn_mem.norm(dim=-1, keepdim=True).clamp(min=eps)
-    s_norm = state_mem / state_mem.norm(dim=-1, keepdim=True).clamp(min=eps)
+    intra = _intra(attn_f) + _intra(state_f)
+    a_norm = attn_f / attn_f.norm(dim=-1, keepdim=True).clamp(min=eps)
+    s_norm = state_f / state_f.norm(dim=-1, keepdim=True).clamp(min=eps)
     cross = (a_norm * s_norm).sum(dim=-1).abs().mean()
-    return intra + cross_alpha * cross
+    return (intra + cross_alpha * cross).to(dtype=out_dtype)
 
 
 def ssm_state_norm_loss(ssm_state: Tensor, gamma: Tensor) -> Tensor:
@@ -1241,6 +1279,9 @@ class MemoryReconstructionDecoder(nn.Module):
         q = self._shape_heads(self.q_proj(x), q_len)
         k = self._shape_heads(self.k_proj(summary), k_len)
         v = self._shape_heads(self.v_proj(summary), k_len)
+        if _is_low_precision(x.dtype):
+            q = _promote_fp32(q)
+            k = _promote_fp32(k)
         scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, v)
@@ -2003,6 +2044,11 @@ class MambaBlock(nn.Module):
         Run fused selective_scan on each row's valid prefix (right-padded mask).
         Outputs are restored to [B, L, d_inner] with padding positions zeroed.
         Final SSM state per row comes from the last valid token (not pad columns).
+
+        Uses cat/pad + stack (not in-place slice assignment) so autograd keeps a
+        path from the fused scan outputs back into the Mamba branch. In-place
+        writes into a zero buffer break that path and can NaN training within
+        a few optimizer steps when dual-memory aux losses are active.
         """
         batch_size, seq_len, d_inner = u.shape
         state_size = B.size(-1)
@@ -2019,20 +2065,20 @@ class MambaBlock(nn.Module):
         token_mask = attention_mask[:, -seq_len:].bool()
         valid_lens = token_mask.sum(dim=1)
 
-        y = torch.zeros(batch_size, seq_len, d_inner, device=device, dtype=dtype)
-        ssm_state: Tensor | None = None
-        if return_final_state:
-            ssm_state = torch.zeros(
-                batch_size,
-                d_inner,
-                state_size,
-                device=device,
-                dtype=dtype,
-            )
-
+        y_rows: list[Tensor] = []
+        state_rows: list[Tensor] = []
         for b in range(batch_size):
             vl = int(valid_lens[b].item())
             if vl <= 0:
+                y_rows.append(
+                    torch.zeros(seq_len, d_inner, device=device, dtype=dtype)
+                )
+                if return_final_state:
+                    state_rows.append(
+                        torch.zeros(
+                            d_inner, state_size, device=device, dtype=dtype
+                        )
+                    )
                 continue
             y_b, st_b = cls._fused_selective_scan(
                 u[b : b + 1, :vl, :],
@@ -2043,10 +2089,26 @@ class MambaBlock(nn.Module):
                 D,
                 return_final_state=return_final_state,
             )
-            y[b, :vl] = y_b[0]
-            if return_final_state and st_b is not None and ssm_state is not None:
-                ssm_state[b] = st_b[0]
+            # Pad seq dim on the right; keeps gradient into y_b[:, :vl].
+            if vl < seq_len:
+                y_padded = F.pad(y_b, (0, 0, 0, seq_len - vl))
+            else:
+                y_padded = y_b
+            y_rows.append(y_padded[0])
+            if return_final_state:
+                if st_b is not None:
+                    state_rows.append(st_b[0])
+                else:
+                    state_rows.append(
+                        torch.zeros(
+                            d_inner, state_size, device=device, dtype=dtype
+                        )
+                    )
 
+        y = torch.stack(y_rows, dim=0)
+        ssm_state = (
+            torch.stack(state_rows, dim=0) if return_final_state else None
+        )
         return y, ssm_state
 
     @classmethod
@@ -2273,7 +2335,14 @@ class CompressiveMemoryBank(nn.Module):
                 scores = scores.masked_fill(
                     key_padding_mask.unsqueeze(1).unsqueeze(2), float("-inf")
                 )
+                all_masked = key_padding_mask.all(dim=-1)
+                if all_masked.any():
+                    scores = scores.clone()
+                    scores[all_masked] = 0.0
             attn = F.softmax(scores, dim=-1)
+            if key_padding_mask is not None and all_masked.any():
+                attn = attn.clone()
+                attn[all_masked] = 0.0
             out = torch.einsum("bhqk,bkhd->bqhd", attn, v)
             out = out.reshape(bsz, q_len, self.hidden_size)
             return self.out_proj(out)
@@ -2369,6 +2438,9 @@ def batched_dual_memory_read(
     k = k.view(2 * bsz, m_len, num_heads, head_dim)
     v = v.view(2 * bsz, m_len, num_heads, head_dim)
 
+    if _is_low_precision(q.dtype):
+        q = _promote_fp32(q)
+        k = _promote_fp32(k)
     scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * scale
     attn = F.softmax(scores, dim=-1)
     out = torch.einsum("bhqk,bkhd->bqhd", attn, v)
@@ -2416,11 +2488,23 @@ def _batched_memory_summarize(
     q = q.view(2 * bsz, m_len, num_heads, head_dim)
     k = k.view(2 * bsz, buf_len, num_heads, head_dim)
     v = v.view(2 * bsz, buf_len, num_heads, head_dim)
+    if _is_low_precision(q.dtype):
+        q = _promote_fp32(q)
+        k = _promote_fp32(k)
     scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * scale
+    all_masked: Tensor | None = None
     if key_padding_mask is not None:
         kpm = torch.cat([key_padding_mask, key_padding_mask], dim=0)
         scores = scores.masked_fill(kpm.unsqueeze(1).unsqueeze(2), float("-inf"))
+        all_masked = kpm.all(dim=-1)
+        if all_masked.any():
+            # Match CompressiveMemoryBank._attend: softmax over all -inf keys is NaN.
+            scores = scores.clone()
+            scores[all_masked] = 0.0
     attn = F.softmax(scores, dim=-1)
+    if all_masked is not None and all_masked.any():
+        attn = attn.clone()
+        attn[all_masked] = 0.0
     out = torch.einsum("bhqk,bkhd->bqhd", attn, v)
     out = out.reshape(2 * bsz, m_len, bank_a.hidden_size)
     out = torch.bmm(out, out_w[bank_idx].transpose(1, 2))
@@ -2472,11 +2556,23 @@ def batched_dual_memory_write(
     mem_stacked = torch.cat([mem_a, mem_b], dim=0)
     summary_stacked = torch.cat([a_summary, s_summary], dim=0)
     gate_in = torch.cat([mem_stacked, summary_stacked], dim=-1)
-    gate_logits = torch.bmm(gate_in, gate_w[bank_idx].transpose(1, 2)) + gate_b[
-        bank_idx
-    ].unsqueeze(1)
-    gate = torch.sigmoid(gate_logits)
-    updates = torch.bmm(summary_stacked, update_w[bank_idx].transpose(1, 2))
+    out_dtype = mem_stacked.dtype
+    if _is_low_precision(out_dtype):
+        gate_logits = torch.bmm(
+            _promote_fp32(gate_in),
+            gate_w.float()[bank_idx].transpose(1, 2),
+        ) + gate_b.float()[bank_idx].unsqueeze(1)
+        gate = torch.sigmoid(gate_logits).to(out_dtype)
+        updates = torch.bmm(
+            _promote_fp32(summary_stacked),
+            update_w.float()[bank_idx].transpose(1, 2),
+        ).to(out_dtype)
+    else:
+        gate_logits = torch.bmm(gate_in, gate_w[bank_idx].transpose(1, 2)) + gate_b[
+            bank_idx
+        ].unsqueeze(1)
+        gate = torch.sigmoid(gate_logits)
+        updates = torch.bmm(summary_stacked, update_w[bank_idx].transpose(1, 2))
     new_mem_stacked = gate * mem_stacked + (1.0 - gate) * updates
     new_a = new_mem_stacked[:bsz]
     new_s = new_mem_stacked[bsz:]
@@ -2488,6 +2584,14 @@ def batched_dual_memory_write(
             new_s = new_s.clone()
             new_a[all_masked_rows] = mem_a[all_masked_rows]
             new_s[all_masked_rows] = mem_b[all_masked_rows]
+            # Aux losses use summary/gate before memory restore; keep them finite.
+            a_summary = a_summary.clone()
+            s_summary = s_summary.clone()
+            a_summary[all_masked_rows] = 0.0
+            s_summary[all_masked_rows] = 0.0
+            gate = gate.clone()
+            gate[:bsz][all_masked_rows] = 0.5
+            gate[bsz:][all_masked_rows] = 0.5
 
     a_gate = gate[:bsz]
     s_gate = gate[bsz:]
@@ -2851,57 +2955,67 @@ class HybridDecoderLayer(nn.Module):
                 }
 
                 if self.training and self.use_auxiliary_losses:
-                    attn_recon_out = self.attn_memory_bank.recon_decoder(
-                        buf_attn_cat, a_summary
-                    )
-                    mamba_recon_out = self.state_memory_bank.recon_decoder(
-                        buf_mamba_cat, s_summary
-                    )
-                    # VRAM: compute per-token residuals before scalar MSE so
-                    # recon_decoder outputs can be released earlier in the graph.
-                    attn_recon_tok = (
-                        (buf_attn_cat - attn_recon_out).pow(2).mean(dim=-1).sqrt()
-                    )
-                    mamba_recon_tok = (
-                        (buf_mamba_cat - mamba_recon_out).pow(2).mean(dim=-1).sqrt()
-                    )
-                    attn_recon = F.mse_loss(attn_recon_out, buf_attn_cat)
-                    mamba_recon = F.mse_loss(mamba_recon_out, buf_mamba_cat)
-                    del attn_recon_out, mamba_recon_out
-                    attn_assoc = associative_retrieval_loss(
-                        self.attn_memory_bank,
-                        buf_attn_cat,
-                        new_a_mem,
-                        attn_recon_tok,
-                        cfg.assoc_sample_count,
-                        write_mask,
-                    )
-                    mamba_assoc = associative_retrieval_loss(
-                        self.state_memory_bank,
-                        buf_mamba_cat,
-                        new_s_mem,
-                        mamba_recon_tok,
-                        cfg.assoc_sample_count,
-                        write_mask,
-                    )
-                    gate_loss = write_gate_entropy_loss(
-                        a_write_gate, cfg.gate_entropy_eps
-                    ) + write_gate_entropy_loss(s_write_gate, cfg.gate_entropy_eps)
-                    slot_loss = memory_slot_diversity_loss(
-                        new_a_mem,
-                        new_s_mem,
-                        cfg.slot_similarity_margin,
-                        cfg.slot_cross_bank_alpha,
-                    )
+                    # FP16 AMP: recon/gate/slot paths need fp32 attention + logs.
+                    with torch.autocast(
+                        device_type=buf_attn_cat.device.type, enabled=False
+                    ):
+                        buf_a = _promote_fp32(buf_attn_cat)
+                        buf_m = _promote_fp32(buf_mamba_cat)
+                        sum_a = _promote_fp32(a_summary)
+                        sum_s = _promote_fp32(s_summary)
+                        attn_recon_out = self.attn_memory_bank.recon_decoder(
+                            buf_a, sum_a
+                        )
+                        mamba_recon_out = self.state_memory_bank.recon_decoder(
+                            buf_m, sum_s
+                        )
+                        attn_recon_tok = (
+                            (buf_a - attn_recon_out).pow(2).mean(dim=-1).sqrt()
+                        )
+                        mamba_recon_tok = (
+                            (buf_m - mamba_recon_out).pow(2).mean(dim=-1).sqrt()
+                        )
+                        attn_recon = F.mse_loss(attn_recon_out, buf_a)
+                        mamba_recon = F.mse_loss(mamba_recon_out, buf_m)
+                        del attn_recon_out, mamba_recon_out
+                        attn_assoc = associative_retrieval_loss(
+                            self.attn_memory_bank,
+                            buf_a,
+                            _promote_fp32(new_a_mem),
+                            attn_recon_tok,
+                            cfg.assoc_sample_count,
+                            write_mask,
+                        )
+                        mamba_assoc = associative_retrieval_loss(
+                            self.state_memory_bank,
+                            buf_m,
+                            _promote_fp32(new_s_mem),
+                            mamba_recon_tok,
+                            cfg.assoc_sample_count,
+                            write_mask,
+                        )
+                        gate_loss = write_gate_entropy_loss(
+                            a_write_gate, cfg.gate_entropy_eps
+                        ) + write_gate_entropy_loss(s_write_gate, cfg.gate_entropy_eps)
+                        slot_loss = memory_slot_diversity_loss(
+                            new_a_mem,
+                            new_s_mem,
+                            cfg.slot_similarity_margin,
+                            cfg.slot_cross_bank_alpha,
+                        )
                     layer_aux = HybridLayerAuxLosses(
-                        recon=(attn_recon + mamba_recon) / 2.0,
-                        assoc=(attn_assoc + mamba_assoc) / 2.0,
-                        gate=gate_loss / 2.0,
+                        recon=_restore_dtype(
+                            (attn_recon + mamba_recon) / 2.0, x.dtype
+                        ),
+                        assoc=_restore_dtype(
+                            (attn_assoc + mamba_assoc) / 2.0, x.dtype
+                        ),
+                        gate=_restore_dtype(gate_loss / 2.0, x.dtype),
                         read=layer_aux.read,
                         fusion=layer_aux.fusion,
                         expert=layer_aux.expert,
                         ssm=layer_aux.ssm,
-                        slot=slot_loss,
+                        slot=_restore_dtype(slot_loss, x.dtype),
                     )
 
         fused, fusion_gate = self.fusion(attn_out, mamba_out)
