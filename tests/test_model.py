@@ -26,6 +26,8 @@ from model import (
     build_test3_null_baseline_config,
     count_trainable_params,
     fused_mamba_scan_available,
+    get_mamba_scan_stats,
+    reset_mamba_scan_stats,
 )
 
 
@@ -1053,7 +1055,7 @@ class TestHybridModel(unittest.TestCase):
         self.assertLess((out_ref - out_fused).abs().max().item(), 1e-4)
         self.assertLess((st_ref - st_fused).abs().max().item(), 1e-4)
 
-    def test_fused_mamba_falls_back_with_padding_mask(self) -> None:
+    def test_fused_mamba_unpadded_with_padding_mask(self) -> None:
         if not fused_mamba_scan_available() or not torch.cuda.is_available():
             self.skipTest("mamba-ssm fused selective_scan requires CUDA")
 
@@ -1088,9 +1090,14 @@ class TestHybridModel(unittest.TestCase):
             ],
             dim=1,
         )
-        out_ref, _, _ = block_ref(x, attention_mask=mask)
-        out_fused, _, _ = block_fused(x, attention_mask=mask)
+        out_ref, _, st_ref = block_ref(x, attention_mask=mask)
+        reset_mamba_scan_stats()
+        out_fused, _, st_fused = block_fused(x, attention_mask=mask)
         self.assertLess((out_ref - out_fused).abs().max().item(), 1e-4)
+        self.assertLess((st_ref - st_fused).abs().max().item(), 1e-4)
+        stats = get_mamba_scan_stats()
+        self.assertEqual(stats["fused_unpadded_batch"], 1)
+        self.assertEqual(stats["pytorch_fallback"], 0)
 
     def test_aux_loss_disabled_warns_with_dual_memory(self) -> None:
         cfg = _small_hybrid_config(use_auxiliary_losses=False)

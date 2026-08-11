@@ -36,8 +36,10 @@ from model import (
     _expert_loss_schedule,
     count_trainable_params,
     fused_mamba_scan_available,
+    get_mamba_scan_stats,
     log_mamba_backend,
     probe_mamba_scan_timing,
+    reset_mamba_scan_stats,
 )
 
 
@@ -290,6 +292,7 @@ def evaluate_val_ce(
     ignore_index: int,
     training_step: int,
     max_training_steps: int,
+    use_amp: bool = False,
 ) -> float:
     """Token-weighted validation CE (eval mode, CE only)."""
     model.eval()
@@ -305,13 +308,16 @@ def evaluate_val_ce(
             labels=labels,
             ignore_index=ignore_index,
         )
-        out = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            training_step=training_step,
-            max_training_steps=max_training_steps,
-        )
+        with torch.autocast(
+            device_type="cuda", dtype=torch.float16, enabled=use_amp
+        ):
+            out = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                training_step=training_step,
+                max_training_steps=max_training_steps,
+            )
         assert out.ce_loss is not None
         active = int((labels != ignore_index).sum().item())
         if active == 0:
@@ -491,6 +497,13 @@ def main() -> None:
     n_params = count_trainable_params(model)
     print(f"trainable_params={n_params:,} (target ~150M) vocab_size={cfg.vocab_size}")
 
+    use_amp = device.type == "cuda"
+    if use_amp:
+        print("mixed_precision=fp16 torch.autocast(cuda) + GradScaler enabled")
+    else:
+        print("mixed_precision=disabled (CPU or non-CUDA device)")
+    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -506,6 +519,7 @@ def main() -> None:
     last_val_ce: float | None = None
     global_step = 0
     stop_training = False
+    reset_mamba_scan_stats()
 
     for epoch in range(args.epochs):
         if stop_training:
@@ -525,17 +539,27 @@ def main() -> None:
             )
 
             optimizer.zero_grad(set_to_none=True)
-            out = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                training_step=global_step,
-                max_training_steps=total_steps,
-            )
+            with torch.autocast(
+                device_type="cuda", dtype=torch.float16, enabled=use_amp
+            ):
+                out = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    training_step=global_step,
+                    max_training_steps=total_steps,
+                )
             assert out.loss is not None
-            out.loss.backward()
-            clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            if scaler is not None:
+                scaler.scale(out.loss).backward()
+                scaler.unscale_(optimizer)
+                clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                out.loss.backward()
+                clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
             scheduler.step()
 
             step_ce = float(out.ce_loss.item()) if out.ce_loss is not None else 0.0
@@ -554,6 +578,7 @@ def main() -> None:
                     cfg.label_ignore_index,
                     training_step=global_step,
                     max_training_steps=total_steps,
+                    use_amp=use_amp,
                 )
                 if last_val_ce < best_val_ce:
                     best_val_ce = last_val_ce
@@ -608,6 +633,12 @@ def main() -> None:
 
             if global_step % args.log_every == 0 or global_step == total_steps - 1:
                 print(_format_loss_line(global_step, total_steps, record))
+                scan_stats = get_mamba_scan_stats()
+                print(
+                    f"  mamba_scan_stats fused_full={scan_stats['fused_full_batch']} "
+                    f"fused_unpadded={scan_stats['fused_unpadded_batch']} "
+                    f"pytorch_fallback={scan_stats['pytorch_fallback']}"
+                )
                 for key, val in record["gate_stats"].items():
                     print(f"  gate_stats[{key}]={val:.8f}")
                 if last_val_ce is not None:
@@ -628,6 +659,7 @@ def main() -> None:
             cfg.label_ignore_index,
             training_step=global_step - 1,
             max_training_steps=total_steps,
+            use_amp=use_amp,
         )
         print(
             f"training_complete steps={global_step} "

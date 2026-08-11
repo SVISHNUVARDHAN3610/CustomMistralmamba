@@ -453,16 +453,19 @@ def expert_specialization_loss(
 ) -> Tensor:
     """Orthogonality + routing variance loss (Guo et al., NeurIPS 2025)."""
     top_k = expert_out.size(1)
-    cos_terms: list[Tensor] = []
+    # VRAM: accumulate pairwise cosines with a running sum instead of stacking
+    # all pair tensors (same mean, lower peak intermediate memory).
+    l_ortho = torch.tensor(0.0, device=expert_out.device, dtype=expert_out.dtype)
+    n_pairs = 0
     for i in range(top_k):
         for j in range(i + 1, top_k):
-            cos_terms.append(
-                F.cosine_similarity(expert_out[:, i], expert_out[:, j], dim=-1).abs()
-            )
-    if cos_terms:
-        l_ortho = torch.stack(cos_terms, dim=0).mean()
-    else:
-        l_ortho = torch.tensor(0.0, device=expert_out.device, dtype=expert_out.dtype)
+            l_ortho = l_ortho + F.cosine_similarity(
+                expert_out[:, i], expert_out[:, j], dim=-1
+            ).abs().mean()
+            n_pairs += 1
+    if n_pairs > 0:
+        l_ortho = l_ortho / n_pairs
+    # Routing variance uses router logits only — no expert_out retention needed.
     full_probs = F.softmax(logits, dim=-1)
     var_loss = -full_probs.var(dim=-1, unbiased=False).mean()
     return l_ortho + var_beta * var_loss
@@ -555,6 +558,8 @@ class DroplessMoELayer(nn.Module):
         )
         expert_out: Tensor | None = None
         if compute_expert_loss and self.training:
+            # VRAM: [num_tokens, top_k, H] only while expert specialization loss
+            # is computed; released when dispatch returns.
             expert_out = torch.zeros(
                 num_tokens,
                 top_k,
@@ -649,6 +654,8 @@ class DroplessMoELayer(nn.Module):
         )
         expert_out: Tensor | None = None
         if compute_expert_loss and self.training:
+            # VRAM: [num_tokens, top_k, H] only while expert specialization loss
+            # is computed; released when dispatch returns.
             expert_out = torch.zeros(
                 num_tokens,
                 top_k,
@@ -727,6 +734,8 @@ class DroplessMoELayer(nn.Module):
         )
         expert_out: Tensor | None = None
         if compute_expert_loss and self.training:
+            # VRAM: [num_tokens, top_k, H] only while expert specialization loss
+            # is computed; released when dispatch returns.
             expert_out = torch.zeros(
                 num_tokens,
                 top_k,
@@ -1459,6 +1468,22 @@ def _validate_hybrid_cache_states(
 _SELECTIVE_SCAN_FN: Callable[..., Tensor] | None = None
 _SELECTIVE_SCAN_PROBE_DONE = False
 _FUSED_SCAN_WARNED = False
+_MAMBA_SCAN_STATS: dict[str, int] = {
+    "fused_full_batch": 0,
+    "fused_unpadded_batch": 0,
+    "pytorch_fallback": 0,
+}
+
+
+def get_mamba_scan_stats() -> dict[str, int]:
+    """Training-time counters for which Mamba selective-scan backend was used."""
+    return dict(_MAMBA_SCAN_STATS)
+
+
+def reset_mamba_scan_stats() -> None:
+    """Reset Mamba scan backend counters (e.g. at the start of a training run)."""
+    for key in _MAMBA_SCAN_STATS:
+        _MAMBA_SCAN_STATS[key] = 0
 
 
 def fused_mamba_scan_available() -> bool:
@@ -1472,7 +1497,10 @@ def log_mamba_backend(config: HybridMambaMoEConfig | None = None) -> str:
     if config is None:
         config = HybridMambaMoEConfig()
     if fused and config.use_fused_mamba_scan:
-        msg = "Mamba backend: fused CUDA selective_scan (mamba-ssm)"
+        msg = (
+            "Mamba backend: fused CUDA selective_scan (mamba-ssm); "
+            "padded batches use per-row unpadded fused scan"
+        )
     elif config.use_parallel_scan:
         msg = "Mamba backend: Hillis-Steele parallel scan (explicit use_parallel_scan=True)"
     else:
@@ -1960,6 +1988,68 @@ class MambaBlock(nn.Module):
         return y_t.transpose(1, 2).to(input_dtype), None
 
     @classmethod
+    def _fused_selective_scan_unpadded(
+        cls,
+        u: Tensor,
+        dt: Tensor,
+        A: Tensor,
+        B: Tensor,
+        C: Tensor,
+        D: Tensor,
+        attention_mask: Tensor,
+        return_final_state: bool = False,
+    ) -> tuple[Tensor, Tensor | None]:
+        """
+        Run fused selective_scan on each row's valid prefix (right-padded mask).
+        Outputs are restored to [B, L, d_inner] with padding positions zeroed.
+        Final SSM state per row comes from the last valid token (not pad columns).
+        """
+        batch_size, seq_len, d_inner = u.shape
+        state_size = B.size(-1)
+        device = u.device
+        dtype = u.dtype
+
+        if attention_mask.dim() != 2:
+            raise ValueError("attention_mask must be 2D [B, L].")
+        if attention_mask.size(1) < seq_len:
+            raise ValueError(
+                f"attention_mask length {attention_mask.size(1)} < seq_len {seq_len}."
+            )
+
+        token_mask = attention_mask[:, -seq_len:].bool()
+        valid_lens = token_mask.sum(dim=1)
+
+        y = torch.zeros(batch_size, seq_len, d_inner, device=device, dtype=dtype)
+        ssm_state: Tensor | None = None
+        if return_final_state:
+            ssm_state = torch.zeros(
+                batch_size,
+                d_inner,
+                state_size,
+                device=device,
+                dtype=dtype,
+            )
+
+        for b in range(batch_size):
+            vl = int(valid_lens[b].item())
+            if vl <= 0:
+                continue
+            y_b, st_b = cls._fused_selective_scan(
+                u[b : b + 1, :vl, :],
+                dt[b : b + 1, :vl, :],
+                A,
+                B[b : b + 1, :vl, :],
+                C[b : b + 1, :vl, :],
+                D,
+                return_final_state=return_final_state,
+            )
+            y[b, :vl] = y_b[0]
+            if return_final_state and st_b is not None and ssm_state is not None:
+                ssm_state[b] = st_b[0]
+
+        return y, ssm_state
+
+    @classmethod
     def _selective_scan(
         cls,
         u: Tensor,
@@ -1993,15 +2083,16 @@ class MambaBlock(nn.Module):
             if batch_has_padding is not None
             else _attention_mask_has_padding(attention_mask, seq_len)
         )
+        fused_fn_available = _load_selective_scan_fn() is not None
         can_use_fused = (
             use_fused_scan
             and not use_parallel_scan
             and u.is_cuda
-            and not has_padding
-            and _load_selective_scan_fn() is not None
+            and fused_fn_available
         )
-        if can_use_fused:
+        if can_use_fused and not has_padding:
             try:
+                _MAMBA_SCAN_STATS["fused_full_batch"] += 1
                 return cls._fused_selective_scan(
                     u,
                     dt,
@@ -2019,7 +2110,29 @@ class MambaBlock(nn.Module):
                         stacklevel=2,
                     )
                     _FUSED_SCAN_WARNED = True
+        if can_use_fused and has_padding and attention_mask is not None:
+            try:
+                _MAMBA_SCAN_STATS["fused_unpadded_batch"] += 1
+                return cls._fused_selective_scan_unpadded(
+                    u,
+                    dt,
+                    A,
+                    B,
+                    C,
+                    D,
+                    attention_mask,
+                    return_final_state=return_final_state,
+                )
+            except (RuntimeError, ValueError, TypeError) as exc:
+                if not _FUSED_SCAN_WARNED:
+                    warnings.warn(
+                        f"mamba-ssm unpadded fused selective_scan failed "
+                        f"({type(exc).__name__}: {exc}); falling back to PyTorch scan.",
+                        stacklevel=2,
+                    )
+                    _FUSED_SCAN_WARNED = True
 
+        _MAMBA_SCAN_STATS["pytorch_fallback"] += 1
         input_dtype = u.dtype
         u_f = u.float()
         dt_f = dt.float()
@@ -2744,14 +2857,17 @@ class HybridDecoderLayer(nn.Module):
                     mamba_recon_out = self.state_memory_bank.recon_decoder(
                         buf_mamba_cat, s_summary
                     )
-                    attn_recon = F.mse_loss(attn_recon_out, buf_attn_cat)
-                    mamba_recon = F.mse_loss(mamba_recon_out, buf_mamba_cat)
+                    # VRAM: compute per-token residuals before scalar MSE so
+                    # recon_decoder outputs can be released earlier in the graph.
                     attn_recon_tok = (
                         (buf_attn_cat - attn_recon_out).pow(2).mean(dim=-1).sqrt()
                     )
                     mamba_recon_tok = (
                         (buf_mamba_cat - mamba_recon_out).pow(2).mean(dim=-1).sqrt()
                     )
+                    attn_recon = F.mse_loss(attn_recon_out, buf_attn_cat)
+                    mamba_recon = F.mse_loss(mamba_recon_out, buf_mamba_cat)
+                    del attn_recon_out, mamba_recon_out
                     attn_assoc = associative_retrieval_loss(
                         self.attn_memory_bank,
                         buf_attn_cat,
@@ -3354,6 +3470,70 @@ class HybridForCausalLM(nn.Module):
             )
         return labels
 
+    def _count_valid_label_tokens(
+        self, labels: Tensor, attention_mask: Tensor | None = None
+    ) -> int:
+        labels = self._apply_label_ignore(labels, attention_mask)
+        return int((labels != self.config.label_ignore_index).sum().item())
+
+    def _compute_ce_loss(
+        self,
+        hidden_states: Tensor,
+        labels: Tensor,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Token-weighted CE mean over non-ignored labels.
+
+        When batches contain padding, lm_head runs only on valid label positions
+        so peak activation memory is [N_valid, V] instead of [B*L, V].
+        """
+        labels = self._apply_label_ignore(labels, attention_mask)
+        ignore_index = self.config.label_ignore_index
+        valid = labels != ignore_index
+        if not valid.any():
+            return torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+        hidden_valid = hidden_states[valid]
+        logits_valid = self.lm_head(hidden_valid)
+        return F.cross_entropy(logits_valid, labels[valid], reduction="mean")
+
+    def _stream_chunk_ce_loss(
+        self,
+        hidden_states: Tensor,
+        labels: Tensor,
+        attention_mask: Tensor | None,
+        materialize_logits: bool,
+    ) -> tuple[Tensor | None, Tensor, int]:
+        """
+        Per-chunk CE without retaining full [B, L, V] logits unless requested.
+
+        Returns (optional_logits_chunk, ce_mean_over_valid, valid_token_count).
+        """
+        labels = self._apply_label_ignore(labels, attention_mask)
+        ignore_index = self.config.label_ignore_index
+        valid = labels != ignore_index
+        n_valid = int(valid.sum().item())
+        if n_valid == 0:
+            zero = torch.tensor(
+                0.0, device=hidden_states.device, dtype=hidden_states.dtype
+            )
+            return None, zero, 0
+
+        if materialize_logits:
+            chunk_logits = self.lm_head(hidden_states)
+            ce_loss = F.cross_entropy(
+                chunk_logits.view(-1, self.vocab_size),
+                labels.reshape(-1),
+                ignore_index=ignore_index,
+            )
+            return chunk_logits, ce_loss, n_valid
+
+        # VRAM: lm_head only on supervised tokens — avoids [B*L, V] peak logits.
+        hidden_valid = hidden_states[valid]
+        logits_valid = self.lm_head(hidden_valid)
+        ce_loss = F.cross_entropy(logits_valid, labels[valid], reduction="mean")
+        return None, ce_loss, n_valid
+
     def _weighted_auxiliary_loss(
         self,
         aux: HybridAuxiliaryLossBreakdown | None,
@@ -3437,15 +3617,24 @@ class HybridForCausalLM(nn.Module):
             max_training_steps=max_training_steps,
             decode_accumulate_only=decode_accumulate_only,
         )
-        logits = self.lm_head(hidden_states)
+        logits = self.lm_head(hidden_states) if self.config.return_logits else None
 
         loss = None
         ce_loss = None
         if labels is not None:
-            labels = self._apply_label_ignore(labels, attention_mask)
-            loss_fct = nn.CrossEntropyLoss(ignore_index=self.config.label_ignore_index)
-            assert logits is not None
-            ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
+            if self.config.return_logits:
+                labels = self._apply_label_ignore(labels, attention_mask)
+                loss_fct = nn.CrossEntropyLoss(
+                    ignore_index=self.config.label_ignore_index
+                )
+                assert logits is not None
+                ce_loss = loss_fct(
+                    logits.view(-1, self.vocab_size), labels.reshape(-1)
+                )
+            else:
+                ce_loss = self._compute_ce_loss(
+                    hidden_states, labels, attention_mask
+                )
             aux_total = self._weighted_auxiliary_loss(
                 auxiliary_losses,
                 device=hidden_states.device,
@@ -3483,7 +3672,12 @@ class HybridForCausalLM(nn.Module):
         training_step: int | None = None,
         max_training_steps: int | None = None,
     ) -> HybridTrainingOutput:
-        """BPTT through memory banks within one backward pass."""
+        """BPTT through memory banks within one backward pass.
+
+        VRAM: each chunk streams CE via _stream_chunk_ce_loss so peak logits are
+        [N_valid, V] (not [B, chunk, V]) when return_logits=False; chunk logits
+        are not concatenated unless return_logits=True.
+        """
         chunk_size = self.config.memory_chunk_size
         assert chunk_size is not None
         seq_len = input_ids.size(1)
@@ -3502,11 +3696,6 @@ class HybridForCausalLM(nn.Module):
         gate_stat_counts: dict[str, int] = {}
         token_weight = 0
         ce_loss_sum = torch.tensor(0.0, device=device)
-        loss_fct = (
-            nn.CrossEntropyLoss(ignore_index=self.config.label_ignore_index)
-            if labels is not None
-            else None
-        )
         aux_weighted = HybridLayerAuxLosses.zeros(
             device, self.model.embed_tokens.weight.dtype
         )
@@ -3546,20 +3735,27 @@ class HybridForCausalLM(nn.Module):
                 training_step=training_step,
                 max_training_steps=max_training_steps,
             )
-            chunk_logits = self.lm_head(hidden_states)
-            if materialize_logits:
-                logits_chunks.append(chunk_logits)
-            if labels is not None and loss_fct is not None:
+            chunk_logits: Tensor | None = None
+            if labels is not None:
                 chunk_labels = labels[:, start:end]
-                chunk_labels = self._apply_label_ignore(chunk_labels, chunk_mask)
-                chunk_ce = loss_fct(
-                    chunk_logits.view(-1, self.vocab_size), chunk_labels.reshape(-1)
+                chunk_logits, chunk_ce, n_valid = self._stream_chunk_ce_loss(
+                    hidden_states,
+                    chunk_labels,
+                    chunk_mask,
+                    materialize_logits,
                 )
-                ce_loss_sum = ce_loss_sum + chunk_ce * chunk_len
-            del chunk_logits
+                if n_valid > 0:
+                    ce_loss_sum = ce_loss_sum + chunk_ce * n_valid
+                    token_weight += n_valid
+                if materialize_logits and chunk_logits is not None:
+                    logits_chunks.append(chunk_logits)
+                del chunk_logits
+            elif materialize_logits:
+                chunk_logits = self.lm_head(hidden_states)
+                logits_chunks.append(chunk_logits)
+                del chunk_logits
             total_aux = total_aux + aux_loss * chunk_len
             total_z = total_z + z_loss * chunk_len
-            token_weight += chunk_len
             aux_weighted = HybridLayerAuxLosses(
                 recon=aux_weighted.recon + chunk_aux.recon * chunk_len,
                 assoc=aux_weighted.assoc + chunk_aux.assoc * chunk_len,
