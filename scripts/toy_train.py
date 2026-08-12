@@ -14,12 +14,11 @@ if str(_ROOT) not in sys.path:
 import torch
 from torch.nn.utils import clip_grad_norm_
 
-from model import (
-    HybridForCausalLM,
-    HybridMambaMoEConfig,
-    count_trainable_params,
-    log_mamba_backend,
-)
+from model.core.builders import count_trainable_params
+from model.core.config import HybridMambaMoEConfig
+from model.hybrid.losses import _aux_loss_schedule, _expert_loss_schedule
+from model.hybrid.mamba import log_mamba_backend
+from model.hybrid.model import HybridForCausalLM
 
 
 def build_toy_config() -> HybridMambaMoEConfig:
@@ -57,8 +56,6 @@ def _weighted_terms(
     cfg = model.config
     aux = out.auxiliary_losses
     assert aux is not None
-    from model import _aux_loss_schedule, _expert_loss_schedule
-
     assoc_scale = _aux_loss_schedule(step, max_steps, cfg.assoc_warmup_fraction)
     expert_scale = _expert_loss_schedule(step, max_steps, cfg.expert_warmup_fraction)
     return {

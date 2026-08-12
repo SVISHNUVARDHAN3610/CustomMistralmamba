@@ -1,4 +1,4 @@
-"""Unit tests for Hybrid Mamba–MoE model.py (laptop-safe ~10M param config)."""
+"""Unit tests for Hybrid Mamba–MoE model package (laptop-safe ~10M param config)."""
 
 from __future__ import annotations
 
@@ -11,24 +11,33 @@ import torch
 from model import (
     HybridForCausalLM,
     HybridMambaMoEConfig,
-    MambaBlock,
-    MemoryWriteBuffer,
     MixtralConfig,
     MixtralForCausalLM,
-    SwiGLUExpert,
-    _aux_loss_schedule,
-    _compute_batch_has_padding,
-    _expert_loss_schedule,
-    _write_buffer_token_len,
-    associative_retrieval_loss,
-    batched_dual_memory_read,
-    batched_dual_memory_write,
     build_test3_null_baseline_config,
     count_trainable_params,
+)
+from model.hybrid.layer import _hybrid_layer_forward
+from model.hybrid.losses import (
+    _aux_loss_schedule,
+    _expert_loss_schedule,
+    associative_retrieval_loss,
+)
+from model.hybrid.mamba import (
+    MambaBlock,
+    _compute_batch_has_padding,
     fused_mamba_scan_available,
     get_mamba_scan_stats,
     reset_mamba_scan_stats,
 )
+from model.hybrid.memory import (
+    CompressiveMemoryBank,
+    MemoryWriteBuffer,
+    _batched_memory_summarize,
+    _write_buffer_token_len,
+    batched_dual_memory_read,
+    batched_dual_memory_write,
+)
+from model.layers.moe import DroplessMoELayer, MOERouter, SwiGLUExpert
 
 
 def _small_hybrid_config(**overrides) -> HybridMambaMoEConfig:
@@ -755,8 +764,6 @@ class TestHybridModel(unittest.TestCase):
         self.assertEqual(weighted_assoc.item(), 0.0)
 
     def test_assoc_loss_uses_squared_l2_norm(self) -> None:
-        from model import CompressiveMemoryBank
-
         hidden = 64
         bank = CompressiveMemoryBank(hidden, memory_size=8, num_heads=4)
         x = torch.randn(1, 4, hidden)
@@ -776,8 +783,6 @@ class TestHybridModel(unittest.TestCase):
 
     def test_assoc_loss_padded_batch_no_oob(self) -> None:
         """Variable-length rows must not gather at sentinel index seq_len."""
-        from model import CompressiveMemoryBank
-
         hidden = 64
         bank = CompressiveMemoryBank(hidden, memory_size=8, num_heads=4)
         seq_len = 32
@@ -802,8 +807,6 @@ class TestHybridModel(unittest.TestCase):
     def test_assoc_loss_padded_batch_cuda(self) -> None:
         if not torch.cuda.is_available():
             self.skipTest("CUDA required")
-        from model import CompressiveMemoryBank
-
         hidden = 64
         bank = CompressiveMemoryBank(hidden, memory_size=8, num_heads=4).cuda()
         seq_len = 32
@@ -1284,9 +1287,9 @@ class TestHybridModel(unittest.TestCase):
     def test_fused_scan_failure_warns_once(self) -> None:
         if not torch.cuda.is_available():
             self.skipTest("CUDA required for fused scan failure test")
-        import model as model_mod
+        import model.hybrid.mamba as mamba_mod
 
-        model_mod._FUSED_SCAN_WARNED = False
+        mamba_mod._FUSED_SCAN_WARNED = False
         hidden_size = 64
         d_inner = hidden_size * 2
         u = torch.randn(1, 8, d_inner, device="cuda")
@@ -1312,7 +1315,7 @@ class TestHybridModel(unittest.TestCase):
             w for w in caught if "fused selective_scan failed" in str(w.message)
         ]
         self.assertEqual(len(fused_warnings), 1)
-        model_mod._FUSED_SCAN_WARNED = False
+        mamba_mod._FUSED_SCAN_WARNED = False
 
     def test_write_buffer_append_linear_cost(self) -> None:
         buf = MemoryWriteBuffer(2, 16, capacity=4)
@@ -1329,8 +1332,6 @@ class TestHybridModel(unittest.TestCase):
         self.assertTrue(out_mask.all())
 
     def test_grouped_moe_matches_loop_dispatch(self) -> None:
-        from model import DroplessMoELayer, MOERouter
-
         torch.manual_seed(3)
         hidden, inter, experts, top_k = 64, 128, 4, 2
         router = MOERouter(hidden, experts, top_k)
@@ -1373,14 +1374,13 @@ class TestHybridModel(unittest.TestCase):
         mask = torch.ones(2, 12, dtype=torch.long)
         mask[0, -2:] = 0
         with mock.patch(
-            "model._compute_batch_has_padding", wraps=_compute_batch_has_padding
+            "model.hybrid.model._compute_batch_has_padding",
+            wraps=_compute_batch_has_padding,
         ) as spy:
             model(input_ids=ids, attention_mask=mask)
             self.assertEqual(spy.call_count, 1)
 
     def test_no_double_checkpoint_when_layer_ckpt_on(self) -> None:
-        from model import _hybrid_layer_forward
-
         cfg = _small_hybrid_config(
             gradient_checkpointing=True,
             memory_chunk_size=None,
@@ -1392,7 +1392,8 @@ class TestHybridModel(unittest.TestCase):
         ids = torch.randint(0, cfg.vocab_size, (1, 32))
         labels = torch.randint(0, cfg.vocab_size, (1, 32))
         with mock.patch(
-            "model.checkpoint", wraps=torch.utils.checkpoint.checkpoint
+            "model.hybrid.model.checkpoint",
+            wraps=torch.utils.checkpoint.checkpoint,
         ) as spy:
             out = model(input_ids=ids, labels=labels)
             assert out.loss is not None
@@ -1440,8 +1441,6 @@ class TestHybridModel(unittest.TestCase):
         self.assertLess((logits_ref - logits_cmp).abs().max().item(), 1e-3)
 
     def test_grouped_gemm_moe_matches_loop(self) -> None:
-        from model import DroplessMoELayer, MOERouter
-
         torch.manual_seed(5)
         hidden, inter, experts, top_k = 64, 128, 4, 2
         router = MOERouter(hidden, experts, top_k)
@@ -1492,8 +1491,6 @@ class TestHybridModel(unittest.TestCase):
 
     def test_batched_memory_summarize_all_masked_no_nan(self) -> None:
         """All-padding write chunks must not NaN summary attention (chunked training)."""
-        from model import _batched_memory_summarize
-
         cfg = _small_hybrid_config(num_layers=1)
         model = HybridForCausalLM(cfg).eval()
         layer = model.model.layers[0]
