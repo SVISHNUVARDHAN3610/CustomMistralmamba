@@ -40,6 +40,10 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
+# Bumped when memory-path NaN guards change. Logged by cloud train script so
+# Kaggle runs can prove they imported this revision (not a stale notebook copy).
+MEMORY_NAN_FIX_ID = "all_masked_softmax+write_buffer_mask+masked_recon_gate-v2"
+
 
 def _is_low_precision(dtype: torch.dtype) -> bool:
     return dtype in (torch.float16, torch.bfloat16)
@@ -1199,11 +1203,43 @@ def _expert_loss_schedule(
     return 1.0 if step >= start else 0.0
 
 
-def write_gate_entropy_loss(gate: Tensor, eps: float = 1e-6) -> Tensor:
+def write_gate_entropy_loss(
+    gate: Tensor,
+    eps: float = 1e-6,
+    row_mask: Tensor | None = None,
+) -> Tensor:
+    """Negative binary entropy of write gates (encourage non-saturated gates).
+
+    ``gate`` is typically ``[B, memory_size, H]``. When ``row_mask`` is provided
+    (``[B]`` bool, True = include), rows with no valid write tokens are skipped
+    so all-padding chunks contribute a finite zero instead of poisoning the mean.
+    """
     # FP16: clamp before log to avoid NaNs when gates saturate or drift slightly.
     gate_f = _promote_fp32(gate).clamp(min=eps, max=1.0 - eps)
     ent = -(gate_f * torch.log(gate_f) + (1.0 - gate_f) * torch.log(1.0 - gate_f))
-    return -ent.mean().to(dtype=gate.dtype)
+    per_row = ent.reshape(ent.size(0), -1).mean(dim=-1)
+    if row_mask is not None:
+        valid = row_mask.bool()
+        if not valid.any():
+            return torch.zeros((), device=gate.device, dtype=gate.dtype)
+        return (-per_row[valid].mean()).to(dtype=gate.dtype)
+    return (-per_row.mean()).to(dtype=gate.dtype)
+
+
+def masked_token_mse(
+    pred: Tensor,
+    target: Tensor,
+    valid_mask: Tensor | None,
+) -> Tensor:
+    """Mean squared error over valid token positions only (pad-safe)."""
+    if valid_mask is None:
+        return F.mse_loss(pred, target)
+    valid = valid_mask.bool()
+    if not valid.any():
+        return torch.zeros((), device=target.device, dtype=target.dtype)
+    # [B, L] reduction over hidden, then mean over valid tokens.
+    per_tok = (pred - target).pow(2).mean(dim=-1)
+    return per_tok[valid].mean()
 
 
 def combine_read_utilization_loss(
@@ -1382,10 +1418,14 @@ def _assert_right_padded_attention_mask(
 
 def _materialize_write_buffer(
     write_buffer: "MemoryWriteBuffer | None",
-) -> tuple[Tensor | None, Tensor | None]:
-    """Materialize pre-allocated write buffer into tensors for memory write."""
+) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+    """Materialize pre-allocated write buffer into tensors for memory write.
+
+    Returns ``(attn, mamba, valid_mask)`` where ``valid_mask`` is ``[B, L]``
+    bool (True = real token). Empty buffers return ``(None, None, None)``.
+    """
     if write_buffer is None or write_buffer.filled == 0:
-        return None, None
+        return None, None, None
     return write_buffer.materialize()
 
 
@@ -1398,7 +1438,12 @@ def _write_buffer_token_len(
 
 
 class MemoryWriteBuffer:
-    """Pre-allocated buffer for chunked memory writes (amortized O(k) append)."""
+    """Pre-allocated buffer for chunked memory writes (amortized O(k) append).
+
+    Stores a per-token validity mask with the branch outputs so write/aux
+    paths never reconstruct prior pads as ``torch.ones`` (which incorrectly
+    treats padding as valid when buffers span multiple appends).
+    """
 
     __slots__ = (
         "attn_buf",
@@ -1407,6 +1452,7 @@ class MemoryWriteBuffer:
         "filled",
         "hidden_size",
         "mamba_buf",
+        "mask_buf",
     )
 
     def __init__(
@@ -1421,6 +1467,7 @@ class MemoryWriteBuffer:
         self.filled = 0
         self.attn_buf: Tensor | None = None
         self.mamba_buf: Tensor | None = None
+        self.mask_buf: Tensor | None = None
 
     def _ensure_capacity(
         self, add_tokens: int, device: torch.device, dtype: torch.dtype
@@ -1434,43 +1481,114 @@ class MemoryWriteBuffer:
             self.mamba_buf = torch.zeros(
                 self.batch_size, cap, self.hidden_size, device=device, dtype=dtype
             )
+            self.mask_buf = torch.zeros(
+                self.batch_size, cap, device=device, dtype=torch.bool
+            )
             self.capacity = cap
             return
         if needed > self.capacity:
             new_cap = max(self.capacity * 2, needed)
-            assert self.mamba_buf is not None
+            assert self.mamba_buf is not None and self.mask_buf is not None
             new_attn = torch.zeros(
                 self.batch_size, new_cap, self.hidden_size, device=device, dtype=dtype
             )
             new_mamba = torch.zeros(
                 self.batch_size, new_cap, self.hidden_size, device=device, dtype=dtype
             )
+            new_mask = torch.zeros(
+                self.batch_size, new_cap, device=device, dtype=torch.bool
+            )
             new_attn[:, : self.filled] = self.attn_buf[:, : self.filled]
             new_mamba[:, : self.filled] = self.mamba_buf[:, : self.filled]
+            new_mask[:, : self.filled] = self.mask_buf[:, : self.filled]
             self.attn_buf = new_attn
             self.mamba_buf = new_mamba
+            self.mask_buf = new_mask
             self.capacity = new_cap
 
-    def append(self, attn: Tensor, mamba: Tensor) -> None:
+    @staticmethod
+    def _normalize_valid_mask(
+        valid_mask: Tensor | None,
+        batch_size: int,
+        add: int,
+        device: torch.device,
+    ) -> Tensor:
+        if valid_mask is None:
+            return torch.ones(batch_size, add, device=device, dtype=torch.bool)
+        mask = valid_mask.bool()
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(-1)
+        if mask.dim() != 2 or mask.size(0) != batch_size or mask.size(1) != add:
+            raise ValueError(
+                f"valid_mask must be [B, add]=[{batch_size}, {add}], got {tuple(mask.shape)}."
+            )
+        return mask
+
+    def append(
+        self,
+        attn: Tensor,
+        mamba: Tensor,
+        valid_mask: Tensor | None = None,
+    ) -> None:
         add = attn.size(1)
         self._ensure_capacity(add, attn.device, attn.dtype)
-        assert self.attn_buf is not None and self.mamba_buf is not None
-        self.attn_buf[:, self.filled : self.filled + add] = attn
-        self.mamba_buf[:, self.filled : self.filled + add] = mamba
+        assert (
+            self.attn_buf is not None
+            and self.mamba_buf is not None
+            and self.mask_buf is not None
+        )
+        mask = self._normalize_valid_mask(
+            valid_mask, self.batch_size, add, attn.device
+        )
+        # Keep pad slots zero so a wrong write_mask cannot attend to junk.
+        keep = mask.unsqueeze(-1)
+        self.attn_buf[:, self.filled : self.filled + add] = torch.where(
+            keep, attn, torch.zeros_like(attn)
+        )
+        self.mamba_buf[:, self.filled : self.filled + add] = torch.where(
+            keep, mamba, torch.zeros_like(mamba)
+        )
+        self.mask_buf[:, self.filled : self.filled + add] = mask
         self.filled += add
 
-    def append_single_token(self, attn: Tensor, mamba: Tensor) -> None:
+    def append_single_token(
+        self,
+        attn: Tensor,
+        mamba: Tensor,
+        valid_mask: Tensor | None = None,
+    ) -> None:
         """Fast path for decode: append one token without realloc after warm-up."""
         if self.attn_buf is None or self.filled >= self.capacity:
             self._ensure_capacity(1, attn.device, attn.dtype)
-        assert self.attn_buf is not None and self.mamba_buf is not None
-        self.attn_buf[:, self.filled : self.filled + 1] = attn
-        self.mamba_buf[:, self.filled : self.filled + 1] = mamba
+        assert (
+            self.attn_buf is not None
+            and self.mamba_buf is not None
+            and self.mask_buf is not None
+        )
+        mask = self._normalize_valid_mask(
+            valid_mask, self.batch_size, 1, attn.device
+        )
+        keep = mask.unsqueeze(-1)
+        self.attn_buf[:, self.filled : self.filled + 1] = torch.where(
+            keep, attn, torch.zeros_like(attn)
+        )
+        self.mamba_buf[:, self.filled : self.filled + 1] = torch.where(
+            keep, mamba, torch.zeros_like(mamba)
+        )
+        self.mask_buf[:, self.filled : self.filled + 1] = mask
         self.filled += 1
 
-    def materialize(self) -> tuple[Tensor, Tensor]:
-        assert self.attn_buf is not None and self.mamba_buf is not None
-        return self.attn_buf[:, : self.filled], self.mamba_buf[:, : self.filled]
+    def materialize(self) -> tuple[Tensor, Tensor, Tensor]:
+        assert (
+            self.attn_buf is not None
+            and self.mamba_buf is not None
+            and self.mask_buf is not None
+        )
+        return (
+            self.attn_buf[:, : self.filled],
+            self.mamba_buf[:, : self.filled],
+            self.mask_buf[:, : self.filled],
+        )
 
     def token_len(self) -> int:
         return self.filled
@@ -2589,9 +2707,13 @@ def batched_dual_memory_write(
             s_summary = s_summary.clone()
             a_summary[all_masked_rows] = 0.0
             s_summary[all_masked_rows] = 0.0
-            gate = gate.clone()
-            gate[:bsz][all_masked_rows] = 0.5
-            gate[bsz:][all_masked_rows] = 0.5
+            # Avoid `gate[:bsz][mask] = ...` (advanced-index on a slice may not
+            # write back into `gate`). Sanitize halves explicitly.
+            a_gate = gate[:bsz].clone()
+            s_gate = gate[bsz:].clone()
+            a_gate[all_masked_rows] = 0.5
+            s_gate[all_masked_rows] = 0.5
+            return new_a, a_gate, a_summary, new_s, s_gate, s_summary
 
     a_gate = gate[:bsz]
     s_gate = gate[bsz:]
@@ -2892,37 +3014,33 @@ class HybridDecoderLayer(nn.Module):
                 new_buf = write_buffer
 
             if decode_accumulate_only and seq_len == 1:
-                new_buf.append_single_token(buf_attn, buf_mamba)
+                new_buf.append_single_token(
+                    buf_attn, buf_mamba, token_attention_mask
+                )
             else:
-                new_buf.append(buf_attn, buf_mamba)
+                new_buf.append(buf_attn, buf_mamba, token_attention_mask)
 
             if skip_memory_write:
                 new_memory_state = memory_state
                 new_write_buffer = new_buf
             else:
-                buf_attn_cat, buf_mamba_cat = new_buf.materialize()
-                # Build mask for buffered tokens: prior buffer assumed valid,
-                # current tokens use token_attention_mask when present.
-                buf_len = buf_attn_cat.size(1)
-                cur_len = attn_out.size(1)
-                if token_attention_mask is not None:
-                    if buf_len > cur_len:
-                        prior = torch.ones(
-                            token_attention_mask.size(0),
-                            buf_len - cur_len,
-                            device=token_attention_mask.device,
-                            dtype=token_attention_mask.dtype,
+                buf_attn_cat, buf_mamba_cat, buf_valid = new_buf.materialize()
+                # Exact accumulated validity (never reconstruct prior pads as ones).
+                write_mask: Tensor | None = None
+                if buf_valid is not None:
+                    write_mask = buf_valid.to(
+                        dtype=(
+                            token_attention_mask.dtype
+                            if token_attention_mask is not None
+                            else torch.long
                         )
-                        write_mask = torch.cat([prior, token_attention_mask], dim=1)
-                    else:
-                        write_mask = token_attention_mask
-                else:
-                    write_mask = None
+                    )
                 if active_batch_mask is not None and write_mask is not None:
                     write_mask = write_mask * active_batch_mask.unsqueeze(-1).to(
                         dtype=write_mask.dtype
                     )
 
+                buf_len = buf_attn_cat.size(1)
                 write_fast = buf_len <= cfg.decode_write_fast_threshold
                 (
                     new_a_mem,
@@ -2963,6 +3081,14 @@ class HybridDecoderLayer(nn.Module):
                         buf_m = _promote_fp32(buf_mamba_cat)
                         sum_a = _promote_fp32(a_summary)
                         sum_s = _promote_fp32(s_summary)
+                        write_valid = (
+                            write_mask.bool() if write_mask is not None else None
+                        )
+                        row_has_valid = (
+                            write_valid.any(dim=-1)
+                            if write_valid is not None
+                            else None
+                        )
                         attn_recon_out = self.attn_memory_bank.recon_decoder(
                             buf_a, sum_a
                         )
@@ -2975,8 +3101,12 @@ class HybridDecoderLayer(nn.Module):
                         mamba_recon_tok = (
                             (buf_m - mamba_recon_out).pow(2).mean(dim=-1).sqrt()
                         )
-                        attn_recon = F.mse_loss(attn_recon_out, buf_a)
-                        mamba_recon = F.mse_loss(mamba_recon_out, buf_m)
+                        attn_recon = masked_token_mse(
+                            attn_recon_out, buf_a, write_valid
+                        )
+                        mamba_recon = masked_token_mse(
+                            mamba_recon_out, buf_m, write_valid
+                        )
                         del attn_recon_out, mamba_recon_out
                         attn_assoc = associative_retrieval_loss(
                             self.attn_memory_bank,
@@ -2995,8 +3125,14 @@ class HybridDecoderLayer(nn.Module):
                             write_mask,
                         )
                         gate_loss = write_gate_entropy_loss(
-                            a_write_gate, cfg.gate_entropy_eps
-                        ) + write_gate_entropy_loss(s_write_gate, cfg.gate_entropy_eps)
+                            a_write_gate,
+                            cfg.gate_entropy_eps,
+                            row_mask=row_has_valid,
+                        ) + write_gate_entropy_loss(
+                            s_write_gate,
+                            cfg.gate_entropy_eps,
+                            row_mask=row_has_valid,
+                        )
                         slot_loss = memory_slot_diversity_loss(
                             new_a_mem,
                             new_s_mem,
@@ -3960,8 +4096,11 @@ class HybridForCausalLM(nn.Module):
                 new_states.append(mem)
                 continue
             a_mem, s_mem = mem
-            buf_attn, buf_mamba = _materialize_write_buffer(buf)
+            buf_attn, buf_mamba, buf_mask = _materialize_write_buffer(buf)
             assert buf_attn is not None and buf_mamba is not None
+            write_mask = (
+                buf_mask.to(dtype=torch.long) if buf_mask is not None else None
+            )
             new_a, _, _, new_s, _, _ = batched_dual_memory_write(
                 layer.attn_memory_bank,
                 layer.state_memory_bank,
@@ -3969,6 +4108,7 @@ class HybridForCausalLM(nn.Module):
                 buf_mamba,
                 a_mem,
                 s_mem,
+                attention_mask=write_mask,
             )
             new_states.append((new_a, new_s))
         return new_states, None

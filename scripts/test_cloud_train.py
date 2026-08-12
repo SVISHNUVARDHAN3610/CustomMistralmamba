@@ -593,6 +593,12 @@ def main() -> None:
     model = HybridForCausalLM(cfg).to(device)
     n_params = count_trainable_params(model)
     print(f"trainable_params={n_params:,} (target ~150M) vocab_size={cfg.vocab_size}")
+    import model as _model_mod
+
+    print(
+        f"model_source={_model_mod.__file__} "
+        f"memory_nan_fix={getattr(_model_mod, 'MEMORY_NAN_FIX_ID', 'missing')}"
+    )
 
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:

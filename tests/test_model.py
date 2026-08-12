@@ -1321,8 +1321,10 @@ class TestHybridModel(unittest.TestCase):
         self.assertIsNotNone(buf.attn_buf)
         assert buf.attn_buf is not None
         self.assertGreaterEqual(buf.attn_buf.size(1), 3)
-        out_a, _out_m = buf.materialize()
+        out_a, _out_m, out_mask = buf.materialize()
         self.assertEqual(out_a.size(1), 3)
+        self.assertEqual(out_mask.dtype, torch.bool)
+        self.assertTrue(out_mask.all())
 
     def test_grouped_moe_matches_loop_dispatch(self) -> None:
         from model import DroplessMoELayer, MOERouter
@@ -1541,6 +1543,62 @@ class TestHybridModel(unittest.TestCase):
         assert aux is not None
         self.assertTrue(torch.isfinite(aux.recon).item())
         self.assertTrue(torch.isfinite(aux.gate).item())
+
+    def test_write_buffer_preserves_validity_mask(self) -> None:
+        """Prior pads must stay invalid across appends (no torch.ones reconstruction)."""
+        buf = MemoryWriteBuffer(2, 8, capacity=4)
+        a0 = torch.randn(2, 3, 8)
+        m0 = torch.randn(2, 3, 8)
+        mask0 = torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.bool)
+        buf.append(a0, m0, mask0)
+        a1 = torch.randn(2, 2, 8)
+        m1 = torch.randn(2, 2, 8)
+        mask1 = torch.tensor([[0, 0], [1, 1]], dtype=torch.bool)
+        buf.append(a1, m1, mask1)
+        attn, mamba, valid = buf.materialize()
+        self.assertEqual(tuple(valid.shape), (2, 5))
+        self.assertEqual(valid[0].tolist(), [True, True, False, False, False])
+        self.assertEqual(valid[1].tolist(), [True, False, False, True, True])
+        # Padded slots stored as zeros.
+        self.assertEqual(attn[0, 2].abs().sum().item(), 0.0)
+        self.assertEqual(mamba[1, 1].abs().sum().item(), 0.0)
+
+    def test_cloud_style_padded_second_chunk_no_nan(self) -> None:
+        """Exact Kaggle trigger: seq=512-like split with one row shorter than chunk."""
+        cfg = _small_hybrid_config(
+            num_layers=2,
+            use_auxiliary_losses=True,
+            memory_chunk_size=16,
+            stream_chunked_ce_loss=True,
+            return_logits=False,
+            use_fused_mamba_scan=False,
+        )
+        model = HybridForCausalLM(cfg).train()
+        # Analogous to valid_lens=[512,195] with chunk=256 → second chunk all-pad.
+        ids = torch.randint(1, cfg.vocab_size, (2, 32))
+        mask = torch.zeros(2, 32, dtype=torch.long)
+        mask[0, :] = 1
+        mask[1, :12] = 1  # < 16 so chunk [16:32] is all pad for row 1
+        labels = ids.clone().masked_fill(mask == 0, cfg.label_ignore_index)
+        for step in range(3):
+            out = model(
+                input_ids=ids,
+                attention_mask=mask,
+                labels=labels,
+                training_step=step,
+                max_training_steps=100,
+            )
+            assert out.loss is not None
+            self.assertTrue(
+                torch.isfinite(out.loss).item(),
+                msg=f"non-finite loss at step={step}",
+            )
+            aux = out.auxiliary_losses
+            assert aux is not None
+            self.assertTrue(torch.isfinite(aux.recon).item())
+            self.assertTrue(torch.isfinite(aux.gate).item())
+            out.loss.backward()
+            model.zero_grad(set_to_none=True)
 
     def test_decode_accumulate_fast_path_buffer_lens(self) -> None:
         buf = MemoryWriteBuffer(1, 16, capacity=8)
