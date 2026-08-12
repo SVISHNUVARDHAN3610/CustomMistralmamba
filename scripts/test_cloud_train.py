@@ -205,7 +205,16 @@ def _non_finite_loss_diagnosis(
         "router_z_w": router_z_w,
     }
     if aux is not None:
-        for name in ("recon", "assoc", "gate", "read", "fusion", "expert", "ssm", "slot"):
+        for name in (
+            "recon",
+            "assoc",
+            "gate",
+            "read",
+            "fusion",
+            "expert",
+            "ssm",
+            "slot",
+        ):
             raw_terms[name] = getattr(aux, name)
 
     non_finite_terms = [
@@ -400,9 +409,7 @@ def evaluate_val_ce(
             labels=labels,
             ignore_index=ignore_index,
         )
-        with torch.autocast(
-            device_type="cuda", dtype=torch.float16, enabled=use_amp
-        ):
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
             out = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,

@@ -1165,7 +1165,9 @@ class TestHybridModel(unittest.TestCase):
             [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]],
             dtype=torch.long,
         )
-        with mock.patch.object(MambaBlock, "_fused_selective_scan", side_effect=fake_fused):
+        with mock.patch.object(
+            MambaBlock, "_fused_selective_scan", side_effect=fake_fused
+        ):
             y, st = MambaBlock._fused_selective_scan_unpadded(
                 u, dt, A, B, C, D, mask, return_final_state=True
             )

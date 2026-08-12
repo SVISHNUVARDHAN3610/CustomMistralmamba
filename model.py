@@ -476,9 +476,12 @@ def expert_specialization_loss(
     n_pairs = 0
     for i in range(top_k):
         for j in range(i + 1, top_k):
-            l_ortho = l_ortho + F.cosine_similarity(
-                expert_out[:, i], expert_out[:, j], dim=-1
-            ).abs().mean()
+            l_ortho = (
+                l_ortho
+                + F.cosine_similarity(expert_out[:, i], expert_out[:, j], dim=-1)
+                .abs()
+                .mean()
+            )
             n_pairs += 1
     if n_pairs > 0:
         l_ortho = l_ortho / n_pairs
@@ -1537,9 +1540,7 @@ class MemoryWriteBuffer:
             and self.mamba_buf is not None
             and self.mask_buf is not None
         )
-        mask = self._normalize_valid_mask(
-            valid_mask, self.batch_size, add, attn.device
-        )
+        mask = self._normalize_valid_mask(valid_mask, self.batch_size, add, attn.device)
         # Keep pad slots zero so a wrong write_mask cannot attend to junk.
         keep = mask.unsqueeze(-1)
         self.attn_buf[:, self.filled : self.filled + add] = torch.where(
@@ -1565,9 +1566,7 @@ class MemoryWriteBuffer:
             and self.mamba_buf is not None
             and self.mask_buf is not None
         )
-        mask = self._normalize_valid_mask(
-            valid_mask, self.batch_size, 1, attn.device
-        )
+        mask = self._normalize_valid_mask(valid_mask, self.batch_size, 1, attn.device)
         keep = mask.unsqueeze(-1)
         self.attn_buf[:, self.filled : self.filled + 1] = torch.where(
             keep, attn, torch.zeros_like(attn)
@@ -2188,14 +2187,10 @@ class MambaBlock(nn.Module):
         for b in range(batch_size):
             vl = int(valid_lens[b].item())
             if vl <= 0:
-                y_rows.append(
-                    torch.zeros(seq_len, d_inner, device=device, dtype=dtype)
-                )
+                y_rows.append(torch.zeros(seq_len, d_inner, device=device, dtype=dtype))
                 if return_final_state:
                     state_rows.append(
-                        torch.zeros(
-                            d_inner, state_size, device=device, dtype=dtype
-                        )
+                        torch.zeros(d_inner, state_size, device=device, dtype=dtype)
                     )
                 continue
             y_b, st_b = cls._fused_selective_scan(
@@ -2218,15 +2213,11 @@ class MambaBlock(nn.Module):
                     state_rows.append(st_b[0])
                 else:
                     state_rows.append(
-                        torch.zeros(
-                            d_inner, state_size, device=device, dtype=dtype
-                        )
+                        torch.zeros(d_inner, state_size, device=device, dtype=dtype)
                     )
 
         y = torch.stack(y_rows, dim=0)
-        ssm_state = (
-            torch.stack(state_rows, dim=0) if return_final_state else None
-        )
+        ssm_state = torch.stack(state_rows, dim=0) if return_final_state else None
         return y, ssm_state
 
     @classmethod
@@ -3014,9 +3005,7 @@ class HybridDecoderLayer(nn.Module):
                 new_buf = write_buffer
 
             if decode_accumulate_only and seq_len == 1:
-                new_buf.append_single_token(
-                    buf_attn, buf_mamba, token_attention_mask
-                )
+                new_buf.append_single_token(buf_attn, buf_mamba, token_attention_mask)
             else:
                 new_buf.append(buf_attn, buf_mamba, token_attention_mask)
 
@@ -3085,9 +3074,7 @@ class HybridDecoderLayer(nn.Module):
                             write_mask.bool() if write_mask is not None else None
                         )
                         row_has_valid = (
-                            write_valid.any(dim=-1)
-                            if write_valid is not None
-                            else None
+                            write_valid.any(dim=-1) if write_valid is not None else None
                         )
                         attn_recon_out = self.attn_memory_bank.recon_decoder(
                             buf_a, sum_a
@@ -3140,12 +3127,8 @@ class HybridDecoderLayer(nn.Module):
                             cfg.slot_cross_bank_alpha,
                         )
                     layer_aux = HybridLayerAuxLosses(
-                        recon=_restore_dtype(
-                            (attn_recon + mamba_recon) / 2.0, x.dtype
-                        ),
-                        assoc=_restore_dtype(
-                            (attn_assoc + mamba_assoc) / 2.0, x.dtype
-                        ),
+                        recon=_restore_dtype((attn_recon + mamba_recon) / 2.0, x.dtype),
+                        assoc=_restore_dtype((attn_assoc + mamba_assoc) / 2.0, x.dtype),
                         gate=_restore_dtype(gate_loss / 2.0, x.dtype),
                         read=layer_aux.read,
                         fusion=layer_aux.fusion,
@@ -3742,7 +3725,9 @@ class HybridForCausalLM(nn.Module):
         ignore_index = self.config.label_ignore_index
         valid = labels != ignore_index
         if not valid.any():
-            return torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+            return torch.tensor(
+                0.0, device=hidden_states.device, dtype=hidden_states.dtype
+            )
         hidden_valid = hidden_states[valid]
         logits_valid = self.lm_head(hidden_valid)
         return F.cross_entropy(logits_valid, labels[valid], reduction="mean")
@@ -3878,13 +3863,9 @@ class HybridForCausalLM(nn.Module):
                     ignore_index=self.config.label_ignore_index
                 )
                 assert logits is not None
-                ce_loss = loss_fct(
-                    logits.view(-1, self.vocab_size), labels.reshape(-1)
-                )
+                ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
             else:
-                ce_loss = self._compute_ce_loss(
-                    hidden_states, labels, attention_mask
-                )
+                ce_loss = self._compute_ce_loss(hidden_states, labels, attention_mask)
             aux_total = self._weighted_auxiliary_loss(
                 auxiliary_losses,
                 device=hidden_states.device,
@@ -4098,9 +4079,7 @@ class HybridForCausalLM(nn.Module):
             a_mem, s_mem = mem
             buf_attn, buf_mamba, buf_mask = _materialize_write_buffer(buf)
             assert buf_attn is not None and buf_mamba is not None
-            write_mask = (
-                buf_mask.to(dtype=torch.long) if buf_mask is not None else None
-            )
+            write_mask = buf_mask.to(dtype=torch.long) if buf_mask is not None else None
             new_a, _, _, new_s, _, _ = batched_dual_memory_write(
                 layer.attn_memory_bank,
                 layer.state_memory_bank,
