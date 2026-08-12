@@ -1,8 +1,8 @@
 """Production training for Hybrid Mamba-MoE with streaming tokenized shards.
 
 Consumes binary shards produced by ``utils.dataset.TokenizedShardProducer`` via
-``MmapShardDataset``. Validation data loading is intentionally omitted here;
-wire that in when a held-out pipeline is ready.
+``MmapShardDataset``. Optional cyclic validation on ``Salesforce/wikitext``
+(validation split) via ``utils.validation.WikiTextCyclicValidator``.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ from utils.dataset import (
     TokenizedShardProducer,
     verify_tokenizer_vocab,
 )
+from utils.validation import WikiTextCyclicValidator
 
 torch.set_float32_matmul_precision("high")
 
@@ -525,6 +526,7 @@ def save_checkpoint(
     current_shard_idx: int,
     checkpoint_dir: Path,
     logger: logging.Logger,
+    validator: WikiTextCyclicValidator | None = None,
 ) -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = checkpoint_dir / CHECKPOINT_FILENAME
@@ -538,6 +540,8 @@ def save_checkpoint(
         "rng_state": _rng_state_dict(),
         "memory_nan_fix_id": MEMORY_NAN_FIX_ID,
     }
+    if validator is not None:
+        payload["validator_state_dict"] = validator.state_dict
     if len(optimizers) >= 1:
         payload["muon_optimizer_state_dict"] = optimizers[0].state_dict()
     if len(optimizers) >= 2:
@@ -570,6 +574,7 @@ def load_checkpoint(
     checkpoint_dir: Path,
     device: torch.device,
     logger: logging.Logger,
+    validator: WikiTextCyclicValidator | None = None,
 ) -> tuple[int, int]:
     ckpt_path = checkpoint_dir / CHECKPOINT_FILENAME
     if not ckpt_path.exists():
@@ -588,6 +593,9 @@ def load_checkpoint(
         schedulers[1].load_state_dict(checkpoint["adam_scheduler_state_dict"])
 
     _load_rng_state_dict(checkpoint.get("rng_state"))
+
+    if validator is not None and "validator_state_dict" in checkpoint:
+        validator.load_state_dict(checkpoint["validator_state_dict"])
 
     global_step = int(checkpoint.get("global_step", 0))
     current_shard_idx = int(checkpoint.get("current_shard_idx", 0))
@@ -611,17 +619,32 @@ def _format_log_line(step: int, max_steps: int, record: dict[str, Any]) -> str:
     expert_tag = "warm" if record.get("expert_scale") == 0.0 else "on"
     smooth = record.get("ce_smooth")
     smooth_str = f"{smooth:.6f}" if smooth is not None else "n/a"
+    val_ce = record.get("val_ce_loss")
+    val_str = f"{val_ce:.6f}" if val_ce is not None else "n/a"
     return (
         f"step={step}/{max_steps} "
         f"shard={record.get('shard_idx', 0)} "
         f"loss={record['loss']:.6f} ce={record['ce_loss']:.6f} "
-        f"ce_smooth={smooth_str} "
+        f"ce_smooth={smooth_str} val_ce={val_str} "
         f"router_aux={record['router_aux_loss']:.6f} "
         f"router_z={record['router_z_loss']:.6f} "
         f"recon={record['recon']:.6f} assoc={record['assoc']:.6f}({assoc_tag}) "
         f"expert={record['expert']:.6f}({expert_tag}) "
         f"grad_norm={record['grad_norm']:.4f} "
         f"muon_lr={record['muon_lr']:.2e} adam_lr={record['adam_lr']:.2e}"
+    )
+
+
+def _format_val_log_line(val_record: dict[str, Any]) -> str:
+    return (
+        f"validation step={val_record['step']} "
+        f"val_loss={val_record['val_loss']:.6f} "
+        f"val_ce={val_record['val_ce_loss']:.6f} "
+        f"val_router_aux={val_record['val_router_aux_loss']:.6f} "
+        f"val_router_z={val_record['val_router_z_loss']:.6f} "
+        f"rows={val_record['val_rows']} batch={val_record['val_batch_size']} "
+        f"cursor={val_record['val_row_start']}->{val_record['val_row_end']} "
+        f"next={val_record['val_cursor']}"
     )
 
 
@@ -693,6 +716,33 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         logger=logger,
     )
 
+    validator: WikiTextCyclicValidator | None = None
+    if not args.no_validation:
+        try:
+            validator = WikiTextCyclicValidator(
+                producer.tokenizer,
+                seq_len=args.seq_len,
+                num_rows=args.val_rows,
+                batch_size=args.val_batch_size,
+                dataset_config=args.val_dataset_config,
+                bos_id=cfg.bos_token_id,
+                eos_id=cfg.eos_token_id,
+                pad_token_id=cfg.pad_token_id,
+            )
+            logger.info(
+                "Cyclic validation enabled | dataset=Salesforce/wikitext/%s "
+                "rows=%d batch=%d interval=%d",
+                args.val_dataset_config,
+                args.val_rows,
+                args.val_batch_size,
+                args.val_interval,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to initialize WikiTextCyclicValidator; disabling validation"
+            )
+            validator = None
+
     warmup_steps = _resolve_warmup_steps(args.warmup_steps, args.max_steps)
     lr_lambda = _build_lr_lambda(warmup_steps, args.max_steps, args.min_lr_ratio)
     schedulers: list[torch.optim.lr_scheduler.LRScheduler] = [
@@ -715,6 +765,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
             checkpoint_dir=ckpt_dir,
             device=device,
             logger=logger,
+            validator=validator,
         )
 
     stop_event = threading.Event()
@@ -888,6 +939,31 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     },
                 }
 
+                if (
+                    validator is not None
+                    and args.val_interval > 0
+                    and global_step % args.val_interval == 0
+                ):
+                    val_record = validator.evaluate(
+                        model,
+                        device=device,
+                        global_step=global_step,
+                        max_training_steps=args.max_steps,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        ignore_index=cfg.label_ignore_index,
+                    )
+                    record["val_loss"] = val_record["val_loss"]
+                    record["val_ce_loss"] = val_record["val_ce_loss"]
+                    record["val_router_aux_loss"] = val_record["val_router_aux_loss"]
+                    record["val_router_z_loss"] = val_record["val_router_z_loss"]
+
+                    if jsonl_path is not None:
+                        with jsonl_path.open("a", encoding="utf-8") as f:
+                            f.write(json.dumps(val_record) + "\n")
+
+                    logger.info(_format_val_log_line(val_record))
+
                 if jsonl_path is not None:
                     with jsonl_path.open("a", encoding="utf-8") as f:
                         f.write(json.dumps(record) + "\n")
@@ -907,6 +983,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         current_shard_idx=current_shard_idx,
                         checkpoint_dir=ckpt_dir,
                         logger=logger,
+                        validator=validator,
                     )
                     producer.save_checkpoint(args.dataset_ckpt_path)
 
@@ -932,6 +1009,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 current_shard_idx=current_shard_idx,
                 checkpoint_dir=ckpt_dir,
                 logger=logger,
+                validator=validator,
             )
             producer.save_checkpoint(args.dataset_ckpt_path)
 
@@ -956,6 +1034,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 current_shard_idx=current_shard_idx,
                 checkpoint_dir=ckpt_dir,
                 logger=logger,
+                validator=validator,
             )
             producer.save_checkpoint(args.dataset_ckpt_path)
         raise
@@ -1098,6 +1177,36 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Optional JSONL metrics path (default: <run-dir>/metrics.jsonl).",
+    )
+
+    parser.add_argument(
+        "--no-validation",
+        action="store_true",
+        help="Disable cyclic Salesforce/wikitext validation.",
+    )
+    parser.add_argument(
+        "--val-interval",
+        type=int,
+        default=200,
+        help="Run cyclic validation every N training steps.",
+    )
+    parser.add_argument(
+        "--val-rows",
+        type=int,
+        default=50,
+        help="Number of wikitext validation rows consumed per validation call.",
+    )
+    parser.add_argument(
+        "--val-batch-size",
+        type=int,
+        default=10,
+        help="Batch size used when scoring validation rows.",
+    )
+    parser.add_argument(
+        "--val-dataset-config",
+        type=str,
+        default="wikitext-2-raw-v1",
+        help="Salesforce/wikitext config name (e.g. wikitext-2-raw-v1, wikitext-103-raw-v1).",
     )
     args = parser.parse_args()
     if not args.log_jsonl:
