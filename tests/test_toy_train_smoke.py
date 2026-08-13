@@ -6,7 +6,9 @@ import unittest
 
 import torch
 
-from model import HybridForCausalLM, _aux_loss_schedule, count_trainable_params
+from model.core.builders import count_trainable_params
+from model.hybrid.losses import _aux_loss_schedule
+from model.hybrid.model import HybridForCausalLM
 from scripts.toy_train import build_toy_config
 
 

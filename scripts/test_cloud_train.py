@@ -29,18 +29,18 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-from model import (
-    HybridForCausalLM,
-    HybridMambaMoEConfig,
-    _aux_loss_schedule,
-    _expert_loss_schedule,
-    count_trainable_params,
+from model.core.builders import count_trainable_params
+from model.core.config import HybridMambaMoEConfig
+from model.core.constants import MEMORY_NAN_FIX_ID
+from model.hybrid.losses import _aux_loss_schedule, _expert_loss_schedule
+from model.hybrid.mamba import (
     fused_mamba_scan_available,
     get_mamba_scan_stats,
     log_mamba_backend,
     probe_mamba_scan_timing,
     reset_mamba_scan_stats,
 )
+from model.hybrid.model import HybridForCausalLM
 
 
 def resolve_tokenizer_vocab_size(
@@ -600,12 +600,9 @@ def main() -> None:
     model = HybridForCausalLM(cfg).to(device)
     n_params = count_trainable_params(model)
     print(f"trainable_params={n_params:,} (target ~150M) vocab_size={cfg.vocab_size}")
-    import model as _model_mod
+    import model as model_pkg
 
-    print(
-        f"model_source={_model_mod.__file__} "
-        f"memory_nan_fix={getattr(_model_mod, 'MEMORY_NAN_FIX_ID', 'missing')}"
-    )
+    print(f"model_source={model_pkg.__file__} memory_nan_fix={MEMORY_NAN_FIX_ID}")
 
     use_amp = device.type == "cuda" and not args.no_amp
     if use_amp:

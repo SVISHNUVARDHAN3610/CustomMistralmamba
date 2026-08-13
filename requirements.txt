@@ -1,4 +1,4 @@
-# Runtime — model.py + tests/test_model.py
+# Runtime — model/ package + tests/test_model.py
 torch>=2.1.0
 
 # Optional GPU acceleration for MambaBlock (CUDA only; auto-fallback if missing):
