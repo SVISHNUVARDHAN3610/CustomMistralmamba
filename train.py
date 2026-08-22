@@ -272,7 +272,9 @@ def build_optimizers(
         )
         return [muon_optim, adam_optim], True, meta
 
-    adam_groups = build_adamw_param_groups(list(model.parameters()), weight_decay, param_names)
+    adam_groups = build_adamw_param_groups(
+        list(model.parameters()), weight_decay, param_names
+    )
     adam_optim = optim.AdamW(
         adam_groups,
         lr=resolved_adam_lr,

@@ -1664,7 +1664,9 @@ class TestHybridModel(unittest.TestCase):
         self.assertEqual(gen.shape, (2, 26))
 
     def test_layer_types_interleaving(self) -> None:
-        cfg = _small_hybrid_config(num_layers=2, layer_types=["mamba_only", "attn_only"])
+        cfg = _small_hybrid_config(
+            num_layers=2, layer_types=["mamba_only", "attn_only"]
+        )
         model = HybridForCausalLM(cfg).train()
         ids = torch.randint(0, cfg.vocab_size, (2, 16))
         labels = torch.randint(0, cfg.vocab_size, (2, 16))
@@ -1686,7 +1688,9 @@ class TestHybridModel(unittest.TestCase):
 
         cfg = _small_hybrid_config()
         model = HybridForCausalLM(cfg)
-        adam_params, _muon_params, inventory, param_names = split_muon_adam_params(model)
+        adam_params, _muon_params, inventory, param_names = split_muon_adam_params(
+            model
+        )
 
         # A_log and D must be in AdamW
         a_log_found = any("A_log" in name for name in inventory["adamw"])
@@ -1695,7 +1699,9 @@ class TestHybridModel(unittest.TestCase):
         self.assertTrue(d_found, "D must be in AdamW parameter group")
 
         # Test build_adamw_param_groups
-        groups = build_adamw_param_groups(adam_params, weight_decay=0.1, name_lookup=param_names)
+        groups = build_adamw_param_groups(
+            adam_params, weight_decay=0.1, name_lookup=param_names
+        )
         self.assertEqual(len(groups), 2)
         decay_group = next(g for g in groups if g["weight_decay"] > 0)
         self.assertEqual(decay_group["weight_decay"], 0.1)

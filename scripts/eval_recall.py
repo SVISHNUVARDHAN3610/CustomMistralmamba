@@ -75,7 +75,9 @@ def generate_synthetic_needle_sample(
     key_tokens = torch.randint(5, 15, (1, key_len), device=device)
     val_tokens = torch.randint(15, 20, (1, val_len), device=device)
 
-    needle_pos = max(0, min(seq_len - key_len - val_len - key_len - 5, int(seq_len * needle_depth)))
+    needle_pos = max(
+        0, min(seq_len - key_len - val_len - key_len - 5, int(seq_len * needle_depth))
+    )
     haystack[:, needle_pos : needle_pos + key_len] = key_tokens
     haystack[:, needle_pos + key_len : needle_pos + key_len + val_len] = val_tokens
 
@@ -119,10 +121,14 @@ def evaluate_retrieval_loss(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Synthetic Recall & Falsification Harness")
+    parser = argparse.ArgumentParser(
+        description="Synthetic Recall & Falsification Harness"
+    )
     parser.add_argument("--seq-len", type=int, default=512)
     parser.add_argument("--num-samples", type=int, default=10)
-    parser.add_argument("--needle-depth", type=float, default=0.1, help="Depth in sequence (0.0 to 0.9)")
+    parser.add_argument(
+        "--needle-depth", type=float, default=0.1, help="Depth in sequence (0.0 to 0.9)"
+    )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -142,26 +148,38 @@ def main() -> None:
     print("SCIENTIFIC RECALL & FALSIFICATION EVALUATION")
     print("=" * 72)
     print(f"Sequence length:  {args.seq_len}")
-    print(f"Needle depth:     {args.needle_depth:.2f} (distance ~{int(args.seq_len * (1 - args.needle_depth))} tokens)")
+    print(
+        f"Needle depth:     {args.needle_depth:.2f} (distance ~{int(args.seq_len * (1 - args.needle_depth))} tokens)"
+    )
     print(f"Number of trials: {args.num_samples}")
     print(f"Hybrid params:    {n_hybrid:,} (use_dual_memory=True)")
-    print(f"Null params:      {n_null:,} (use_dual_memory=False, state={null_cfg.mamba_state_size})")
+    print(
+        f"Null params:      {n_null:,} (use_dual_memory=False, state={null_cfg.mamba_state_size})"
+    )
     print("-" * 72)
 
     losses_on, losses_zeroed, losses_null = [], [], []
     matches_on, matches_zeroed, matches_null = 0, 0, 0
 
     for _ in range(args.num_samples):
-        input_ids, target_val, _needle_pos, _query_pos = generate_synthetic_needle_sample(
-            vocab_size=cfg.vocab_size,
-            seq_len=args.seq_len,
-            needle_depth=args.needle_depth,
-            device=device,
+        input_ids, target_val, _needle_pos, _query_pos = (
+            generate_synthetic_needle_sample(
+                vocab_size=cfg.vocab_size,
+                seq_len=args.seq_len,
+                needle_depth=args.needle_depth,
+                device=device,
+            )
         )
 
-        l_on, m_on = evaluate_retrieval_loss(model_hybrid, input_ids, target_val, zero_memory=False)
-        l_zero, m_zero = evaluate_retrieval_loss(model_hybrid, input_ids, target_val, zero_memory=True)
-        l_null, m_null = evaluate_retrieval_loss(model_null, input_ids, target_val, zero_memory=False)
+        l_on, m_on = evaluate_retrieval_loss(
+            model_hybrid, input_ids, target_val, zero_memory=False
+        )
+        l_zero, m_zero = evaluate_retrieval_loss(
+            model_hybrid, input_ids, target_val, zero_memory=True
+        )
+        l_null, m_null = evaluate_retrieval_loss(
+            model_null, input_ids, target_val, zero_memory=False
+        )
 
         losses_on.append(l_on)
         losses_zeroed.append(l_zero)
@@ -177,9 +195,15 @@ def main() -> None:
     mean_zero = sum(losses_zeroed) / len(losses_zeroed)
     mean_null = sum(losses_null) / len(losses_null)
 
-    print(f"Condition 1 (Memory-On):     Mean CE = {mean_on:.4f} | Exact Match = {matches_on}/{args.num_samples}")
-    print(f"Condition 2 (Test 1 Zeroed):  Mean CE = {mean_zero:.4f} | Exact Match = {matches_zeroed}/{args.num_samples}")
-    print(f"Condition 3 (Test 3 Null):    Mean CE = {mean_null:.4f} | Exact Match = {matches_null}/{args.num_samples}")
+    print(
+        f"Condition 1 (Memory-On):     Mean CE = {mean_on:.4f} | Exact Match = {matches_on}/{args.num_samples}"
+    )
+    print(
+        f"Condition 2 (Test 1 Zeroed):  Mean CE = {mean_zero:.4f} | Exact Match = {matches_zeroed}/{args.num_samples}"
+    )
+    print(
+        f"Condition 3 (Test 3 Null):    Mean CE = {mean_null:.4f} | Exact Match = {matches_null}/{args.num_samples}"
+    )
     print("-" * 72)
     delta_test1 = mean_zero - mean_on
     delta_test3 = mean_null - mean_on

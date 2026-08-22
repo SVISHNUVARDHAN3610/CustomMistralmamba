@@ -132,16 +132,22 @@ class SlidingWindowGQA(nn.Module):
                     [key_states[:, :, :sink, :], key_states[:, :, -recent:, :]], dim=2
                 )
                 value_states = torch.cat(
-                    [value_states[:, :, :sink, :], value_states[:, :, -recent:, :]], dim=2
+                    [value_states[:, :, :sink, :], value_states[:, :, -recent:, :]],
+                    dim=2,
                 )
                 if attention_mask is not None:
                     if attention_mask.dim() == 2:
                         attention_mask = torch.cat(
-                            [attention_mask[:, :sink], attention_mask[:, -recent:]], dim=1
+                            [attention_mask[:, :sink], attention_mask[:, -recent:]],
+                            dim=1,
                         )
                     elif attention_mask.dim() == 4:
                         attention_mask = torch.cat(
-                            [attention_mask[:, :, :, :sink], attention_mask[:, :, :, -recent:]], dim=3
+                            [
+                                attention_mask[:, :, :, :sink],
+                                attention_mask[:, :, :, -recent:],
+                            ],
+                            dim=3,
                         )
             else:
                 key_states = key_states[:, :, -self.window_size :, :]

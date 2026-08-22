@@ -97,7 +97,9 @@ def _is_adamw_parameter(name: str, param: nn.Parameter) -> bool:
 
 def split_muon_adam_params(
     model: nn.Module,
-) -> tuple[list[nn.Parameter], list[nn.Parameter], dict[str, list[str]], dict[int, str]]:
+) -> tuple[
+    list[nn.Parameter], list[nn.Parameter], dict[str, list[str]], dict[int, str]
+]:
     """Split parameters into AdamW vs Muon groups with name inventories."""
     adam_params: list[nn.Parameter] = []
     muon_params: list[nn.Parameter] = []
