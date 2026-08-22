@@ -9,7 +9,7 @@
 | **Primary entry point** | `from model import HybridForCausalLM, HybridMambaMoEConfig` |
 | **Design document** | [`research/research.md`](../research/research.md) |
 | **Loss specification** | [`research/loss-definitions.md`](../research/loss-definitions.md) |
-| **Unit tests** | [`tests/test_model.py`](../tests/test_model.py) — 66 tests |
+| **Unit tests** | [`tests/test_model.py`](../tests/test_model.py) — 73 tests |
 | **Revision marker** | `MEMORY_NAN_FIX_ID` (see §12) |
 
 ---
@@ -541,6 +541,10 @@ Supports `temperature`, `top_k`, `top_p`, `do_sample`, and `eos_token_id` (defau
 | `capacity_factor` | `None` | MoE capacity limit; None = dropless |
 | `max_position_embeddings` | 32768 | RoPE cache upper bound |
 | `rope_theta` | 10000.0 | RoPE base frequency |
+| `use_qk_norm` | False | Apply per-head RMSNorm to query and key states |
+| `attention_sink_size` | 0 | Retain initial sink tokens across sliding window |
+| `final_logit_z_loss_coef` | 0.0 | Output logit z-loss regularization coefficient |
+| `layer_types` | None | Layer topology (`hybrid`, `mamba_only`, `attn_only`) |
 | `router_aux_loss_coef` | 0.02 | Load balancing weight |
 | `router_z_loss_coef` | 0.005 | Router z-loss weight |
 | `label_ignore_index` | -100 | CE ignore index for padding |
@@ -646,8 +650,10 @@ Extra parameters per hybrid layer (dual memory + combine layers): approximately 
 
 | Suite | Location | Coverage |
 |-------|----------|----------|
-| Unit tests | `tests/test_model.py` | 66 tests — forward/backward, chunked training, incremental vs full-forward parity, memory persistence, padding/NaN edges, fused Mamba parity, aux loss gradients, MoE dispatch, CUDA-graph decode, falsification hooks |
-| Toy train smoke | `tests/test_toy_train_smoke.py` | 10-step training loop, param budget |
+| Unit tests | `tests/test_model.py` | 73 tests — forward/backward, QK-Norm, Attention Sinks, shared RoPE, layer routing, optimizer parameter grouping, chunked training, incremental vs full-forward parity, memory persistence, padding/NaN edges, fused Mamba parity, aux loss gradients, MoE dispatch, CUDA-graph decode, falsification hooks |
+| Toy train smoke | `tests/test_toy_train_smoke.py` | 10-step training loop, param budget (~500K params) |
+| Mixed CPU training | `tests/test_mixed_cpu_training.py` | 50-step mixed CPU training test on 1M-5M model with NaN/Inf assertions across all 8 auxiliary losses and gradients |
+| Recall falsification | `scripts/eval_recall.py` | Synthetic associative recall & scientific falsification harness (Condition 1 Memory-On, Condition 2 Zeroed, Condition 3 Null baseline) |
 | Cloud smoke | `scripts/test_cloud_train.py` | ~150M param IMDB one-epoch run |
 
 **Caching correctness test:** incremental `generate()` vs full-forward last-logit cosine similarity — re-run before latency-sensitive deployment at larger scales.

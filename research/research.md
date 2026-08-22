@@ -16,11 +16,13 @@ Mixture-of-Experts — that keeps per-layer cost linear in sequence length while
 retaining a mechanism for long-range, non-recurring information that both
 attention and the SSM branch tend to lose over long contexts.
 
-A reference PyTorch implementation exists (`model.py`, ~4.4k lines), verified
-with 66 unit tests in `tests/test_model.py`, forward/backward passes, chunked
+A reference PyTorch implementation exists (modularized under `model/`), verified
+with 73 unit tests in `tests/test_model.py`, a 50-step mixed CPU training test
+in `tests/test_mixed_cpu_training.py`, forward/backward passes, chunked
 long-context training, and an autoregressive `generate()` method. A cloud
 training smoke script (`scripts/test_cloud_train.py`) exercises the full
-training objective on IMDB at ~150M parameters. This document lays out the
+training objective on IMDB at ~150M parameters, and `scripts/eval_recall.py`
+evaluates synthetic associative recall and falsification deltas. This document lays out the
 problem, the design, what's built, what's still unproven, and the evaluation
 plan that determines whether the memory component earns its place in the
 architecture.
@@ -279,11 +281,19 @@ share the GQA and MoE stacks:
 
 ### 5.3 Training & Test Infrastructure
 
-- ✅ **`tests/test_model.py`** — 66 unit tests covering forward/backward,
+- ✅ **`tests/test_model.py`** — 73 unit tests covering forward/backward, QK-norm,
+  attention sinks, shared RoPE, layer routing, optimizer parameter grouping,
   chunked training parity, incremental vs full-forward logit cosine similarity,
   memory persistence across chunks, padding/NaN edge cases, fused Mamba parity,
   auxiliary loss gradients, MoE dispatch, CUDA-graph decode parity, and
   falsification hooks.
+
+- ✅ **`tests/test_mixed_cpu_training.py`** — 50-step mixed CPU training test
+  (1M-5M parameters) asserting strictly finite losses and gradients with zero NaNs.
+
+- ✅ **`scripts/eval_recall.py`** — synthetic associative recall & scientific
+  falsification harness evaluating Condition 1 (Memory-On), Condition 2 (Test 1 Zeroed),
+  and Condition 3 (Test 3 Null baseline).
 
 - ✅ **`scripts/test_cloud_train.py`** — one-epoch IMDB smoke test (~150M
   params, `memory_chunk_size=256`, `stream_chunked_ce_loss=True`,
@@ -291,7 +301,7 @@ share the GQA and MoE stacks:
   logging. Intended for GPU cloud hosts (Colab, Kaggle, etc.).
 
 - ✅ **`loss-definitions.md`** — full specification of all eight auxiliary
-  losses, hyperparameter ranges, and tuning signals.
+  losses plus output logit z-loss, hyperparameter ranges, and tuning signals.
 
 ### 5.4 Bugs Found and Fixed During Implementation
 

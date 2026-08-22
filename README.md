@@ -96,15 +96,19 @@ Full per-layer diagrams, compute-cost tables, and a component-by-component refer
 The reference implementation is feature-complete for training and autoregressive inference:
 
 - Both model families (`MixtralForCausalLM`, `HybridForCausalLM`) with matched GQA/MoE building blocks for apples-to-apples ablation.
+- **Per-Head QK-Normalization (`use_qk_norm`)** and **StreamingLLM Attention Sinks (`attention_sink_size`)** in `SlidingWindowGQA` for attention entropy control and infinite-context window stability.
+- Deduplicated single shared `RotaryEmbedding` across all layers to eliminate redundant frequency buffer allocations.
 - `CompressiveMemoryBank` with GRU-style gated writes, padding-safe batched read/write, and a training-only reconstruction/associative auxiliary path.
-- `MambaBlock` with a four-tier scan dispatch (fused CUDA kernel when `mamba-ssm` is available, Hillis-Steele parallel scan, blocked vectorized scan, sequential scan with checkpointing) so behavior is correct with or without GPU fused kernels.
-- **Eight auxiliary losses** (reconstruction, associative recall, gate regularization, slot utilization, read/fusion/SSM-calibration/expert-routing terms) with warmup schedules, documented formula-by-formula in [`research/loss-definitions.md`](research/loss-definitions.md).
+- `MambaBlock` with a four-tier scan dispatch (fused CUDA kernel when `mamba-ssm` is available, Hillis-Steele parallel scan, blocked vectorized scan, sequential scan with checkpointing) and fully vectorized prefill cache gathering.
+- Flexible layer topology routing (`layer_types`) supporting `"hybrid"`, `"mamba_only"`, and `"attn_only"` execution profiles.
+- **Eight auxiliary losses** (reconstruction, associative recall, gate regularization, slot utilization, read/fusion/SSM-calibration/expert-routing terms) plus output logit z-loss regularization (`final_logit_z_loss_coef`).
 - Chunked, truncated-BPTT training for long sequences, with memory and Mamba state threaded across chunks.
 - Incremental KV / Mamba / memory caching for `generate()`, including a fast single-token decode path (`MambaBlock.step()`, `MemoryWriteBuffer.append_single_token()`).
 - A parameter-matched **null baseline builder** (`build_test3_null_baseline_config`) that expands the Mamba state size to compensate for a disabled memory bank, so memory's contribution can be isolated from raw parameter count.
-- Production training script (`train.py`) consuming memory-mapped tokenized shards, with cyclic WikiText validation, mixed-precision-safe FP32 promotion for numerically sensitive ops, and full checkpoint/resume support.
+- Production training script (`train.py`) consuming memory-mapped tokenized shards, with Muon+AdamW parameter grouping and no-decay exclusion on 1D/norm/embedding/SSM parameters.
+- Synthetic associative recall and falsification harness (`scripts/eval_recall.py`) benchmarking Condition 1 (Memory-On), Condition 2 (Test 1 Zeroed), and Condition 3 (Test 3 Null baseline).
 - A cloud training smoke test (`scripts/test_cloud_train.py`) exercising the complete training objective at ~150M parameters on IMDB.
-- 66 unit tests covering forward/backward correctness, shape invariants, caching, memory falsification hooks, and numerical stability (`MEMORY_NAN_FIX_ID` guards against NaNs on the memory path).
+- 73 unit tests in `tests/test_model.py` and dedicated CPU mixed training test in `tests/test_mixed_cpu_training.py` verifying mathematical stability and zero-NaN invariants.
 
 ## 6. Repository Structure
 
@@ -116,18 +120,19 @@ CustomMistralmamba/
 │
 ├── model/                         # Core architecture package
 │   ├── README.md                  # Full architecture reference (24 sections)
-│   ├── core/                      # Config dataclasses, dtype helpers, param builders
-│   ├── layers/                    # Shared blocks: RMSNorm, RoPE, GQA, MoE, fusion gate
+│   ├── core/                      # Config dataclasses, dtype helpers, param/optimizer builders
+│   ├── layers/                    # Shared blocks: RMSNorm, RoPE, GQA (QK-Norm + Sinks), MoE, fusion gate
 │   ├── mixtral/                   # Baseline ablation model
 │   └── hybrid/                    # Memory bank, Mamba block, aux losses, hybrid layer/model
 │
 ├── research/
 │   ├── research.md                # Full research proposal, problem framing, evaluation plan
-│   ├── loss-definitions.md        # Formula-level spec for all eight auxiliary losses
+│   ├── loss-definitions.md        # Formula-level spec for all eight auxiliary losses + logit z-loss
 │   └── Improvement-suggestions.md # Deferred research-grade backlog (post-review)
 │
 ├── scripts/
-│   ├── toy_train.py               # ~5M-param smoke test, single file, no dataset needed
+│   ├── toy_train.py               # ~500K-param minimal smoke test, single file, no dataset needed
+│   ├── eval_recall.py             # Synthetic associative recall & scientific falsification harness
 │   ├── test_cloud_train.py        # ~150M-param IMDB training smoke test
 │   └── verify_model_package.py    # Import / API surface sanity check
 │
@@ -135,10 +140,11 @@ CustomMistralmamba/
 │   ├── dataset.py                 # TokenizedShardProducer, MmapShardDataset (streaming shards)
 │   └── validation.py              # WikiTextCyclicValidator for periodic held-out eval
 │
-├── train.py                       # Production training loop (streaming shards + checkpointing)
+├── train.py                       # Production training loop (streaming shards + Muon/AdamW)
 └── tests/
-    ├── test_model.py              # 66 unit tests over the model package
-    └── test_toy_train_smoke.py    # Smoke test for scripts/toy_train.py
+    ├── test_model.py              # 73 unit tests over the model package
+    ├── test_toy_train_smoke.py    # Fast smoke test for scripts/toy_train.py
+    └── test_mixed_cpu_training.py # 50-step mixed CPU training test with NaN/Inf validation
 ```
 
 ## 7. Installation

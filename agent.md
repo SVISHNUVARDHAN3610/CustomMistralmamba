@@ -71,8 +71,10 @@ moe_out ────────────────────────
 #### 1. Sliding-Window Grouped-Query Attention (`SlidingWindowGQA`)
 - **File:** `model/layers/attention.py`
 - **Complexity:** $O(L \cdot w)$, where $w = \text{window\_size}$ (default 4096).
-- **Mechanics:** Grouped-Query Attention with $N_q$ query heads and $N_{kv}$ key/value heads ($N_q \pmod{N_{kv}} = 0$). Uses `RotaryEmbedding` (`model/layers/rope.py`) with base $\theta=10000.0$ and pre-allocated non-growing buffers up to `max_position_embeddings`.
-- **KV Truncation & Mask Alignment:** KV cache is bounded to the trailing `window_size` tokens. **Crucial Invariant:** When KV is truncated, `attention_mask` is truncated to match to prevent dimension mismatch crashes during generation.
+- **Mechanics:** Grouped-Query Attention with $N_q$ query heads and $N_{kv}$ key/value heads ($N_q \pmod{N_{kv}} = 0$). Uses shared `RotaryEmbedding` (`model/layers/rope.py`) with base $\theta=10000.0$ and pre-allocated non-growing buffers up to `max_position_embeddings`.
+- **QK-Normalization (`use_qk_norm`):** Optional per-head `RMSNorm(head_dim)` applied to query and key heads before RoPE rotation to eliminate attention entropy collapse.
+- **Attention Sinks (`attention_sink_size`):** Preserves initial $k_{\text{sink}}$ tokens across sliding-window cache eviction, combined with generalized causal attention masks.
+- **KV Truncation & Mask Alignment:** KV cache is bounded to the trailing `window_size` tokens plus attention sinks.
 - **SDPA:** Relies exclusively on `torch.nn.functional.scaled_dot_product_attention`.
 
 #### 2. Mamba Selective State-Space Branch (`MambaBlock`)
@@ -84,6 +86,7 @@ moe_out ────────────────────────
   3. **Tier 2 (Parallel Scan):** Hillis-Steele associative scan ($O(L \log L)$) when $L \le 4096$ or `use_parallel_scan=True`.
   4. **Tier 3 (Blocked Scan):** Blocked vectorized associative scan for $4096 < L \le 65536$.
   5. **Tier 4 (Sequential Scan):** Checkpointed sequential scan for $L > 65536$.
+- **Vectorized Prefill Gathering:** Batched `torch.gather` on valid indices constructs prefill convolution states without CPU-GPU synchronization loops.
 - **Decode Fast Path:** `MambaBlock.step()` performs single-token state recurrence $h_t = \bar{A} h_{t-1} + \bar{B} x_t$ with in-place rolling conv buffer updates.
 
 #### 3. Dual Compressive Memory Banks (`CompressiveMemoryBank` & `MemoryWriteBuffer`)
@@ -96,10 +99,11 @@ moe_out ────────────────────────
 - **Batched Operations:** `batched_dual_memory_read` and `batched_dual_memory_write` stack parameters and states across both banks to execute in a single batched kernel.
 - **Write Buffer:** `MemoryWriteBuffer` holds raw branch outputs with explicit boolean validity masks (`mask_buf`) across decoding steps until `memory_write_interval` tokens accumulate.
 
-#### 4. Token-Wise Gated Fusion (`TokenGatedFusion`)
-- **File:** `model/layers/fusion.py`
+#### 4. Token-Wise Gated Fusion (`TokenGatedFusion`) & Layer Topology
+- **Files:** `model/layers/fusion.py`, `model/hybrid/layer.py`
 - **Complexity:** $O(L \cdot d^2)$ — linear in sequence length.
 - **Mechanism:** $g = \sigma(W_{fuse} [a; m])$, $\text{fused} = g \odot a + (1 - g) \odot m$. Completely avoids quadratic cross-attention between branches.
+- **Layer Topology (`layer_types`):** Supports per-layer `"hybrid"`, `"mamba_only"`, and `"attn_only"` configurations with non-active branch bypassing.
 
 #### 5. Dropless Top-2 Sparse MoE (`DroplessMoELayer`, `MOERouter`, `SwiGLUExpert`)
 - **File:** `model/layers/moe.py`
@@ -115,15 +119,16 @@ moe_out ────────────────────────
 ## 3. Training Objective & Auxiliary Loss System
 
 ### 3.1 Total Loss Formulation
-The overall training objective combines the primary causal language modeling loss, MoE routing stabilizers, and eight memory/branch auxiliary losses:
+The overall training objective combines the primary causal language modeling loss, MoE routing stabilizers, final logit z-loss, and eight memory/branch auxiliary losses:
 
-$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}} + \alpha_{\text{aux}} \mathcal{L}_{\text{router\_aux}} + \alpha_{z} \mathcal{L}_{\text{router\_z}} + \sum_{i=1}^{8} \lambda_i \mathcal{L}_i$$
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}} + \alpha_{\text{aux}} \mathcal{L}_{\text{router\_aux}} + \alpha_{z} \mathcal{L}_{\text{router\_z}} + \alpha_{\text{head\_z}} \mathcal{L}_{\text{head\_z}} + \sum_{i=1}^{8} \lambda_i \mathcal{L}_i$$
 
 | Term | Coefficient / Schedule | Description & Purpose |
 |---|---|---|
 | **$\mathcal{L}_{\text{CE}}$** | $1.0$ (implicit) | Cross-entropy on valid next-token predictions. |
 | **$\mathcal{L}_{\text{router\_aux}}$** | $\alpha_{\text{aux}} = 0.02$ | Switch-Transformer load-balancing across experts ($E \sum f_i p_i$). |
 | **$\mathcal{L}_{\text{router\_z}}$** | $\alpha_{z} = 0.005$ | ST-MoE router logit $z$-loss ($\text{mean}(\text{logsumexp}(logits)^2)$). |
+| **$\mathcal{L}_{\text{head\_z}}$** | $\alpha_{\text{head\_z}} = \text{config.final\_logit\_z\_loss\_coef}$ | Output logit $z$-loss ($\text{mean}(\text{logsumexp}(logits)^2)$) for classifier numerical stability. |
 | **$\mathcal{L}_{\text{recon}}$ (Loss 1)** | $\lambda_{\text{recon}} = 0.08$ | **Compressive Reconstruction:** Lightweight cross-attention decoder reconstructs chunk tokens from write summary. Provides direct write-path gradients. |
 | **$\mathcal{L}_{\text{assoc}}$ (Loss 2)** | $\lambda_{\text{assoc}} = 1.2\times 10^{-4}$ (5% warmup) | **Associative Retrieval:** Titans-style surprise-weighted loss verifying post-write key $\to$ value retrieval from updated memory slots. |
 | **$\mathcal{L}_{\text{gate}}$ (Loss 3)** | $\lambda_{\text{gate}} = 1\times 10^{-3}$ | **Write-Gate Entropy:** Maximizes binary entropy $-\text{mean}(H(g))$ to prevent write gates from saturating at 0 or 1. |
@@ -166,9 +171,10 @@ When sequence length $L > \text{memory\_chunk\_size}$ (default 512):
 - **`WikiTextCyclicValidator`:** Runs periodic evaluation over sliding windows of `Salesforce/wikitext` validation split, computing exact validation CE, perplexity, and router auxiliary metrics.
 
 ### 5.3 Production Training Loop (`train.py`)
-- **Optimizer Split:**
+- **Optimizer Split (`model.core.builders`):**
   - **Muon:** 2D hidden layer weight matrices and MoE router projections (scaled by Moonshot RMS adjustment $\propto 0.2 \sqrt{\max(A,B)}$).
-  - **AdamW:** Embeddings (`embed_tokens`, `init_memory`, `summary_query`), LM head (`lm_head`), Conv1D, RMSNorm gains, and biases.
+  - **AdamW Decay Group:** LM head and 2D/3D projection matrices (`weight_decay > 0`).
+  - **AdamW No-Decay Group (`weight_decay = 0.0`):** 1D parameters, RMSNorm gains, biases, embeddings (`embed_tokens`, `init_memory`, `summary_query`), and SSM state decay parameters (`A_log`, `D`).
 - **Learning Rate Schedule:** Cosine decay with linear warmup (`_build_lr_lambda`).
 - **Mixed Precision & Autocast:** FP32 promotion for sensitive ops (`RMSNorm`, router logits, scan fallback recurrence, memory entropy/slot math).
 
@@ -187,32 +193,33 @@ CustomMistralmamba/
 │   ├── __init__.py                # Public API exports
 │   ├── README.md                  # Detailed architectural reference manual (24 sections)
 │   ├── core/                      # Configuration, dtype utilities, builders
-│   │   ├── builders.py            # count_trainable_params, build_test3_null_baseline_config
+│   │   ├── builders.py            # count_trainable_params, build_test3_null_baseline_config, split_muon_adam_params, build_adamw_param_groups
 │   │   ├── config.py              # MixtralConfig, HybridMambaMoEConfig, MambaCache
 │   │   ├── constants.py           # MEMORY_NAN_FIX_ID revision marker
 │   │   └── dtype.py               # FP32 promotion/restoration helpers
 │   ├── layers/                    # Shared Neural Primitives
-│   │   ├── attention.py           # SlidingWindowGQA (grouped-query sliding window)
+│   │   ├── attention.py           # SlidingWindowGQA (grouped-query sliding window, QK-Norm, Attention Sinks)
 │   │   ├── fusion.py              # TokenGatedFusion (O(L) per-token gating)
 │   │   ├── moe.py                 # DroplessMoELayer, MOERouter, SwiGLUExpert
 │   │   ├── norm.py                # RMSNorm (with FP32 precision promotion)
-│   │   └── rope.py                # RotaryEmbedding (fixed-size buffer cache)
+│   │   └── rope.py                # RotaryEmbedding (shared instance across layers)
 │   ├── mixtral/                   # Baseline Model Family
 │   │   └── model.py               # MixtralDecoderLayer, MixtralModel, MixtralForCausalLM
 │   └── hybrid/                    # Research Architecture
-│       ├── layer.py               # HybridDecoderLayer (dual branch + dual memory wiring)
+│       ├── layer.py               # HybridDecoderLayer (dual branch + dual memory wiring + layer_types routing)
 │       ├── losses.py              # Eight auxiliary losses & schedule functions
-│       ├── mamba.py               # MambaBlock (4-tier scan dispatch, incremental decode)
+│       ├── mamba.py               # MambaBlock (4-tier scan dispatch, vectorized prefill, incremental decode)
 │       ├── memory.py              # CompressiveMemoryBank, MemoryWriteBuffer, batched ops
 │       └── model.py               # HybridModel, HybridForCausalLM, chunked BPTT, generate()
 │
 ├── research/
 │   ├── research.md                # Research proposal, compute analysis, falsification plan
-│   ├── loss-definitions.md        # Mathematical specifications for all auxiliary losses
+│   ├── loss-definitions.md        # Mathematical specifications for all auxiliary losses & logit z-loss
 │   └── Improvement-suggestions.md # Backlog of deferred performance & scaling proposals
 │
 ├── scripts/
-│   ├── toy_train.py               # Minimal 5M-param standalone training smoke test
+│   ├── toy_train.py               # Minimal ~500K-param standalone training smoke test
+│   ├── eval_recall.py             # Synthetic associative recall & scientific falsification harness
 │   ├── test_cloud_train.py        # 150M-param IMDB training smoke test for cloud GPUs
 │   └── verify_model_package.py    # Import and API surface integrity check
 │
@@ -221,8 +228,9 @@ CustomMistralmamba/
 │   └── validation.py              # WikiTextCyclicValidator for periodic eval
 │
 └── tests/
-    ├── test_model.py              # 66 comprehensive unit tests covering all modules
-    └── test_toy_train_smoke.py    # End-to-end smoke test for scripts/toy_train.py
+    ├── test_model.py              # 73 comprehensive unit tests covering all modules
+    ├── test_toy_train_smoke.py    # Fast smoke test for scripts/toy_train.py
+    └── test_mixed_cpu_training.py # 50-step mixed CPU training test with NaN/Inf validation
 ```
 
 ---
@@ -264,7 +272,7 @@ Always use the virtual environment Python executable (`.\.venv\Scripts\python.ex
    ```
 3. Run a quick 10-step toy training smoke run:
    ```bash
-   .\.venv\Scripts\python.exe scripts/toy_train.py --steps 10 --batch-size 2 --seq-len 256
+   .\.venv\Scripts\python.exe scripts/toy_train.py --steps 10 --batch-size 2 --seq-len 128
    ```
 4. Run Ruff lint check:
    ```bash

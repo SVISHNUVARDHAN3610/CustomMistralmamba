@@ -20,13 +20,15 @@ Terminology here is aligned with the actual code (`CompressiveMemoryBank`, `Toke
 
 ## 2. Current training objective (implemented)
 
-`HybridForCausalLM` currently optimizes **three terms**:
+`HybridForCausalLM` optimizes the primary language modeling loss, routing stabilizers, output logit regularizer, and the eight weighted auxiliary terms:
 
 ```python
 loss = (
     ce_loss
     + router_aux_loss_coef * aux_loss  # default 0.02
     + router_z_loss_coef * z_loss  # default 5e-3
+    + final_logit_z_loss_coef * logit_z_loss  # default 0.0 (optional stabilizer)
+    + aux_total  # sum of the 8 auxiliary memory/fusion/SSM losses
 )
 ```
 
@@ -35,15 +37,10 @@ loss = (
 | Cross-entropy | `ce_loss` | `HybridForCausalLM.forward` | All parameters upstream of `lm_head` | 1.0 (implicit) |
 | Router load-balancing | `aux_loss` | `MOERouter.forward` | `MOERouter.wg` — Switch Transformer style token/expert balance (Fedus et al., 2021) | 0.02 |
 | Router z-loss | `z_loss` | `MOERouter.forward` | `MOERouter.wg` — penalizes large `logsumexp` of router logits (ST-MoE stabilizer, Zoph et al., 2022) | 5e-3 |
+| Final Logit z-loss | `logit_z_loss` | `HybridForCausalLM.forward` | `lm_head` logits — penalizes large output logit dynamic range (PaLM / OLMo-2 stabilizer) | 0.0 (`final_logit_z_loss_coef`) |
+| Auxiliary losses | `aux_total` | `HybridForCausalLM._weighted_auxiliary_loss` | Dual memory banks, write gates, fusion gate balance, SSM state norm, slot diversity | Scheduled per term |
 
-**Not in the loss today:**
-
-- Memory read/write parameters (`CompressiveMemoryBank`)
-- Fusion gate (`TokenGatedFusion`)
-- Mamba SSM state (beyond indirect `ce_loss`)
-- Expert specialization beyond load balancing
-
-`gate_stats` (per-layer write-gate means) are computed and returned for **logging only** — they are `.detach()`-ed and never added to `loss`.
+`gate_stats` (per-layer write-gate means) are computed and returned for logging/telemetry.
 
 `label_ignore_index` (default `-100`) is applied via `CrossEntropyLoss(ignore_index=...)` and `_apply_label_ignore()` for padded label positions.
 
