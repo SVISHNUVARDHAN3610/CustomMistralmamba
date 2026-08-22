@@ -14,8 +14,10 @@ from model.core import (
     HybridMambaMoEConfig,
     MambaCache,
     MixtralConfig,
+    build_adamw_param_groups,
     build_test3_null_baseline_config,
     count_trainable_params,
+    split_muon_adam_params,
 )
 from model.hybrid import (
     CompressiveMemoryBank,
@@ -76,6 +78,7 @@ __all__ = [
     "associative_retrieval_loss",
     "batched_dual_memory_read",
     "batched_dual_memory_write",
+    "build_adamw_param_groups",
     "build_test3_null_baseline_config",
     "count_trainable_params",
     "fused_mamba_scan_available",
@@ -83,4 +86,5 @@ __all__ = [
     "log_mamba_backend",
     "probe_mamba_scan_timing",
     "reset_mamba_scan_stats",
+    "split_muon_adam_params",
 ]

@@ -49,6 +49,18 @@ class MixtralConfig:
     # If True, lm_head.weight shares storage with embed_tokens.weight.
     tie_word_embeddings: bool = False
 
+    # QK-Normalization (applies RMSNorm per head to query and key states).
+    use_qk_norm: bool = False
+
+    # Number of initial token slots permanently retained in sliding-window KV cache (StreamingLLM attention sinks).
+    attention_sink_size: int = 0
+
+    # Optional z-loss on final vocabulary logits (PaLM / OLMo-2 style stability regularizer).
+    final_logit_z_loss_coef: float = 0.0
+
+    # Optional layer topology pattern (e.g. ["hybrid", "mamba_only", ...]). None defaults to all hybrid/standard.
+    layer_types: list[str] | None = None
+
     def to_dict(self) -> dict[str, Any]:
         """Serializes configuration parameters to a dictionary layout."""
         return asdict(self)

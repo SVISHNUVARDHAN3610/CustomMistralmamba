@@ -39,10 +39,12 @@ PUBLIC_SYMBOLS = [
     "HybridMambaMoEConfig",
     "MixtralConfig",
     "MixtralForCausalLM",
+    "build_adamw_param_groups",
     "build_test3_null_baseline_config",
     "count_trainable_params",
     "fused_mamba_scan_available",
     "log_mamba_backend",
+    "split_muon_adam_params",
 ]
 
 

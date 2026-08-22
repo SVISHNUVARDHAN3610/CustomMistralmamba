@@ -30,6 +30,7 @@ from model.layers.attention import SlidingWindowGQA
 from model.layers.fusion import TokenGatedFusion
 from model.layers.moe import DroplessMoELayer, MOERouter, SwiGLUExpert
 from model.layers.norm import RMSNorm
+from model.layers.rope import RotaryEmbedding
 
 
 def _hybrid_layer_forward(
@@ -90,14 +91,20 @@ class HybridDecoderLayer(nn.Module):
     write back — not the memory-augmented tensors.
     """
 
-    def __init__(self, config: HybridMambaMoEConfig) -> None:
+    def __init__(
+        self,
+        config: HybridMambaMoEConfig,
+        rotary_emb: RotaryEmbedding | None = None,
+        layer_type: str = "hybrid",
+    ) -> None:
         super().__init__()
         self.config = config
+        self.layer_type = layer_type
         self.use_dual_memory = config.use_dual_memory
         self.use_auxiliary_losses = config.use_auxiliary_losses
 
         self.rmsnorm_in = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attention_block = SlidingWindowGQA(config)
+        self.attention_block = SlidingWindowGQA(config, rotary_emb=rotary_emb)
         self.mamba_block = MambaBlock(
             hidden_size=config.hidden_size,
             state_size=config.mamba_state_size,
@@ -253,26 +260,36 @@ class HybridDecoderLayer(nn.Module):
             attn_input = attn_input * hidden_mask
             mamba_input = mamba_input * hidden_mask
 
-        attn_out, present_key_value = self.attention_block(
-            attn_input,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-            active_batch_mask=active_batch_mask,
-        )
-        mamba_token_mask = token_attention_mask
-        mamba_out, new_mamba_cache, ssm_state = self.mamba_block(
-            mamba_input,
-            cache=mamba_cache,
-            use_cache=use_cache,
-            attention_mask=mamba_token_mask,
-            active_batch_mask=active_batch_mask,
-            debug_state_checks=cfg.debug_state_checks,
-            batch_has_padding=batch_has_padding,
-            mamba_internal_checkpoint=cfg.mamba_internal_checkpoint,
-            layer_checkpointing_active=layer_checkpointing_active,
-        )
+        if self.layer_type == "mamba_only":
+            attn_out = torch.zeros_like(attn_input)
+            present_key_value = None
+        else:
+            attn_out, present_key_value = self.attention_block(
+                attn_input,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+                active_batch_mask=active_batch_mask,
+            )
+
+        if self.layer_type == "attn_only":
+            mamba_out = torch.zeros_like(mamba_input)
+            new_mamba_cache = None
+            ssm_state = None
+        else:
+            mamba_token_mask = token_attention_mask
+            mamba_out, new_mamba_cache, ssm_state = self.mamba_block(
+                mamba_input,
+                cache=mamba_cache,
+                use_cache=use_cache,
+                attention_mask=mamba_token_mask,
+                active_batch_mask=active_batch_mask,
+                debug_state_checks=cfg.debug_state_checks,
+                batch_has_padding=batch_has_padding,
+                mamba_internal_checkpoint=cfg.mamba_internal_checkpoint,
+                layer_checkpointing_active=layer_checkpointing_active,
+            )
 
         if self.use_dual_memory:
             assert memory_state is not None
@@ -442,7 +459,18 @@ class HybridDecoderLayer(nn.Module):
                         slot=_restore_dtype(slot_loss, x.dtype),
                     )
 
-        fused, fusion_gate = self.fusion(attn_out, mamba_out)
+        if self.layer_type == "mamba_only":
+            fused = mamba_out
+            fusion_gate = torch.zeros(
+                x.size(0), x.size(1), 1, device=x.device, dtype=x.dtype
+            )
+        elif self.layer_type == "attn_only":
+            fused = attn_out
+            fusion_gate = torch.ones(
+                x.size(0), x.size(1), 1, device=x.device, dtype=x.dtype
+            )
+        else:
+            fused, fusion_gate = self.fusion(attn_out, mamba_out)
         if hidden_mask is not None:
             fused = fused * hidden_mask
         x = residual + fused

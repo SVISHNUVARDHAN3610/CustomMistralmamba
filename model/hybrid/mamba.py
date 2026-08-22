@@ -320,21 +320,22 @@ class MambaBlock(nn.Module):
             if attention_mask is not None and attention_mask.dim() == 2:
                 token_mask = attention_mask[:, -seq_len:]
                 _assert_right_padded_attention_mask(token_mask, debug_state_checks)
-                # Right-padding assumption: valid prefix length per row.
                 valid_lens = token_mask.sum(dim=1)
-                conv_state = torch.zeros(
-                    x.size(0),
-                    self.d_inner,
-                    self.conv_kernel,
-                    device=x.device,
-                    dtype=x_in.dtype,
+                k_idx = torch.arange(self.conv_kernel, device=x.device).unsqueeze(0)
+                v_len = valid_lens.unsqueeze(1)
+                gather_idx = v_len - self.conv_kernel + k_idx
+                valid_mask = (gather_idx >= 0) & (v_len > 0)
+                clamped_idx = gather_idx.clamp(min=0, max=seq_len - 1)
+                gathered = torch.gather(
+                    x_in, 1, clamped_idx.unsqueeze(-1).expand(-1, -1, self.d_inner)
                 )
-                for b in range(x.size(0)):
-                    vl = int(valid_lens[b].item())
-                    if vl <= 0:
-                        continue
-                    take = min(self.conv_kernel, vl)
-                    conv_state[b, :, -take:] = x_in[b, vl - take : vl].transpose(0, 1)
+                conv_state = (
+                    torch.where(
+                        valid_mask.unsqueeze(-1), gathered, torch.zeros_like(gathered)
+                    )
+                    .transpose(1, 2)
+                    .contiguous()
+                )
             else:
                 pad = max(self.conv_kernel - seq_len, 0)
                 conv_state = F.pad(x_conv, (pad, 0))[

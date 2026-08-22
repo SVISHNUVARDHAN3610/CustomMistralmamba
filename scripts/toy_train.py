@@ -21,29 +21,43 @@ from model.hybrid.mamba import log_mamba_backend
 from model.hybrid.model import HybridForCausalLM
 
 
-def build_toy_config() -> HybridMambaMoEConfig:
-    """~5M trainable params (excluding training-only aux modules from budget check)."""
+def build_toy_config(
+    vocab_size: int = 256,
+    hidden_size: int = 64,
+    num_layers: int = 2,
+    num_heads: int = 2,
+    num_kv_heads: int = 1,
+    head_dim: int = 32,
+    intermediate_size: int = 128,
+    window_size: int = 32,
+    num_experts: int = 2,
+    top_k: int = 1,
+    memory_size: int = 8,
+    memory_num_heads: int = 2,
+    memory_chunk_size: int = 64,
+) -> HybridMambaMoEConfig:
+    """Minimal, ultra-lightweight toy config for rapid CPU development and debugging (~500K params)."""
     return HybridMambaMoEConfig(
-        vocab_size=512,
-        hidden_size=128,
-        num_layers=5,
-        num_heads=4,
-        num_kv_heads=2,
-        head_dim=32,
-        intermediate_size=192,
-        window_size=64,
-        num_experts=4,
-        top_k=2,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        intermediate_size=intermediate_size,
+        window_size=window_size,
+        num_experts=num_experts,
+        top_k=top_k,
         dropout=0.0,
         capacity_factor=None,
-        max_position_embeddings=1024,
+        max_position_embeddings=512,
         mamba_state_size=8,
         mamba_conv_kernel=4,
         mamba_expand=2,
         use_dual_memory=True,
-        memory_size=32,
-        memory_num_heads=4,
-        memory_chunk_size=256,
+        memory_size=memory_size,
+        memory_num_heads=memory_num_heads,
+        memory_chunk_size=memory_chunk_size,
         stream_chunked_ce_loss=True,
         return_logits=False,
         use_auxiliary_losses=True,
@@ -76,13 +90,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Toy Hybrid Mamba-MoE training smoke test"
     )
-    parser.add_argument("--steps", type=int, default=100)
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--seq-len", type=int, default=768)
+    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--seq-len", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument(
         "--log-jsonl",
         type=Path,
@@ -110,7 +124,7 @@ def main() -> None:
     print(log_mamba_backend(cfg))
     model = HybridForCausalLM(cfg).to(device)
     n_params = count_trainable_params(model)
-    print(f"trainable_params={n_params:,} (target ~5M)")
+    print(f"trainable_params={n_params:,} (minimal toy test)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     log_path = args.log_jsonl if str(args.log_jsonl) else None

@@ -1644,6 +1644,69 @@ class TestHybridModel(unittest.TestCase):
         gen_eager = eager.generate(prompt, max_new_tokens=4, do_sample=False)
         self.assertTrue(torch.equal(gen_graph, gen_eager))
 
+    def test_qk_norm_forward_backward(self) -> None:
+        cfg = _small_hybrid_config(use_qk_norm=True)
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (2, 16))
+        labels = torch.randint(0, cfg.vocab_size, (2, 16))
+        out = model(input_ids=ids, labels=labels)
+        self.assertIsNotNone(out.loss)
+        out.loss.backward()
+        q_norm_w = model.model.layers[0].attention_block.q_norm.weight
+        self.assertIsNotNone(q_norm_w.grad)
+        self.assertTrue(torch.isfinite(q_norm_w.grad).all())
+
+    def test_attention_sinks_forward_and_generate(self) -> None:
+        cfg = _small_hybrid_config(window_size=8, attention_sink_size=2)
+        model = HybridForCausalLM(cfg).eval()
+        prompt = torch.randint(1, cfg.vocab_size, (2, 16))
+        gen = model.generate(prompt, max_new_tokens=10, do_sample=False)
+        self.assertEqual(gen.shape, (2, 26))
+
+    def test_layer_types_interleaving(self) -> None:
+        cfg = _small_hybrid_config(num_layers=2, layer_types=["mamba_only", "attn_only"])
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (2, 16))
+        labels = torch.randint(0, cfg.vocab_size, (2, 16))
+        out = model(input_ids=ids, labels=labels)
+        self.assertIsNotNone(out.loss)
+        out.loss.backward()
+        self.assertEqual(out.logits.shape, (2, 16, cfg.vocab_size))
+
+    def test_shared_rope_cache(self) -> None:
+        cfg = _small_hybrid_config(num_layers=2)
+        model = HybridForCausalLM(cfg)
+        layer0_rope = model.model.layers[0].attention_block.rotary_emb
+        layer1_rope = model.model.layers[1].attention_block.rotary_emb
+        self.assertIs(layer0_rope, layer1_rope)
+        self.assertIs(layer0_rope, model.model.rotary_emb)
+
+    def test_optimizer_partitioning_no_weight_decay(self) -> None:
+        from model.core.builders import build_adamw_param_groups, split_muon_adam_params
+
+        cfg = _small_hybrid_config()
+        model = HybridForCausalLM(cfg)
+        adam_params, _muon_params, inventory, param_names = split_muon_adam_params(model)
+
+        # A_log and D must be in AdamW
+        a_log_found = any("A_log" in name for name in inventory["adamw"])
+        d_found = any("D" in name for name in inventory["adamw"])
+        self.assertTrue(a_log_found, "A_log must be in AdamW parameter group")
+        self.assertTrue(d_found, "D must be in AdamW parameter group")
+
+        # Test build_adamw_param_groups
+        groups = build_adamw_param_groups(adam_params, weight_decay=0.1, name_lookup=param_names)
+        self.assertEqual(len(groups), 2)
+        decay_group = next(g for g in groups if g["weight_decay"] > 0)
+        self.assertEqual(decay_group["weight_decay"], 0.1)
+        no_decay_group = next(g for g in groups if g["weight_decay"] == 0.0)
+
+        # No-decay group must contain A_log, D, norm, embed
+        no_decay_names = [param_names[id(p)] for p in no_decay_group["params"]]
+        self.assertTrue(any("A_log" in n for n in no_decay_names))
+        self.assertTrue(any("D" in n for n in no_decay_names))
+        self.assertTrue(any("norm" in n for n in no_decay_names))
+
 
 if __name__ == "__main__":
     unittest.main()

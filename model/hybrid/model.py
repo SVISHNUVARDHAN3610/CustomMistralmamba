@@ -30,6 +30,7 @@ from model.hybrid.memory import (
     batched_dual_memory_write,
 )
 from model.layers.norm import RMSNorm
+from model.layers.rope import RotaryEmbedding
 
 
 def _top_k_filter(logits: Tensor, top_k: int) -> Tensor:
@@ -73,8 +74,26 @@ class HybridModel(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.rotary_emb = RotaryEmbedding(
+            dim=config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+        layer_types = config.layer_types
+        if layer_types is None:
+            layer_types = ["hybrid"] * config.num_layers
+        elif len(layer_types) != config.num_layers:
+            raise ValueError(
+                f"len(config.layer_types)={len(layer_types)} != num_layers={config.num_layers}"
+            )
+
         layers: list[HybridDecoderLayer] = [
-            HybridDecoderLayer(config) for _ in range(config.num_layers)
+            HybridDecoderLayer(
+                config,
+                rotary_emb=self.rotary_emb,
+                layer_type=layer_types[i],
+            )
+            for i in range(config.num_layers)
         ]
         if config.use_torch_compile:
             if config.gradient_checkpointing:
@@ -1004,7 +1023,10 @@ class HybridForCausalLM(nn.Module):
                 end = min(start + write_interval, prompt_len)
                 chunk = generated_buf[:, start:end]
                 chunk_mask = attn_buf[:, :end]
-                if chunk_mask.size(1) > self.config.window_size:
+                if (
+                    chunk_mask.size(1) > self.config.window_size
+                    and chunk.size(1) <= self.config.window_size
+                ):
                     chunk_mask = chunk_mask[:, -self.config.window_size :]
                 chunk_pos = (
                     torch.arange(start, end, dtype=torch.long, device=device)

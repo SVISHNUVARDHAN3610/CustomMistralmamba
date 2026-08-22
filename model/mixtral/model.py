@@ -10,13 +10,18 @@ from model.core.config import MixtralConfig
 from model.layers.attention import SlidingWindowGQA
 from model.layers.moe import DroplessMoELayer, MOERouter, SwiGLUExpert
 from model.layers.norm import RMSNorm
+from model.layers.rope import RotaryEmbedding
 
 
 class MixtralDecoderLayer(nn.Module):
-    def __init__(self, config: MixtralConfig) -> None:
+    def __init__(
+        self,
+        config: MixtralConfig,
+        rotary_emb: RotaryEmbedding | None = None,
+    ) -> None:
         super().__init__()
         self.rmsnorm_attn = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attention_block = SlidingWindowGQA(config)
+        self.attention_block = SlidingWindowGQA(config, rotary_emb=rotary_emb)
         self.rmsnorm_moe = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         router = MOERouter(
@@ -91,8 +96,16 @@ class MixtralModel(nn.Module):
     def __init__(self, config: MixtralConfig) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.rotary_emb = RotaryEmbedding(
+            dim=config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
         self.layers = nn.ModuleList(
-            [MixtralDecoderLayer(config) for _ in range(config.num_layers)]
+            [
+                MixtralDecoderLayer(config, rotary_emb=self.rotary_emb)
+                for _ in range(config.num_layers)
+            ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

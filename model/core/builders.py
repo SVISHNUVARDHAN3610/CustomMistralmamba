@@ -74,3 +74,84 @@ def build_test3_null_baseline_config(
         )
 
     return null_config
+
+
+_ADAMW_NAME_SUBSTRINGS = (
+    "embed_tokens",
+    "lm_head",
+    "init_memory",
+    "summary_query",
+    "A_log",
+    "dt_proj",
+)
+
+
+def _is_adamw_parameter(name: str, param: nn.Parameter) -> bool:
+    """True when Muon must not own this parameter."""
+    if getattr(param, "_no_weight_decay", False):
+        return True
+    if param.ndim != 2:
+        return True
+    return any(key in name for key in _ADAMW_NAME_SUBSTRINGS)
+
+
+def split_muon_adam_params(
+    model: nn.Module,
+) -> tuple[list[nn.Parameter], list[nn.Parameter], dict[str, list[str]], dict[int, str]]:
+    """Split parameters into AdamW vs Muon groups with name inventories."""
+    adam_params: list[nn.Parameter] = []
+    muon_params: list[nn.Parameter] = []
+    inventory: dict[str, list[str]] = {"adamw": [], "muon": []}
+    param_names: dict[int, str] = {}
+    seen: set[int] = set()
+
+    for name, param in model.named_parameters():
+        param_id = id(param)
+        param_names[param_id] = name
+        if param_id in seen:
+            continue
+        seen.add(param_id)
+
+        if _is_adamw_parameter(name, param):
+            adam_params.append(param)
+            inventory["adamw"].append(f"{name}{tuple(param.shape)}")
+        else:
+            muon_params.append(param)
+            inventory["muon"].append(f"{name}{tuple(param.shape)}")
+
+    return adam_params, muon_params, inventory, param_names
+
+
+def build_adamw_param_groups(
+    params: list[nn.Parameter],
+    weight_decay: float,
+    name_lookup: dict[int, str] | None = None,
+) -> list[dict[str, object]]:
+    """Split AdamW parameters into weight-decay and no-decay groups."""
+    decay_params: list[nn.Parameter] = []
+    no_decay_params: list[nn.Parameter] = []
+
+    for param in params:
+        param_name = name_lookup.get(id(param), "") if name_lookup else ""
+        is_no_decay = (
+            getattr(param, "_no_weight_decay", False)
+            or param.ndim < 2
+            or "norm" in param_name
+            or "bias" in param_name
+            or "embed_tokens" in param_name
+            or "init_memory" in param_name
+            or "summary_query" in param_name
+            or "A_log" in param_name
+            or "D" in param_name
+        )
+        if is_no_decay:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    groups: list[dict[str, object]] = []
+    if decay_params:
+        groups.append({"params": decay_params, "weight_decay": weight_decay})
+    if no_decay_params:
+        groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    return groups

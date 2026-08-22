@@ -5,23 +5,21 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from model.core.config import MixtralConfig
+from model.layers.norm import RMSNorm
 from model.layers.rope import RotaryEmbedding, apply_rotary_pos_emb
 
 
 class SlidingWindowGQA(nn.Module):
     """
     Sliding-window grouped-query attention using SDPA only.
-
-    The flex_attention experimental path was removed: it depended on a
-    module-level global (`_CURRENT_PADDING_MASK`) that is unsafe with FSDP
-    (concurrent forward passes across wrapped layers/ranks can race on it),
-    it indexed the padding mask with block-local `kv_idx` instead of the
-    global sequence index (semantically wrong), and it was unsupported on
-    T4 (compute capability 7.5) in any case -- the previous code even forced
-    `HAS_FLEX = False` unconditionally, so this path was already dead code.
+    Supports QK-Normalization, StreamingLLM attention sinks, and shared RoPE caches.
     """
 
-    def __init__(self, config: MixtralConfig) -> None:
+    def __init__(
+        self,
+        config: MixtralConfig,
+        rotary_emb: RotaryEmbedding | None = None,
+    ) -> None:
         super().__init__()
 
         self.hidden_size = config.hidden_size
@@ -30,6 +28,8 @@ class SlidingWindowGQA(nn.Module):
         self.window_size = config.window_size
         self.head_dim = config.head_dim
         self.dropout = config.dropout
+        self.use_qk_norm = getattr(config, "use_qk_norm", False)
+        self.attention_sink_size = getattr(config, "attention_sink_size", 0)
 
         assert self.num_heads % self.num_kv_heads == 0, (
             f"Configuration Error: num_heads ({self.num_heads}) must be perfectly divisible by num_kv_heads ({self.num_kv_heads})."
@@ -51,11 +51,21 @@ class SlidingWindowGQA(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.rotary_emb = RotaryEmbedding(
-            dim=self.head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-        )
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
+
+        if rotary_emb is not None:
+            self.rotary_emb = rotary_emb
+        else:
+            self.rotary_emb = RotaryEmbedding(
+                dim=self.head_dim,
+                max_position_embeddings=config.max_position_embeddings,
+                base=config.rope_theta,
+            )
         self._sliding_mask_cache: dict[tuple[int, int, str], Tensor] = {}
         self._sliding_mask_cache_max = 64
 
@@ -98,6 +108,11 @@ class SlidingWindowGQA(nn.Module):
             .transpose(1, 2)
         )
 
+        if self.q_norm is not None:
+            query_states = self.q_norm(query_states)
+        if self.k_norm is not None:
+            key_states = self.k_norm(key_states)
+
         cos, sin = self.rotary_emb(
             value_states, seq_len=seq_len, position_ids=position_ids
         )
@@ -110,16 +125,35 @@ class SlidingWindowGQA(nn.Module):
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
         if key_states.size(2) > self.window_size:
-            key_states = key_states[:, :, -self.window_size :, :]
-            value_states = value_states[:, :, -self.window_size :, :]
-            # Padding mask must match truncated KV length, or the `&` with
-            # sliding_causal_mask raises a shape mismatch once seq_len >
-            # window_size (latent during generate() with a mask present).
-            if attention_mask is not None:
-                if attention_mask.dim() == 2:
-                    attention_mask = attention_mask[:, -self.window_size :]
-                elif attention_mask.dim() == 4:
-                    attention_mask = attention_mask[:, :, :, -self.window_size :]
+            sink = min(self.attention_sink_size, self.window_size - 1)
+            if sink > 0:
+                recent = self.window_size - sink
+                key_states = torch.cat(
+                    [key_states[:, :, :sink, :], key_states[:, :, -recent:, :]], dim=2
+                )
+                value_states = torch.cat(
+                    [value_states[:, :, :sink, :], value_states[:, :, -recent:, :]], dim=2
+                )
+                if attention_mask is not None:
+                    if attention_mask.dim() == 2:
+                        attention_mask = torch.cat(
+                            [attention_mask[:, :sink], attention_mask[:, -recent:]], dim=1
+                        )
+                    elif attention_mask.dim() == 4:
+                        attention_mask = torch.cat(
+                            [attention_mask[:, :, :, :sink], attention_mask[:, :, :, -recent:]], dim=3
+                        )
+            else:
+                key_states = key_states[:, :, -self.window_size :, :]
+                value_states = value_states[:, :, -self.window_size :, :]
+                # Padding mask must match truncated KV length, or the `&` with
+                # sliding_causal_mask raises a shape mismatch once seq_len >
+                # window_size (latent during generate() with a mask present).
+                if attention_mask is not None:
+                    if attention_mask.dim() == 2:
+                        attention_mask = attention_mask[:, -self.window_size :]
+                    elif attention_mask.dim() == 4:
+                        attention_mask = attention_mask[:, :, :, -self.window_size :]
 
         # Cache only the sliding window (O(1) in L for decode), not the
         # full history — RoPE is already baked into cached K.
@@ -131,16 +165,21 @@ class SlidingWindowGQA(nn.Module):
         key_states_r = self._repeat_kv(key_states, num_queries_per_kv)
         value_states_r = self._repeat_kv(value_states, num_queries_per_kv)
 
-        mask_key = (seq_len, kv_seq_len, str(device))
+        mask_key = (seq_len, kv_seq_len, str(device), self.attention_sink_size)
         sliding_causal_mask = self._sliding_mask_cache.get(mask_key)
         if sliding_causal_mask is None:
             row_idx = torch.arange(seq_len, device=device).unsqueeze(1) + (
                 kv_seq_len - seq_len
             )
             col_idx = torch.arange(kv_seq_len, device=device).unsqueeze(0)
-            sliding_causal_mask = (row_idx >= col_idx) & (
+            window_causal = (row_idx >= col_idx) & (
                 (row_idx - col_idx) < self.window_size
             )
+            if self.attention_sink_size > 0:
+                is_sink = (col_idx < self.attention_sink_size) & (row_idx >= col_idx)
+                sliding_causal_mask = is_sink | window_causal
+            else:
+                sliding_causal_mask = window_causal
             if len(self._sliding_mask_cache) >= self._sliding_mask_cache_max:
                 self._sliding_mask_cache.clear()
             self._sliding_mask_cache[mask_key] = sliding_causal_mask
