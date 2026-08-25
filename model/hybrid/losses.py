@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from model.core.dtype import _is_low_precision, _promote_fp32
+from model.core.dtype import _is_low_precision, _promote_fp32, _restore_dtype
 
 if TYPE_CHECKING:
     from model.hybrid.memory import CompressiveMemoryBank
@@ -189,12 +189,16 @@ class MemoryReconstructionDecoder(nn.Module):
         q = self._shape_heads(self.q_proj(x), q_len)
         k = self._shape_heads(self.k_proj(summary), k_len)
         v = self._shape_heads(self.v_proj(summary), k_len)
+        # Promote v alongside q/k so native-bf16 callers don't hit an
+        # fp32-attn x bf16-v matmul outside autocast (mirrors memory.py).
         if _is_low_precision(x.dtype):
             q = _promote_fp32(q)
             k = _promote_fp32(k)
+            v = _promote_fp32(v)
         scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, v)
+        out = _restore_dtype(out, x.dtype)
         out = out.transpose(1, 2).contiguous().view(x.size(0), q_len, -1)
         return self.out_proj(out)
 

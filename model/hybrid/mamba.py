@@ -518,7 +518,13 @@ class MambaBlock(nn.Module):
         use_scan_checkpoint = (
             training and mamba_internal_checkpoint and not layer_checkpointing_active
         )
-        if use_parallel_scan or seq_len <= parallel_scan_fallback_max_len:
+        # `blocked_scan_min_len` is the intended lower bound of the blocked
+        # tier: raising it above `parallel_scan_fallback_max_len` extends the
+        # parallel tier to match. Lowering it below that ceiling has no effect
+        # (the parallel tier keeps priority). With the defaults (4096/4096)
+        # this reduces to the original two-knob dispatch exactly.
+        parallel_limit = max(parallel_scan_fallback_max_len, blocked_scan_min_len - 1)
+        if use_parallel_scan or seq_len <= parallel_limit:
             return cls._parallel_associative_scan(delta_a, delta_b_u)
         if seq_len <= sequential_scan_min_len:
             scan_fn = lambda a, b: cls._blocked_associative_scan(

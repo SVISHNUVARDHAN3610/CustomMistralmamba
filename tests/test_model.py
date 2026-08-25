@@ -384,6 +384,120 @@ class TestHybridModel(unittest.TestCase):
         self.assertEqual(decode_inputs[0][0, 0].item(), 0)
         self.assertNotEqual(decode_inputs[0][1, 0].item(), 0)
 
+    def test_generate_return_logits_false_works(self) -> None:
+        """H1 regression: as-trained configs ship return_logits=False; generate()
+        must force logit materialization instead of crashing on None logits."""
+        cfg = _small_hybrid_config(return_logits=False)
+        model = HybridForCausalLM(cfg).eval()
+        prompt = torch.randint(1, cfg.vocab_size, (1, 5))
+        gen = model.generate(prompt, max_new_tokens=3, do_sample=False)
+        self.assertEqual(gen.shape[1], 8)
+        self.assertTrue(((gen >= 0) & (gen < cfg.vocab_size)).all())
+        # The flag must be restored afterwards.
+        self.assertFalse(cfg.return_logits)
+
+    def test_generate_empty_prompt_raises(self) -> None:
+        """P16: empty prompts fail loudly, not with a bare AssertionError."""
+        cfg = _small_hybrid_config()
+        model = HybridForCausalLM(cfg).eval()
+        with self.assertRaises(ValueError):
+            model.generate(torch.zeros(1, 0, dtype=torch.long), max_new_tokens=2)
+
+    def test_generate_negative_eos_disables_stopping(self) -> None:
+        """P17: eos_token_id < 0 must fully disable EOS early-stopping."""
+        cfg = _small_hybrid_config()
+        model = HybridForCausalLM(cfg).eval()
+        prompt = torch.randint(1, cfg.vocab_size, (2, 4))
+        gen = model.generate(prompt, max_new_tokens=6, do_sample=False, eos_token_id=-1)
+        self.assertEqual(gen.shape[1], 10)
+
+    def test_generate_batched_decode_positions_per_row(self) -> None:
+        """M1: decode positions come from each row's valid-token count, not the
+        padded batch width (shorter rows previously got pad-inflated RoPE)."""
+        cfg = _small_hybrid_config()
+        model = HybridForCausalLM(cfg).eval()
+
+        ids_short = torch.randint(1, cfg.vocab_size, (1, 4))
+        ids_long = torch.randint(1, cfg.vocab_size, (1, 8))
+        padded_short = torch.cat(
+            [ids_short, torch.full((1, 4), cfg.pad_token_id, dtype=torch.long)],
+            dim=1,
+        )
+        # Two rows batched to the same padded width: row 0 has 4 valid tokens,
+        # row 1 has 8.
+        batch_ids = torch.cat([padded_short, ids_long], dim=0)
+        batch_mask = torch.cat(
+            [
+                torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0]], dtype=torch.long),
+                torch.ones(1, 8, dtype=torch.long),
+            ],
+            dim=0,
+        )
+
+        captured: list[tuple[int, torch.Tensor]] = []
+        orig_forward = model.forward
+
+        def spy_forward(*args, **kwargs):
+            pos = kwargs.get("position_ids")
+            seq_len = kwargs["input_ids"].size(1)
+            if pos is not None:
+                captured.append((seq_len, pos.detach().clone()))
+            return orig_forward(*args, **kwargs)
+
+        model.forward = spy_forward  # type: ignore[method-assign]
+        model.generate(
+            batch_ids,
+            attention_mask=batch_mask,
+            max_new_tokens=2,
+            do_sample=False,
+        )
+
+        prefill_pos = dict(captured)[8]
+        # Row 0 pads clamp to their left neighbor's position (masked anyway).
+        self.assertEqual(prefill_pos[0].tolist(), [0, 1, 2, 3, 3, 3, 3, 3])
+        self.assertEqual(prefill_pos[1].tolist(), [0, 1, 2, 3, 4, 5, 6, 7])
+
+        decode_positions = [pos for length, pos in captured if length == 1]
+        self.assertEqual(len(decode_positions), 2)
+        # First decoded token sits at index 4 (row 0) / 8 (row 1).
+        self.assertEqual(decode_positions[0].flatten().tolist(), [4, 8])
+        self.assertEqual(decode_positions[1].flatten().tolist(), [5, 9])
+
+    def test_chunked_cached_with_pads_matches_full(self) -> None:
+        """P2/P3 settling test: sink re-tagging and `within_window` distances
+        stay correct for multi-token cached chunks with interior padding once
+        the KV cache has started evicting (post-eviction alignment)."""
+        cfg = _small_hybrid_config(num_sink_tokens=2, window_size=16)
+        model = HybridForCausalLM(cfg).eval()
+
+        ids = torch.randint(1, cfg.vocab_size, (1, 24))
+        mask = torch.ones(1, 24, dtype=torch.long)
+        mask[0, 5] = 0  # interior pad inside the first chunk
+        mask[0, 19] = 0  # interior pad inside the second chunk
+        ids[0, 5] = cfg.pad_token_id
+        ids[0, 19] = cfg.pad_token_id
+
+        full = model(input_ids=ids, attention_mask=mask, use_cache=False)
+
+        first = model(
+            input_ids=ids[:, :16], attention_mask=mask[:, :16], use_cache=True
+        )
+        second = model(
+            input_ids=ids[:, 16:],
+            attention_mask=mask,
+            past_key_values=first.past_key_values,
+            memory_states=first.memory_states,
+            mamba_caches=first.mamba_caches,
+            past_seen_tokens=16,
+            use_cache=False,
+        )
+        cos = torch.nn.functional.cosine_similarity(
+            second.logits[:, -1].float(),
+            full.logits[:, -1].float(),
+            dim=-1,
+        )
+        self.assertGreater(float(cos), 0.99)
+
     def test_moe_capacity_eval_deterministic(self) -> None:
         """Eval mode with capacity_factor should be order-stable across seeds."""
         cfg = _small_hybrid_config(capacity_factor=1.0, num_experts=2, top_k=1)

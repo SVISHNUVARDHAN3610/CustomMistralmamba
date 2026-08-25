@@ -123,6 +123,9 @@ class HybridMambaMoEConfig(MixtralConfig):
     decode_write_fast_threshold: int = 4
     use_torch_compile: bool = False
     torch_compile_mode: str = "default"
+    # DEPRECATED no-op (kept so old checkpoints/configs load): the CUDA-graph
+    # decode runner was removed — capture/replay silently corrupted recurrent
+    # state. generate() warns once and decodes eagerly when this is True.
     use_cuda_graph: bool = False
 
     # Chunked training: stream CE per chunk to avoid materializing [B, L, V].

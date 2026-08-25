@@ -37,7 +37,9 @@ jobs:
           cache: pip
 
       - name: Install ruff
-        run: pip install ruff
+        # Pinned so local pre-commit / CI / requirements.txt all lint with the
+        # same ruff revision (unpinned installs drift and flip format rules).
+        run: pip install "ruff==0.16.2"
 
       - name: Run ruff
         run: |
@@ -60,3 +62,8 @@ jobs:
 
       - name: Run unit tests
         run: python -m unittest tests.test_model -v
+
+      - name: Run training smoke test
+        # The only gate exercising chunked-BPTT *backward* (the unit suite
+        # covers forward parity); a regression here previously shipped green.
+        run: python -m unittest tests.test_toy_train_smoke -v

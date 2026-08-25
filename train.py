@@ -114,7 +114,7 @@ def seed_worker(worker_id: int) -> None:
 
 
 def build_training_config(vocab_size: int) -> HybridMambaMoEConfig:
-    """Default ~80–120M Hybrid config aligned with the prior Mixtral-scale run."""
+    """Default production Hybrid config (~148M trainable params, measured)."""
     hidden_size = 512
     num_heads = 8
     head_dim = 64
@@ -459,10 +459,22 @@ def _non_finite_diagnosis(
 
 
 def _rng_state_dict() -> dict[str, Any]:
+    """RNG states serialized weights_only-safely (primitives + tensors only).
+
+    The NumPy Mersenne-Twister state contains an ndarray, which older
+    ``weights_only=True`` unpicklers reject — it is stored as a plain int list.
+    """
     state: dict[str, Any] = {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-        "torch": torch.get_rng_state(),
+        "python": random.getstate(),  # tuple of ints — pickle-safe
+        "torch": torch.get_rng_state(),  # uint8 tensor
+    }
+    np_state = np.random.get_state()
+    state["numpy"] = {
+        "bit_generator": str(np_state[0]),
+        "key": np.asarray(np_state[1]).astype(np.int64).tolist(),
+        "pos": int(np_state[2]),
+        "has_gauss": int(np_state[3]),
+        "cached_gaussian": float(np_state[4]),
     }
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
@@ -473,24 +485,44 @@ def _load_rng_state_dict(state: dict[str, Any] | None) -> None:
     if not state:
         return
     if "python" in state:
-        random.setstate(state["python"])
+        random.setstate(_as_python_rng_state(state["python"]))
     if "numpy" in state:
-        np.random.set_state(state["numpy"])
+        np.random.set_state(_as_numpy_rng_state(state["numpy"]))
     if "torch" in state:
-        torch.set_rng_state(state["torch"])
+        torch.set_rng_state(_as_torch_rng_state(state["torch"]))
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        torch.cuda.set_rng_state_all([_as_torch_rng_state(s) for s in state["cuda"]])
 
 
-def _checkpoint_opt_sched(
-    optimizers: list[optim.Optimizer],
-    schedulers: list[torch.optim.lr_scheduler.LRScheduler],
-    use_muon: bool,
-) -> tuple[list[optim.Optimizer], list[torch.optim.lr_scheduler.LRScheduler]]:
-    """Normalize to [muon_or_adam, adam] layout expected by save/load_checkpoint."""
-    if use_muon:
-        return optimizers, schedulers
-    return [optimizers[0], optimizers[0]], [schedulers[0], schedulers[0]]
+def _as_python_rng_state(value: Any) -> Any:
+    """Accept both legacy pickled tuples and primitive-only encodings."""
+    if isinstance(value, dict):
+        return (
+            int(value["version"]),
+            tuple(int(k) for k in value["keys"]),
+            value.get("gauss_next"),
+        )
+    return value
+
+
+def _as_numpy_rng_state(value: Any) -> Any:
+    if isinstance(value, dict):
+        key = np.asarray(value["key"], dtype=np.int64).astype(np.uint32)
+        return (
+            str(value["bit_generator"]),
+            key,
+            int(value["pos"]),
+            int(value["has_gauss"]),
+            float(value["cached_gaussian"]),
+        )
+    # Legacy checkpoints hold the raw ('MT19937', ndarray, ...) tuple.
+    return value
+
+
+def _as_torch_rng_state(value: Any) -> torch.Tensor:
+    if isinstance(value, torch.Tensor):
+        return value.to(dtype=torch.uint8)
+    return torch.tensor(value, dtype=torch.uint8)
 
 
 def save_checkpoint(
@@ -503,29 +535,37 @@ def save_checkpoint(
     checkpoint_dir: Path,
     logger: logging.Logger,
     validator: WikiTextCyclicValidator | None = None,
+    use_muon: bool = True,
+    extra_payload: dict[str, Any] | None = None,
 ) -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = checkpoint_dir / CHECKPOINT_FILENAME
     tmp_path = ckpt_path.with_suffix(".pth.tmp")
 
-    payload = {
+    # In Muon mode optimizers=[muon, adam]; AdamW-only mode stores its single
+    # optimizer ONLY under the adam_* keys (previously the same state was
+    # duplicated under muon_* too, making cross-mode resume fail opaquely).
+    payload: dict[str, Any] = {
         "model_state_dict": model.state_dict(),
         "config": asdict(model.config),
         "global_step": global_step,
         "current_shard_idx": current_shard_idx,
         "rng_state": _rng_state_dict(),
         "memory_nan_fix_id": MEMORY_NAN_FIX_ID,
+        "use_muon": use_muon,
     }
     if validator is not None:
         payload["validator_state_dict"] = validator.state_dict
-    if len(optimizers) >= 1:
+    if use_muon:
         payload["muon_optimizer_state_dict"] = optimizers[0].state_dict()
-    if len(optimizers) >= 2:
-        payload["adam_optimizer_state_dict"] = optimizers[1].state_dict()
-    if len(schedulers) >= 1:
         payload["muon_scheduler_state_dict"] = schedulers[0].state_dict()
-    if len(schedulers) >= 2:
+        payload["adam_optimizer_state_dict"] = optimizers[1].state_dict()
         payload["adam_scheduler_state_dict"] = schedulers[1].state_dict()
+    else:
+        payload["adam_optimizer_state_dict"] = optimizers[0].state_dict()
+        payload["adam_scheduler_state_dict"] = schedulers[0].state_dict()
+    if extra_payload:
+        payload.update(extra_payload)
 
     torch.save(payload, tmp_path)
     os.replace(tmp_path, ckpt_path)
@@ -551,36 +591,96 @@ def load_checkpoint(
     device: torch.device,
     logger: logging.Logger,
     validator: WikiTextCyclicValidator | None = None,
+    use_muon: bool | None = None,
+    dl_generator: torch.Generator | None = None,
 ) -> tuple[int, int]:
     ckpt_path = checkpoint_dir / CHECKPOINT_FILENAME
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    try:
+        # Checkpoints contain tensors + primitives only (see _rng_state_dict);
+        # loading without pickle execution closes the arbitrary-code hole for
+        # untrusted/shared checkpoint files.
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=True)
+    except Exception as exc:  # noqa: BLE001 - legacy payloads need full pickle
+        logger.warning(
+            "weights_only load failed (%s); retrying with weights_only=False. "
+            "Only resume from checkpoints you trust: pickle deserialization "
+            "executes arbitrary code.",
+            exc,
+        )
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    if len(optimizers) >= 1 and "muon_optimizer_state_dict" in checkpoint:
+    # Optimizer-mode consistency: a clear error beats an opaque param-group
+    # shape mismatch halfway through state restoration.
+    ckpt_use_muon = bool(
+        checkpoint.get("use_muon", "muon_optimizer_state_dict" in checkpoint)
+    )
+    has_explicit_flag = "use_muon" in checkpoint
+    if use_muon is not None and has_explicit_flag and ckpt_use_muon != use_muon:
+        raise RuntimeError(
+            f"Checkpoint was saved with use_muon={ckpt_use_muon} but this run "
+            f"uses use_muon={use_muon}; optimizer states are incompatible. "
+            f"Start fresh or rerun with the matching --no-muon setting."
+        )
+
+    if ckpt_use_muon and "muon_optimizer_state_dict" in checkpoint:
         optimizers[0].load_state_dict(checkpoint["muon_optimizer_state_dict"])
-    if len(optimizers) >= 2 and "adam_optimizer_state_dict" in checkpoint:
-        optimizers[1].load_state_dict(checkpoint["adam_optimizer_state_dict"])
-    if len(schedulers) >= 1 and "muon_scheduler_state_dict" in checkpoint:
+        optimizers[-1].load_state_dict(checkpoint["adam_optimizer_state_dict"])
         schedulers[0].load_state_dict(checkpoint["muon_scheduler_state_dict"])
-    if len(schedulers) >= 2 and "adam_scheduler_state_dict" in checkpoint:
-        schedulers[1].load_state_dict(checkpoint["adam_scheduler_state_dict"])
+        schedulers[-1].load_state_dict(checkpoint["adam_scheduler_state_dict"])
+    else:
+        optimizers[0].load_state_dict(checkpoint["adam_optimizer_state_dict"])
+        schedulers[0].load_state_dict(checkpoint["adam_scheduler_state_dict"])
 
     _load_rng_state_dict(checkpoint.get("rng_state"))
+
+    if dl_generator is not None:
+        gen_state = checkpoint.get("dl_generator_state")
+        if gen_state is not None:
+            dl_generator.set_state(_as_torch_rng_state(gen_state))
 
     if validator is not None and "validator_state_dict" in checkpoint:
         validator.load_state_dict(checkpoint["validator_state_dict"])
 
+    # Scalar-config drift detection: resume rebuilds the config from CLI +
+    # current code defaults, so any coefficient/knob that changed since the
+    # checkpoint would silently continue training a different objective.
+    saved_cfg = checkpoint.get("config")
+    if isinstance(saved_cfg, dict):
+        current_cfg = asdict(model.config)
+        drifted = {
+            k: {"checkpoint": saved_cfg[k], "current": current_cfg[k]}
+            for k in current_cfg
+            if k in saved_cfg and saved_cfg[k] != current_cfg[k]
+        }
+        if drifted:
+            logger.warning(
+                "Resumed config differs from the checkpoint payload in %d field(s): %s",
+                len(drifted),
+                drifted,
+            )
+
+    ckpt_fix_id = checkpoint.get("memory_nan_fix_id")
+    if ckpt_fix_id != MEMORY_NAN_FIX_ID:
+        logger.warning(
+            "Checkpoint memory_nan_fix_id=%r differs from current %r — "
+            "NaN-guard behavior changed between the two revisions.",
+            ckpt_fix_id,
+            MEMORY_NAN_FIX_ID,
+        )
+
     global_step = int(checkpoint.get("global_step", 0))
     current_shard_idx = int(checkpoint.get("current_shard_idx", 0))
     logger.info(
-        "Resumed from %s | step=%d shard=%d fix_id=%s",
+        "Resumed from %s | step=%d shard=%d fix_id=%s use_muon=%s",
         ckpt_path,
         global_step,
         current_shard_idx,
-        checkpoint.get("memory_nan_fix_id", "unknown"),
+        ckpt_fix_id if ckpt_fix_id is not None else "unknown",
+        ckpt_use_muon,
     )
     return global_step, current_shard_idx
 
@@ -635,6 +735,19 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     device = torch.device(args.device)
     use_amp = device.type == "cuda" and not args.no_amp
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
+    # fp16 autocast needs loss scaling (gradients silently underflow to zero
+    # otherwise); bf16 has the same exponent range as fp32 and must NOT be
+    # scaled. With enabled=False GradScaler is a pass-through, so the same
+    # call sites work for both dtypes and fp32.
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        scaler = torch.amp.GradScaler(
+            "cuda", enabled=(use_amp and amp_dtype == torch.float16)
+        )
+    else:  # torch < 2.3
+        scaler = torch.cuda.amp.GradScaler(
+            enabled=(use_amp and amp_dtype == torch.float16)
+        )
+    use_fp16_scaler = scaler.is_enabled()
 
     tokens_per_shard = align_tokens_per_shard(args.tokens_per_shard, args.seq_len)
     if tokens_per_shard != args.tokens_per_shard:
@@ -650,12 +763,18 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         tokenizer_name=args.tokenizer_name,
         tokens_per_shard=tokens_per_shard,
         max_buffered_files=args.max_buffered_files,
+        seed=args.seed,
+        log_fn=logger.info,
     )
     verify_tokenizer_vocab(producer.tokenizer, args.vocab_size)
 
     cfg = build_training_config(vocab_size=args.vocab_size)
-    cfg.bos_token_id = producer.tokenizer.bos_token_id or cfg.bos_token_id
-    cfg.eos_token_id = producer.tokenizer.eos_token_id or cfg.eos_token_id
+    # `is not None` (not `or`): a legitimate token id of 0 must not be
+    # clobbered by the config default.
+    if producer.tokenizer.bos_token_id is not None:
+        cfg.bos_token_id = producer.tokenizer.bos_token_id
+    if producer.tokenizer.eos_token_id is not None:
+        cfg.eos_token_id = producer.tokenizer.eos_token_id
     if args.compile:
         cfg.use_torch_compile = True
         cfg.torch_compile_mode = args.compile_mode
@@ -730,19 +849,29 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     current_shard_idx = 0
     ckpt_dir = Path(args.ckpt_dir)
 
+    # Shuffle generator for the DataLoader; persisted in the checkpoint so
+    # intra-shard permutations replay identically after --resume.
+    dl_generator = torch.Generator()
+    dl_generator.manual_seed(args.seed)
+
     if args.resume:
-        ckpt_optimizers, ckpt_schedulers = _checkpoint_opt_sched(
-            optimizers, schedulers, use_muon
-        )
         global_step, current_shard_idx = load_checkpoint(
             model=model,
-            optimizers=ckpt_optimizers,
-            schedulers=ckpt_schedulers,
+            optimizers=optimizers,
+            schedulers=schedulers,
             checkpoint_dir=ckpt_dir,
             device=device,
             logger=logger,
             validator=validator,
+            use_muon=use_muon,
+            dl_generator=dl_generator,
         )
+        # LambdaLR.load_state_dict restores `_last_lr` but not
+        # param_group['lr'], and opt.step() precedes sched.step() — without
+        # this sync the first post-resume step would run at constructor LR.
+        for opt, sched in zip(optimizers, schedulers):
+            for group in opt.param_groups:
+                group["lr"] = group["initial_lr"] * lr_lambda(max(sched.last_epoch, 0))
 
     stop_event = threading.Event()
     producer_thread: threading.Thread | None = None
@@ -750,9 +879,13 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     reset_mamba_scan_stats()
 
     try:
+        # NOTE: the trainer's *consume* cursor (`current_shard_idx`, restored
+        # above from the model checkpoint) stays authoritative. Do NOT copy
+        # `producer.current_shard_idx` (the production/write cursor) over it:
+        # the producer runs up to max_buffered_files shards ahead, so doing so
+        # silently skipped every buffered-but-untrained shard on resume.
         if args.resume and os.path.exists(args.dataset_ckpt_path):
             producer.load_checkpoint(args.dataset_ckpt_path)
-            current_shard_idx = producer.current_shard_idx
 
         producer_thread = threading.Thread(
             target=producer.start_streaming,
@@ -765,28 +898,38 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         producer_thread.start()
         logger.info("Shard producer started | cache_dir=%s", args.cache_dir)
 
-        dl_generator = torch.Generator()
-        dl_generator.manual_seed(args.seed)
-
         while global_step < args.max_steps:
             shard_name = f"shard_{current_shard_idx:06d}.bin"
             bin_path = os.path.join(args.cache_dir, shard_name)
+            # The producer writes shard.bin atomically (tmp+replace), then
+            # publishes shard.json. Gating on BOTH closes the torn-shard race:
+            # a bare existing .bin could once be caught mid-write.
+            sidecar_path = os.path.join(
+                args.cache_dir, shard_name.replace(".bin", ".json")
+            )
             wait_start = time.time()
-            timed_out = False
 
-            while not os.path.exists(bin_path):
-                if time.time() - wait_start > args.producer_wait_timeout:
-                    logger.error(
-                        "Timeout waiting for %s after %ds",
-                        shard_name,
-                        args.producer_wait_timeout,
+            while not (os.path.exists(bin_path) and os.path.exists(sidecar_path)):
+                # Surface producer-thread failures instead of spinning out to
+                # a misleading success exit.
+                producer_error = getattr(producer, "error", None)
+                if producer_error is not None:
+                    raise RuntimeError(
+                        f"Shard producer thread failed while waiting for "
+                        f"{shard_name}: {producer_error!r}"
+                    ) from (
+                        producer_error
+                        if isinstance(producer_error, BaseException)
+                        else None
                     )
-                    timed_out = True
-                    break
+                if time.time() - wait_start > args.producer_wait_timeout:
+                    raise RuntimeError(
+                        f"Timed out waiting for {shard_name} after "
+                        f"{args.producer_wait_timeout}s (producer stalled or "
+                        f"starved) — aborting with a non-zero status instead "
+                        f"of reporting success."
+                    )
                 time.sleep(1.0)
-
-            if timed_out:
-                break
 
             dataset = MmapShardDataset(bin_path=bin_path, seq_len=args.seq_len + 1)
             dataloader = DataLoader(
@@ -810,8 +953,14 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 args.max_steps,
             )
 
+            shard_fully_consumed = True
             for input_ids, labels in dataloader:
                 if global_step >= args.max_steps:
+                    # Hitting max-steps mid-shard: leave the shard unmarked
+                    # and the cursor where it is so a later --max-steps
+                    # extension resumes from this exact batch instead of
+                    # silently dropping the unconsumed tail.
+                    shard_fully_consumed = False
                     break
 
                 input_ids = input_ids.to(device, non_blocking=True)
@@ -862,13 +1011,56 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     global_step += 1
                     continue
 
-                outputs.loss.backward()
+                if use_fp16_scaler:
+                    scaler.scale(outputs.loss).backward()
+                else:
+                    outputs.loss.backward()
+
+                # Unscale before clipping so max_grad_norm applies to true
+                # gradient magnitudes, not scaled ones.
+                if use_fp16_scaler:
+                    for opt in optimizers:
+                        scaler.unscale_(opt)
                 grad_norm = float(
                     clip_grad_norm_(model.parameters(), args.max_grad_norm).item()
                 )
 
-                for opt in optimizers:
-                    opt.step()
+                # Gate on gradient finiteness too: a finite loss can still
+                # produce NaN/Inf grads, which clip_grad_norm_ only logs and
+                # opt.step() would happily fold into the weights (and the next
+                # periodic checkpoint would capture the poisoned state).
+                if not math.isfinite(grad_norm):
+                    logger.error(
+                        "Non-finite grad norm at step=%d (norm=%r) — skipping "
+                        "optimizer step",
+                        global_step,
+                        grad_norm,
+                    )
+                    if jsonl_path is not None:
+                        with jsonl_path.open("a", encoding="utf-8") as f:
+                            f.write(
+                                json.dumps(
+                                    {
+                                        "event": "non_finite_grad",
+                                        "step": global_step,
+                                        "shard_idx": current_shard_idx,
+                                        "grad_norm": grad_norm,
+                                    }
+                                )
+                                + "\n"
+                            )
+                    global_step += 1
+                    continue
+
+                for i, opt in enumerate(optimizers):
+                    if use_fp16_scaler:
+                        # Internally no-ops when unscaled grads contain
+                        # inf/nan; update() then shrinks the scale.
+                        scaler.step(opt)
+                    else:
+                        opt.step()
+                if use_fp16_scaler:
+                    scaler.update()
                 for sched in schedulers:
                     sched.step()
 
@@ -948,22 +1140,27 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     logger.info(_format_log_line(global_step, args.max_steps, record))
 
                 if global_step % args.save_interval == 0 and global_step > 0:
-                    ckpt_optimizers, ckpt_schedulers = _checkpoint_opt_sched(
-                        optimizers, schedulers, use_muon
-                    )
                     save_checkpoint(
                         model=model,
-                        optimizers=ckpt_optimizers,
-                        schedulers=ckpt_schedulers,
+                        optimizers=optimizers,
+                        schedulers=schedulers,
                         global_step=global_step,
                         current_shard_idx=current_shard_idx,
                         checkpoint_dir=ckpt_dir,
                         logger=logger,
                         validator=validator,
+                        use_muon=use_muon,
+                        extra_payload={
+                            "dl_generator_state": dl_generator.get_state(),
+                            "muon_adjust_lr_fn": _opt_meta.get("muon_adjust_lr_fn"),
+                        },
                     )
                     producer.save_checkpoint(args.dataset_ckpt_path)
 
                 global_step += 1
+
+            if not shard_fully_consumed:
+                break
 
             done_path = os.path.join(
                 args.cache_dir, f"shard_{current_shard_idx:06d}.done"
@@ -974,18 +1171,20 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
             current_shard_idx += 1
 
         if global_step > 0 and global_step % args.save_interval != 0:
-            ckpt_optimizers, ckpt_schedulers = _checkpoint_opt_sched(
-                optimizers, schedulers, use_muon
-            )
             save_checkpoint(
                 model=model,
-                optimizers=ckpt_optimizers,
-                schedulers=ckpt_schedulers,
+                optimizers=optimizers,
+                schedulers=schedulers,
                 global_step=global_step,
                 current_shard_idx=current_shard_idx,
                 checkpoint_dir=ckpt_dir,
                 logger=logger,
                 validator=validator,
+                use_muon=use_muon,
+                extra_payload={
+                    "dl_generator_state": dl_generator.get_state(),
+                    "muon_adjust_lr_fn": _opt_meta.get("muon_adjust_lr_fn"),
+                },
             )
             producer.save_checkpoint(args.dataset_ckpt_path)
 
@@ -999,18 +1198,20 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt — saving checkpoint before exit")
         if global_step > 0:
-            ckpt_optimizers, ckpt_schedulers = _checkpoint_opt_sched(
-                optimizers, schedulers, use_muon
-            )
             save_checkpoint(
                 model=model,
-                optimizers=ckpt_optimizers,
-                schedulers=ckpt_schedulers,
+                optimizers=optimizers,
+                schedulers=schedulers,
                 global_step=global_step,
                 current_shard_idx=current_shard_idx,
                 checkpoint_dir=ckpt_dir,
                 logger=logger,
                 validator=validator,
+                use_muon=use_muon,
+                extra_payload={
+                    "dl_generator_state": dl_generator.get_state(),
+                    "muon_adjust_lr_fn": _opt_meta.get("muon_adjust_lr_fn"),
+                },
             )
             producer.save_checkpoint(args.dataset_ckpt_path)
         raise
@@ -1192,6 +1393,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.deterministic:
+        # Must be set before the first cuBLAS handle is created (i.e. before
+        # any CUDA tensor op), so it lives here rather than in set_seed(),
+        # which runs after imports may have touched CUDA.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     logger = setup_logging(Path(args.run_dir))
     logger.info("Starting training with args: %s", vars(args))
     train(args, logger)

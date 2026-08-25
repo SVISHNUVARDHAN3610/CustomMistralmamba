@@ -271,6 +271,16 @@ class SlidingWindowGQA(nn.Module):
             is_causal=False,
         )
 
+        # All-masked query rows (pad-only rows in right-padded batches, or
+        # finished rows during batched decode) can yield NaN/Inf on some SDPA
+        # backends instead of zeros. Zero them explicitly rather than relying
+        # on backend behavior; covered by MEMORY_NAN_FIX_ID.
+        if attn_mask is not None:
+            row_visible = attn_mask.any(dim=-1, keepdim=True)  # [B, 1, S, 1]
+            attn_output = torch.where(
+                row_visible, attn_output, torch.zeros_like(attn_output)
+            )
+
         attn_output = (
             attn_output.transpose(1, 2)
             .contiguous()

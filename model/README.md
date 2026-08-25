@@ -65,7 +65,7 @@ Two complete model families share the GQA and MoE building blocks:
 | **Baseline** | `MixtralConfig` | `MixtralForCausalLM` | Ablation control: GQA + MoE only |
 | **Hybrid** | `HybridMambaMoEConfig` | `HybridForCausalLM` | Full architecture with dual memory |
 
-The implementation is feature-complete for training and autoregressive inference, including eight memory-specific auxiliary losses, chunked truncated-BPTT training, VRAM-efficient CE streaming, incremental KV/Mamba/memory caching, and 66 unit tests. **What remains scientifically unproven** is whether the memory component is *indispensable* — see §21 and the falsification plan in `research/research.md` §6.
+The implementation is feature-complete for training and autoregressive inference, including eight memory-specific auxiliary losses, chunked truncated-BPTT training, VRAM-efficient CE streaming, incremental KV/Mamba/memory caching, and 83 unit tests. **What remains scientifically unproven** is whether the memory component is *indispensable* — see §21 and the falsification plan in `research/research.md` §6.
 
 ---
 
@@ -227,7 +227,7 @@ Memory is **not** mixed after the branches. The implementation matches `research
 
 1. **Read path:** Each bank is read with the current token representations as queries. The read output is concatenated with the shared RMSNorm'd hidden state and projected through `attn_memory_combine` / `state_memory_combine` **before** entering GQA and Mamba respectively.
 
-2. **Write path:** **Raw** branch outputs (`attn_out`, `mamba_out`) — not the memory-augmented tensors — are accumulated and written back to the banks via a GRU-style gated update.
+2. **Write path:** **Raw** branch outputs (`attn_out`, `mamba_out`) — not the memory-augmented tensors — are accumulated and written back to the banks via a single-sigmoid gated EMA update.
 
 This read-into-input / write-from-output contract is what makes the banks a genuine memory system rather than a static learned bias on the residual stream.
 
@@ -303,7 +303,7 @@ Each bank maintains **m fixed slots** of dimension d (config: `memory_size`, def
 
 **Read:** Multi-head scaled dot-product attention where chunk tokens are queries and memory slots are keys/values. Cost O(L·m·d).
 
-**Write:** A learned `summary_query` attends over the current chunk to produce a compressed summary. A GRU-style gate blends the summary into existing memory:
+**Write:** A learned `summary_query` attends over the current chunk to produce a compressed summary. A single-sigmoid gate blends the summary into existing memory (an EMA-style convex blend, not a full GRU cell — no reset/forget pair):
 
 ```
 gate = σ(W · [memory; summary])
@@ -490,7 +490,7 @@ When `seq_len > memory_chunk_size` (default 512) and `use_dual_memory=True`, `Hy
 **VRAM impact:** For vocab V=32K, hidden d=4096, batch B=2, chunk L=512:
 
 - Full logits per chunk: ~134 MB (fp16) per chunk materialized.
-- Streamed CE: proportional to valid tokens only — critical for cloud training at ~150M params.
+- Streamed CE: proportional to valid tokens only — critical for cloud training at ~200M params.
 
 `gradient_checkpointing=True` checkpoints each `HybridDecoderLayer` forward via `_hybrid_layer_forward`. Mamba internal scan checkpointing is automatically suppressed when layer checkpointing is active to avoid double checkpoint overhead.
 
@@ -514,7 +514,7 @@ When `seq_len > memory_chunk_size` (default 512) and `use_dual_memory=True`, `Hy
 3. **Memory write cadence** — writes every `memory_write_interval` tokens (defaults to `memory_chunk_size`).
 4. **Finished rows** — `active_batch_mask` freezes KV/Mamba/memory updates for sequences that hit `eos_token_id`.
 5. **Final flush** — any partial write buffer is flushed via `_flush_memory_write_buffers()`.
-6. **Optional CUDA graph** — `use_cuda_graph=True` captures single-token decode when batch is fully active and sampling is disabled.
+6. **CUDA graph decode (removed)** — the former `use_cuda_graph=True` fast path was removed: its capture/replay silently corrupted recurrent state (warm-up ran against live caches; replay froze KV/SSM/memory at capture-time addresses). The flag remains in the config as a documented no-op that warns and decodes eagerly.
 
 ### 12.3 Sampling
 
@@ -568,7 +568,7 @@ Supports `temperature`, `top_k`, `top_p`, `do_sample`, and `eos_token_id` (defau
 | `stream_chunked_ce_loss` | True | VRAM-efficient chunked CE |
 | `return_logits` | True | Return full logits tensor |
 | `use_grouped_moe_dispatch` | True | Sort-by-expert MoE dispatch |
-| `use_cuda_graph` | False | CUDA graph decode fast path |
+| `use_cuda_graph` | False | No-op (CUDA-graph decode removed; warns if enabled) |
 | `use_torch_compile` | False | `torch.compile` per layer |
 | `use_auxiliary_losses` | True | Eight training aux losses |
 | `debug_state_checks` | False | Assert cache/mask invariants |
@@ -632,7 +632,7 @@ Extra parameters per hybrid layer (dual memory + combine layers): approximately 
 |---------|----------------|
 | Mamba scan speed | Install `mamba-ssm` on CUDA training hosts |
 | Long-context training VRAM | `return_logits=False`, `stream_chunked_ce_loss=True` |
-| Decode latency | `use_cuda_graph=True` for greedy single-batch decode |
+| Decode latency | eager incremental decode (`MambaBlock.step()`); no CUDA-graph path |
 | MoE memory spikes | `capacity_factor=1.25` only on memory-constrained hardware |
 | Layer compile | `use_torch_compile=True` (disables gradient checkpointing) |
 
@@ -648,7 +648,7 @@ Extra parameters per hybrid layer (dual memory + combine layers): approximately 
 |-------|----------|----------|
 | Unit tests | `tests/test_model.py` | 66 tests — forward/backward, chunked training, incremental vs full-forward parity, memory persistence, padding/NaN edges, fused Mamba parity, aux loss gradients, MoE dispatch, CUDA-graph decode, falsification hooks |
 | Toy train smoke | `tests/test_toy_train_smoke.py` | 10-step training loop, param budget |
-| Cloud smoke | `scripts/test_cloud_train.py` | ~150M param IMDB one-epoch run |
+| Cloud smoke | `scripts/test_cloud_train.py` | ~200M param IMDB one-epoch run |
 
 **Caching correctness test:** incremental `generate()` vs full-forward last-logit cosine similarity — re-run before latency-sensitive deployment at larger scales.
 

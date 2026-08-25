@@ -27,11 +27,13 @@ Fixes applied vs. the reviewed version:
     multiple of `seq_len` so no tokens are dropped at shard boundaries.
 """
 
+import base64
 import glob
 import json
 import os
 import time
 import warnings
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -41,24 +43,62 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 
+def resolve_tokenizer_vocab_size(
+    tokenizer: PreTrainedTokenizerBase,
+    probe_texts: tuple[str, ...] = (
+        "The quick brown fox jumps over the lazy dog.",
+        "def fibonacci(n):\n    a, b = 0, 1\n    return a",
+        "1234567890 !@#$%^&*() []{};':\",./<>?",
+        "\n\t éü中文 한국어 Русский",
+    ),
+) -> int:
+    """Resolve the vocab size this tokenizer can *actually emit*.
+
+    Llama-family tokenizers frequently report ``len(tokenizer) == V`` while
+    still encoding some inputs to ``id == V`` (the reported size excludes a
+    slot the encoder happily produces). A plain equality check against the
+    model config passes such a tokenizer, which then crashes out-of-range
+    hours into a run. Probe with real encodes to find the true ceiling.
+    """
+    reported = len(tokenizer)
+    max_id = -1
+    for text in probe_texts:
+        # Probe strings are constants; a failure here is a real tokenizer bug
+        # and should surface rather than be swallowed.
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if ids:
+            max_id = max(max_id, int(max(ids)))
+    # Special tokens are legal outputs too.
+    for special in (
+        tokenizer.bos_token_id,
+        tokenizer.eos_token_id,
+        tokenizer.pad_token_id,
+        tokenizer.unk_token_id,
+    ):
+        if special is not None:
+            max_id = max(max_id, int(special))
+    return max(reported, max_id + 1)
+
+
 def verify_tokenizer_vocab(
     tokenizer: PreTrainedTokenizerBase, expected_vocab_size: int
 ) -> None:
-    """Raises if the tokenizer's vocab size doesn't match the model config.
+    """Raises if the tokenizer can emit ids the model config cannot embed.
 
-    A silent mismatch here means the model's embedding/lm_head matrices are
-    sized for a different vocabulary than the tokenizer actually produces --
-    tokens beyond the model's vocab_size would raise a CUDA indexing error
-    at a random point in training, or (worse) silently alias into unrelated
-    embedding rows if vocab_size is only checked loosely elsewhere.
+    Only ids >= vocab_size can corrupt training (CUDA indexing errors or
+    silent aliasing into unrelated embedding rows), so the check fires when
+    the probed ceiling exceeds the configured size. Extra embedding rows are
+    harmless dead weight. See :func:`resolve_tokenizer_vocab_size` for why
+    the reported ``len(tokenizer)`` alone is not trusted.
     """
-    tok_vocab = len(tokenizer)
-    if tok_vocab != expected_vocab_size:
+    resolved = resolve_tokenizer_vocab_size(tokenizer)
+    if resolved > expected_vocab_size:
         raise ValueError(
-            f"Tokenizer/model vocab size mismatch: tokenizer '{tokenizer.name_or_path}' "
-            f"has vocab size {tok_vocab}, but MixtralConfig.vocab_size={expected_vocab_size}. "
-            f"Either update MixtralConfig.vocab_size to match, or use a tokenizer whose "
-            f"vocab size matches the model."
+            f"Tokenizer '{tokenizer.name_or_path}' can emit token ids up to "
+            f"{resolved - 1}, but the model vocab_size={expected_vocab_size}. "
+            f"Such ids crash or corrupt training mid-run. Set --vocab-size to "
+            f"{resolved} (see resolve_tokenizer_vocab_size) or use a tokenizer "
+            f"whose emitted range fits the model."
         )
 
 
@@ -103,11 +143,24 @@ class TokenizedShardProducer:
         tokenizer_name: str = "UIC-AI-lab/llama2-tokenizer",
         tokens_per_shard: int = 100_000,
         max_buffered_files: int = 3,
+        seed: int | None = None,
+        log_fn: Callable[[str], None] | None = None,
     ):
         self.cache_dir = cache_dir
         self.tokenizer_name = tokenizer_name
         self.tokens_per_shard = tokens_per_shard
         self.max_buffered_files = max_buffered_files
+        # Seeds interleave_datasets' sampling so stream order is reproducible
+        # for a given --seed (HF otherwise draws from unseeded entropy).
+        self.seed = seed
+        # Diagnostics route through the caller's logger when provided, so
+        # producer messages land in runs/*/train.log instead of only stdout.
+        self.log = (
+            log_fn if log_fn is not None else (lambda msg: print(msg, flush=True))
+        )
+        # Exception raised inside the streaming thread; the trainer polls
+        # this and aborts loudly rather than timing out like a stall.
+        self.error: BaseException | None = None
 
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, use_fast=True)
 
@@ -130,11 +183,17 @@ class TokenizedShardProducer:
         self._supports_native_state = False
 
     def save_checkpoint(self, checkpoint_path: str):
-        """Saves current dataset streaming state and buffer to a JSON file."""
+        """Saves current dataset streaming state and buffer to a JSON file.
+
+        The token buffer is serialized as base64-packed uint16 (a JSON list of
+        Python ints was both large and slow for buffers near tokens_per_shard).
+        """
+        buf = np.asarray(self.token_buffer, dtype=np.uint16)
         state = {
             "current_shard_idx": self.current_shard_idx,
             "cumulative_samples": self.cumulative_samples,
-            "token_buffer": self.token_buffer,
+            "token_buffer_len": int(buf.size),
+            "token_buffer_b64": base64.b64encode(buf.tobytes()).decode("ascii"),
             "tokens_per_shard": self.tokens_per_shard,
             "tokenizer_name": self.tokenizer_name,
             "native_ds_state": self._native_ds_state,
@@ -143,10 +202,7 @@ class TokenizedShardProducer:
         with open(tmp_path, "w") as f:
             json.dump(state, f)
         os.replace(tmp_path, checkpoint_path)
-        print(
-            f"[CPU Producer] Checkpoint saved successfully to: {checkpoint_path}",
-            flush=True,
-        )
+        self.log(f"[CPU Producer] Checkpoint saved successfully to: {checkpoint_path}")
 
     def load_checkpoint(self, checkpoint_path: str):
         """Loads dataset state from checkpoint file to resume streaming seamlessly."""
@@ -160,29 +216,59 @@ class TokenizedShardProducer:
 
         self.current_shard_idx = state["current_shard_idx"]
         self.cumulative_samples = state["cumulative_samples"]
-        self.token_buffer = state["token_buffer"]
+        if "token_buffer_b64" in state:
+            raw = base64.b64decode(state["token_buffer_b64"])
+            arr = np.frombuffer(raw, dtype=np.uint16)
+            expected_len = int(state.get("token_buffer_len", arr.size))
+            if arr.size != expected_len:
+                raise ValueError(
+                    f"Dataset checkpoint token buffer corrupt: decoded "
+                    f"{arr.size} tokens, header says {expected_len}"
+                )
+            self.token_buffer = arr.astype(np.int64).tolist()
+        else:  # legacy checkpoints serialized the buffer as a JSON int list
+            self.token_buffer = list(state.get("token_buffer", []))
         self._native_ds_state = state.get("native_ds_state")
-        print(
-            f"[CPU Producer] Resumed checkpoint state from {checkpoint_path} | Next Shard: {self.current_shard_idx:06d} | Samples Skipped: {self.cumulative_samples}",
-            flush=True,
+        self.log(
+            f"[CPU Producer] Resumed checkpoint state from {checkpoint_path} | "
+            f"Next Shard: {self.current_shard_idx:06d} | "
+            f"Samples Skipped: {self.cumulative_samples}"
         )
 
     def _cleanup_consumed_shards(self):
-        """Removes consumed binary shards marked with .done sentinels."""
+        """Removes consumed binary shards marked with .done sentinels.
+
+        On Windows, workers holding mmap handles can make unlink fail
+        transiently — retry briefly; leaving the `.done` sentinel in place on
+        failure means the next cleanup cycle tries again (the shard is never
+        lost, just deleted late).
+        """
         sentinel_files = glob.glob(os.path.join(self.cache_dir, "*.done"))
         for sentinel_path in sentinel_files:
             shard_base = sentinel_path.replace(".done", "")
-            bin_path = f"{shard_base}.bin"
-            json_path = f"{shard_base}.json"
+            candidates = [
+                f"{shard_base}.bin",
+                f"{shard_base}.bin.tmp",
+                f"{shard_base}.json",
+            ]
 
-            try:
-                if os.path.exists(bin_path):
-                    os.remove(bin_path)
-                if os.path.exists(json_path):
-                    os.remove(json_path)
-                os.remove(sentinel_path)
-            except OSError:
-                pass
+            last_exc: OSError | None = None
+            for attempt in range(3):
+                try:
+                    for path in candidates:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    os.remove(sentinel_path)
+                    last_exc = None
+                    break
+                except OSError as exc:
+                    last_exc = exc
+                    time.sleep(0.5 * (attempt + 1))
+            if last_exc is not None:
+                self.log(
+                    f"[CPU Producer] Could not delete consumed shard "
+                    f"{shard_base}.* yet ({last_exc}); will retry next cycle."
+                )
 
     def _build_stream(self):
         """Builds and returns the interleaved HF streaming dataset."""
@@ -266,19 +352,54 @@ class TokenizedShardProducer:
             streams.append(ds)
             probabilities.append(cfg["weight"])
 
-        hf_stream = interleave_datasets(
-            streams, probabilities=probabilities, stopping_strategy="all_exhausted"
-        )
+        if self.seed is not None:
+            try:
+                hf_stream = interleave_datasets(
+                    streams,
+                    probabilities=probabilities,
+                    stopping_strategy="all_exhausted",
+                    seed=self.seed,
+                )
+            except TypeError:
+                # Older `datasets` without the seed kwarg: keep going, but the
+                # stream order will not be reproducible across runs.
+                warnings.warn(
+                    "[CPU Producer] installed `datasets` lacks "
+                    "interleave_datasets(seed=); interleaved stream order will "
+                    "NOT be reproducible despite the configured seed."
+                )
+                hf_stream = interleave_datasets(
+                    streams,
+                    probabilities=probabilities,
+                    stopping_strategy="all_exhausted",
+                )
+        else:
+            hf_stream = interleave_datasets(
+                streams, probabilities=probabilities, stopping_strategy="all_exhausted"
+            )
         return hf_stream
 
     def start_streaming(self, stop_event=None, checkpoint_path: str | None = None):
+        """Thread-target wrapper: records failures on ``self.error``.
+
+        A daemon thread that dies with an exception is otherwise invisible —
+        the trainer would just time out as if the producer were slow. Storing
+        the exception lets the trainer raise it with context.
+        """
+        try:
+            self._stream_loop(stop_event, checkpoint_path)
+        except BaseException as exc:
+            self.error = exc
+            self.log(f"[CPU Producer] FAILED with: {exc!r}")
+            raise
+
+    def _stream_loop(self, stop_event=None, checkpoint_path: str | None = None):
         """Main execution engine loop for streaming, tokenizing, and adding BOS/EOS."""
         if checkpoint_path and os.path.exists(checkpoint_path):
             self.load_checkpoint(checkpoint_path)
 
-        print(
-            "[CPU Producer] Connecting to Hugging Face multi-stream repositories...",
-            flush=True,
+        self.log(
+            "[CPU Producer] Connecting to Hugging Face multi-stream repositories..."
         )
 
         hf_stream = self._build_stream()
@@ -295,9 +416,8 @@ class TokenizedShardProducer:
             if self._supports_native_state:
                 try:
                     hf_stream.load_state_dict(self._native_ds_state)
-                    print(
-                        "[CPU Producer] Restored native IterableDataset state (no re-skip needed).",
-                        flush=True,
+                    self.log(
+                        "[CPU Producer] Restored native IterableDataset state (no re-skip needed)."
                     )
                 except (
                     AttributeError,
@@ -321,29 +441,25 @@ class TokenizedShardProducer:
                 )
                 hf_stream = hf_stream.skip(self.cumulative_samples)
         elif self.cumulative_samples > 0:
-            print(
-                f"[CPU Producer] Skipping first {self.cumulative_samples} samples to resume stream position...",
-                flush=True,
+            self.log(
+                f"[CPU Producer] Skipping first {self.cumulative_samples} samples to resume stream position..."
             )
             hf_stream = hf_stream.skip(self.cumulative_samples)
 
         bos_id = self.tokenizer.bos_token_id
         eos_id = self.tokenizer.eos_token_id
 
-        print(
-            f"[CPU Producer] Tokenizer initialized: {self.tokenizer_name} (Vocab size: {len(self.tokenizer)})",
-            flush=True,
+        self.log(
+            f"[CPU Producer] Tokenizer initialized: {self.tokenizer_name} (Vocab size: {len(self.tokenizer)})"
         )
-        print(
-            "[CPU Producer] Pipeline streaming live. Extracting, adding BOS/EOS, and chunking tokens...",
-            flush=True,
+        self.log(
+            "[CPU Producer] Pipeline streaming live. Extracting, adding BOS/EOS, and chunking tokens..."
         )
 
         for sample in hf_stream:
             if stop_event and stop_event.is_set():
-                print(
-                    "[CPU Producer] Shutdown signal received. Exiting thread cleanly...",
-                    flush=True,
+                self.log(
+                    "[CPU Producer] Shutdown signal received. Exiting thread cleanly..."
                 )
                 break
 
@@ -359,6 +475,11 @@ class TokenizedShardProducer:
                 self._cleanup_consumed_shards()
 
             text = sample["text"]
+            # Count BEFORE the blank check: skip-based fallback resume calls
+            # hf_stream.skip(self.cumulative_samples), which counts blanks —
+            # incrementing after the check drifted the resumed stream position
+            # backward by the number of blank docs consumed (duplicated data).
+            self.cumulative_samples += 1
             if not text.strip():
                 continue
 
@@ -366,7 +487,6 @@ class TokenizedShardProducer:
             doc_tokens = [bos_id] + raw_tokens + [eos_id]
 
             self.token_buffer.extend(doc_tokens)
-            self.cumulative_samples += 1
 
             if self._supports_native_state:
                 try:
@@ -392,14 +512,31 @@ class TokenizedShardProducer:
                     self.cache_dir, f"shard_{self.current_shard_idx:06d}.json"
                 )
 
-                shard_tokens.tofile(bin_path)
-                with open(json_path, "w") as jf:
+                # Atomic handoff: write to a tmp file, fsync, then os.replace.
+                # A trainer polling for shard_NNNNNN.bin can otherwise memmap
+                # a half-written file (existence != complete); after replace,
+                # existence guarantees a full, durable shard. The .json sidecar
+                # is published last so its presence is a second completion
+                # signal for consumers that gate on it.
+                bin_tmp = f"{bin_path}.tmp"
+                with open(bin_tmp, "wb") as bf:
+                    shard_tokens.tofile(bf)
+                    bf.flush()
+                    os.fsync(bf.fileno())
+                os.replace(bin_tmp, bin_path)
+
+                json_tmp = f"{json_path}.tmp"
+                with open(json_tmp, "w") as jf:
                     json.dump(
                         {
-                            "cumulative_samples_streamed_at_boundary": self.cumulative_samples
+                            "cumulative_samples_streamed_at_boundary": self.cumulative_samples,
+                            "num_tokens": int(shard_tokens.size),
                         },
                         jf,
                     )
+                    jf.flush()
+                    os.fsync(jf.fileno())
+                os.replace(json_tmp, json_path)
 
                 self.current_shard_idx += 1
 

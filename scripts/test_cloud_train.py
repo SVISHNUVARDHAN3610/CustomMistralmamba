@@ -3,8 +3,9 @@
 Loads rows from ``stanfordnlp/imdb``, tokenizes with
 ``UIC-AI-lab/llama2-tokenizer``, and runs training with validation CE,
 rolling train-CE smoothing, cosine LR (with warmup), and optional early
-stopping. Default model is ~150M trainable params (vocab 32000). Intended
-for GPU cloud environments (Colab T4/A100, etc.) — not laptop CPU runs.
+stopping. Default model is ~200M trainable params (vocab 32000; measured,
+excluding aux-only modules). Intended for GPU cloud environments
+(Colab T4/A100, etc.) — not laptop CPU runs.
 
 Dependencies (install on the cloud host):
     pip install datasets transformers torch
@@ -599,7 +600,7 @@ def main() -> None:
         )
     model = HybridForCausalLM(cfg).to(device)
     n_params = count_trainable_params(model)
-    print(f"trainable_params={n_params:,} (target ~150M) vocab_size={cfg.vocab_size}")
+    print(f"trainable_params={n_params:,} (target ~200M) vocab_size={cfg.vocab_size}")
     import model as model_pkg
 
     print(f"model_source={model_pkg.__file__} memory_nan_fix={MEMORY_NAN_FIX_ID}")
@@ -619,7 +620,9 @@ def main() -> None:
         lr_lambda=_build_lr_lambda(warmup_steps, total_steps, args.min_lr_ratio),
     )
     ce_smooth = RollingAverage(args.smooth_window)
-    log_path = args.log_jsonl if str(args.log_jsonl) else None
+    # `--log-jsonl ""` means "disable" per the flag's help; str(Path("")) is
+    # "." (truthy), so test the raw string, not the Path.
+    log_path = args.log_jsonl if args.log_jsonl and args.log_jsonl != "." else None
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
