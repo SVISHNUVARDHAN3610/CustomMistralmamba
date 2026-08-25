@@ -118,10 +118,19 @@ def combine_read_utilization_loss(
     return torch.relu(r_min - r) ** 2
 
 
-def fusion_balance_loss(fusion_gate: Tensor) -> Tensor:
+def fusion_balance_loss(fusion_gate: Tensor, target: float = 0.5) -> Tensor:
+    """
+    Pull the batch-mean token gate toward `target` per hidden channel.
+
+    target=0.5 (default) forces an even attention/mamba blend; lowering it
+    lets branches specialize (ablation axis, see research/Improvement-
+    suggestions.md). Must lie in [0, 1].
+    """
+    if not 0.0 <= target <= 1.0:
+        raise ValueError(f"fusion_balance_target must be in [0, 1], got {target}")
     g_bar = fusion_gate.mean(dim=(0, 1))
     hidden = g_bar.size(0)
-    return ((g_bar - 0.5) ** 2).sum() / hidden
+    return ((g_bar - target) ** 2).sum() / hidden
 
 
 def memory_slot_diversity_loss(

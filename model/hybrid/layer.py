@@ -470,7 +470,9 @@ class HybridDecoderLayer(nn.Module):
                 ) + combine_read_utilization_loss(
                     self.state_memory_combine, cfg.read_util_min_fraction
                 )
-            fusion_loss = fusion_balance_loss(fusion_gate)
+            fusion_loss = fusion_balance_loss(
+                fusion_gate, target=cfg.fusion_balance_target
+            )
             ssm_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
             if ssm_state is not None:
                 gamma = getattr(self, "ssm_norm_gamma", None)

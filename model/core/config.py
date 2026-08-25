@@ -21,6 +21,10 @@ class MixtralConfig:
     init_range: float = 0.02
     router_aux_loss_coef: float = 0.02
     router_z_loss_coef: float = 5e-3
+    # Z-loss on the final vocabulary logits (mean of logsumexp^2), PaLM/OLMo
+    # style. Keeps the softmax normalizer from drifting on long runs. 0.0
+    # disables it; ~1e-4 is the usual active value.
+    vocab_z_loss_coef: float = 0.0
 
     num_experts: int = 8
     top_k: int = 2
@@ -36,6 +40,17 @@ class MixtralConfig:
     # RotaryEmbedding / SlidingWindowGQA).
     max_position_embeddings: int = 32768
     rope_theta: float = 10000.0
+
+    # Attention-sink slots (StreamingLLM, arXiv:2309.17453). When the KV cache
+    # exceeds window_size during cached decode, the first `num_sink_tokens`
+    # entries are retained alongside the most recent (window - K) tokens
+    # instead of being evicted. Decode-only: full-sequence training attention
+    # is unchanged. 0 preserves plain sliding-window eviction.
+    num_sink_tokens: int = 0
+
+    # RMSNorm on Q/K per head before RoPE (Gemma2/OLMo2/Qwen3-style). Guards
+    # against attention-logit blow-up at scale. Adds 2*head_dim params/layer.
+    use_qk_norm: bool = False
 
     # Special tokens (previously hardcoded to 1/2 inside the data pipeline
     # with no link back to the model config).
@@ -125,6 +140,10 @@ class HybridMambaMoEConfig(MixtralConfig):
     lambda_read: float = 5e-3
     read_util_min_fraction: float = 0.15
     lambda_fusion: float = 8e-3
+    # Target for fusion_balance_loss. 0.5 forces the token gate toward an even
+    # attention/mamba blend; lower values let branches specialize (ablation:
+    # research/Improvement-suggestions.md). Must be in (0, 1).
+    fusion_balance_target: float = 0.5
     lambda_expert: float = 2e-3
     expert_warmup_fraction: float = 0.10
     expert_var_beta: float = 0.5

@@ -21,6 +21,7 @@ from model.hybrid.losses import (
     _aux_loss_schedule,
     _expert_loss_schedule,
     associative_retrieval_loss,
+    fusion_balance_loss,
 )
 from model.hybrid.mamba import (
     MambaBlock,
@@ -1643,6 +1644,249 @@ class TestHybridModel(unittest.TestCase):
         gen_graph = model.generate(prompt, max_new_tokens=4, do_sample=False)
         gen_eager = eager.generate(prompt, max_new_tokens=4, do_sample=False)
         self.assertTrue(torch.equal(gen_graph, gen_eager))
+
+
+class TestImprovementFeatures(unittest.TestCase):
+    """Opt-in features from the consolidated agent-review plan (all default-off
+    or behavior-preserving; each adds a config axis rather than changing the
+    production defaults)."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(0)
+
+    # ---------- shared RoPE ----------
+
+    def test_hybrid_shares_one_rope_instance(self) -> None:
+        cfg = _small_hybrid_config()
+        model = HybridForCausalLM(cfg).eval()
+        rots = [layer.attention_block.rotary_emb for layer in model.model.layers]
+        self.assertEqual(len(rots), cfg.num_layers)
+        self.assertTrue(all(r is rots[0] for r in rots))
+        out = model(input_ids=torch.randint(0, cfg.vocab_size, (1, 12)))
+        self.assertTrue(torch.isfinite(out.logits).all())
+
+    def test_mixtral_shares_one_rope_instance(self) -> None:
+        cfg = MixtralConfig(
+            vocab_size=128,
+            hidden_size=64,
+            num_layers=3,
+            num_heads=4,
+            num_kv_heads=2,
+            head_dim=16,
+            intermediate_size=96,
+            window_size=8,
+            num_experts=2,
+            dropout=0.0,
+        )
+        model = MixtralForCausalLM(cfg).eval()
+        rots = [layer.attention_block.rotary_emb for layer in model.model.layers]
+        self.assertTrue(all(r is rots[0] for r in rots))
+
+    # ---------- QK-Norm ----------
+
+    def test_qk_norm_off_by_default_and_adds_exactly_two_gains_per_layer(self) -> None:
+        cfg_off = _small_hybrid_config()
+        m_off = HybridForCausalLM(cfg_off)
+        attn_off = m_off.model.layers[0].attention_block
+        self.assertIsNone(attn_off.q_norm)
+        self.assertIsNone(attn_off.k_norm)
+
+        cfg_on = _small_hybrid_config(use_qk_norm=True)
+        m_on = HybridForCausalLM(cfg_on)
+        attn_on = m_on.model.layers[0].attention_block
+        self.assertIsNotNone(attn_on.q_norm)
+        self.assertIsNotNone(attn_on.k_norm)
+
+        expected_delta = 2 * cfg_on.head_dim * cfg_on.num_layers
+        self.assertEqual(
+            count_trainable_params(m_on) - count_trainable_params(m_off),
+            expected_delta,
+        )
+
+    def test_qk_norm_forward_backward_finite(self) -> None:
+        cfg = _small_hybrid_config(use_qk_norm=True)
+        model = HybridForCausalLM(cfg)
+        model.train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 16))
+        labels = torch.randint(0, cfg.vocab_size, (1, 16))
+        out = model(input_ids=ids, labels=labels)
+        assert out.loss is not None
+        self.assertTrue(torch.isfinite(out.loss))
+        out.loss.backward()
+
+    # ---------- attention sinks ----------
+
+    def test_sinks_leave_full_sequence_attention_unchanged(self) -> None:
+        """Sinks are decode-only: full-sequence logits must be bit-identical."""
+        torch.manual_seed(0)
+        m0 = HybridForCausalLM(_small_hybrid_config()).eval()
+        torch.manual_seed(0)
+        m4 = HybridForCausalLM(_small_hybrid_config(num_sink_tokens=4)).eval()
+        ids = torch.randint(0, m0.config.vocab_size, (1, 40))
+        with torch.no_grad():
+            l0 = m0(input_ids=ids, use_cache=False).logits
+            l4 = m4(input_ids=ids, use_cache=False).logits
+        self.assertTrue(torch.equal(l0, l4))
+
+    def test_sink_slots_retained_across_decode_steps(self) -> None:
+        k_sink = 4
+        cfg = _small_hybrid_config(num_sink_tokens=k_sink)
+        model = HybridForCausalLM(cfg).eval()
+        window = cfg.window_size
+
+        # Prefill longer than the window so sink eviction triggers immediately.
+        ids = torch.randint(0, cfg.vocab_size, (1, window + 6))
+        out = model(input_ids=ids[:, : window + 2], use_cache=True)
+        pkv = out.past_key_values
+        mem, mc = out.memory_states, out.mamba_caches
+        for key, val in pkv:
+            self.assertEqual(key.size(2), window)
+            self.assertEqual(val.size(2), window)
+        sinks = [
+            (key[:, :, :k_sink].clone(), val[:, :, :k_sink].clone()) for key, val in pkv
+        ]
+
+        past_seen = window + 2
+        for i in range(window + 2, window + 6):
+            out = model(
+                input_ids=ids[:, i : i + 1],
+                past_key_values=pkv,
+                memory_states=mem,
+                mamba_caches=mc,
+                past_seen_tokens=past_seen,
+                use_cache=True,
+            )
+            pkv, mem, mc = out.past_key_values, out.memory_states, out.mamba_caches
+            past_seen += 1
+            self.assertTrue(torch.isfinite(out.logits).all())
+
+        for (k_snap, v_snap), (key, val) in zip(sinks, pkv):
+            self.assertEqual(key.size(2), window)  # cache stays bounded
+            self.assertTrue(torch.equal(key[:, :, :k_sink], k_snap))
+            self.assertTrue(torch.equal(val[:, :, :k_sink], v_snap))
+
+    def test_num_sink_tokens_must_leave_sliding_room(self) -> None:
+        from model.layers.attention import SlidingWindowGQA
+
+        with self.assertRaises(ValueError):
+            SlidingWindowGQA(_small_hybrid_config(num_sink_tokens=16, window_size=16))
+
+    # ---------- vocab z-loss ----------
+
+    def test_vocab_z_loss_disabled_by_default_and_active_when_coefficient_set(
+        self,
+    ) -> None:
+        cfg = _small_hybrid_config()
+        self.assertEqual(cfg.vocab_z_loss_coef, 0.0)
+        model = HybridForCausalLM(cfg).eval()
+        ids = torch.randint(0, cfg.vocab_size, (1, 20))
+        labels = torch.randint(0, cfg.vocab_size, (1, 20))
+
+        with torch.no_grad():
+            loss_base = model(input_ids=ids, labels=labels).loss
+            cfg.vocab_z_loss_coef = 0.05
+            loss_z = model(input_ids=ids, labels=labels).loss
+        assert loss_base is not None and loss_z is not None
+        z = (loss_z - loss_base) / 0.05
+        self.assertGreater(float(z), 0.0)
+
+        # Chunked path must pick the term up too.
+        cfg_chunked = _small_hybrid_config(memory_chunk_size=8)
+        model_c = HybridForCausalLM(cfg_chunked).eval()
+        ids_c = torch.randint(0, cfg.vocab_size, (1, 32))
+        labels_c = torch.randint(0, cfg.vocab_size, (1, 32))
+        with torch.no_grad():
+            base_c = model_c(input_ids=ids_c, labels=labels_c).loss
+            cfg_chunked.vocab_z_loss_coef = 0.05
+            z_c = model_c(input_ids=ids_c, labels=labels_c).loss
+        assert base_c is not None and z_c is not None
+        self.assertGreater(float((z_c - base_c) / 0.05), 0.0)
+
+    # ---------- fusion balance target ----------
+
+    def test_fusion_balance_loss_target_knob(self) -> None:
+        gate = torch.full((1, 5, 8), 0.3)
+        at_target = fusion_balance_loss(gate, target=0.3)
+        self.assertAlmostEqual(float(at_target), 0.0, places=6)
+        away = fusion_balance_loss(gate, target=0.5)
+        self.assertAlmostEqual(float(away), (0.2**2), places=6)
+        with self.assertRaises(ValueError):
+            fusion_balance_loss(gate, target=1.5)
+
+    # ---------- vectorized conv-state prefill ----------
+
+    def test_conv_state_prefill_matches_reference_loop(self) -> None:
+        cfg = _small_hybrid_config()
+        block = MambaBlock(
+            hidden_size=cfg.hidden_size,
+            state_size=cfg.mamba_state_size,
+            conv_kernel=cfg.mamba_conv_kernel,
+            expand=cfg.mamba_expand,
+        )
+        batch, seq_len = 3, 9
+        x = torch.randn(batch, seq_len, cfg.hidden_size)
+        mask = torch.ones(batch, seq_len, dtype=torch.long)
+        mask[0, 7:] = 0  # right-padded rows of varying valid length
+        mask[1, 3:] = 0
+        mask[2, :2] = 1  # fully valid row
+
+        _, cache, _ = block(x, use_cache=True, attention_mask=mask)
+        conv_state = cache[0]
+        self.assertTrue(conv_state.is_contiguous())
+
+        # Reference: original per-row construction (kept here as spec).
+        x_in, _ = block.in_proj(x).chunk(2, dim=-1)
+        reference = torch.zeros_like(conv_state)
+        valid_lens = mask.sum(dim=1)
+        for b in range(batch):
+            vl = int(valid_lens[b])
+            if vl <= 0:
+                continue
+            take = min(block.conv_kernel, vl)
+            reference[b, :, -take:] = x_in[b, vl - take : vl].transpose(0, 1)
+        self.assertTrue(torch.equal(reference, conv_state))
+
+    # ---------- optimizer split metadata ----------
+
+    def test_optimizer_split_honors_no_weight_decay_metadata(self) -> None:
+        from model.core.optim import split_muon_adam_params
+
+        model = HybridForCausalLM(_small_hybrid_config())
+        flagged_names = [
+            n
+            for n, p in model.named_parameters()
+            if getattr(p, "_no_weight_decay", False)
+        ]
+        self.assertTrue(any("A_log" in n for n in flagged_names))
+        self.assertTrue(any(n.endswith(".D") for n in flagged_names))
+
+        adam_params, muon_params, _inventory = split_muon_adam_params(model)
+        adam_ids = {id(p) for p in adam_params}
+        muon_ids = {id(p) for p in muon_params}
+        by_name = dict(model.named_parameters())
+        for name in flagged_names:
+            pid = id(by_name[name])
+            self.assertIn(pid, adam_ids)
+            self.assertNotIn(pid, muon_ids)
+        # Muon stays matrix-only and never receives flagged params.
+        for p in muon_params:
+            self.assertEqual(p.ndim, 2)
+            self.assertFalse(getattr(p, "_no_weight_decay", False))
+
+    def test_adamw_no_decay_predicate(self) -> None:
+        from model.core.optim import _is_adamw_no_decay
+
+        cfg = _small_hybrid_config()
+        model = HybridForCausalLM(cfg)
+        # Norm gain (1D) -> no decay; embedding (2D, name match) -> decay;
+        # A_log (2D, flagged) -> no decay; router matrix (2D, unflagged) -> decay.
+        self.assertTrue(_is_adamw_no_decay(model.model.norm.weight))
+        self.assertFalse(_is_adamw_no_decay(model.model.embed_tokens.weight))
+        self.assertTrue(_is_adamw_no_decay(model.model.layers[0].mamba_block.A_log))
+        moe_2d = next(
+            p for n, p in model.named_parameters() if p.ndim == 2 and ".w_gate" in n
+        )
+        self.assertFalse(_is_adamw_no_decay(moe_2d))
 
 
 if __name__ == "__main__":

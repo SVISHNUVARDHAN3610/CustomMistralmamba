@@ -10,6 +10,7 @@ from model.core.config import MixtralConfig
 from model.layers.attention import SlidingWindowGQA
 from model.layers.moe import DroplessMoELayer, MOERouter, SwiGLUExpert
 from model.layers.norm import RMSNorm
+from model.layers.rope import RotaryEmbedding
 
 
 class MixtralDecoderLayer(nn.Module):
@@ -91,9 +92,20 @@ class MixtralModel(nn.Module):
     def __init__(self, config: MixtralConfig) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [MixtralDecoderLayer(config) for _ in range(config.num_layers)]
+        # One RoPE table shared by every attention layer (identical head_dim /
+        # theta everywhere): avoids num_layers duplicate cos/sin caches. The
+        # buffers are non-persistent, so state_dicts are unchanged.
+        shared_rotary_emb = RotaryEmbedding(
+            dim=config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
         )
+        layers = []
+        for _ in range(config.num_layers):
+            layer = MixtralDecoderLayer(config)
+            layer.attention_block.rotary_emb = shared_rotary_emb
+            layers.append(layer)
+        self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -216,6 +228,14 @@ class MixtralForCausalLM(nn.Module):
                 + (self.router_aux_loss_coef * aux_loss)
                 + (self.router_z_loss_coef * z_loss)
             )
+            if self.config.vocab_z_loss_coef > 0.0:
+                valid = labels != self.config.label_ignore_index
+                if valid.any():
+                    loss = (
+                        loss
+                        + self.config.vocab_z_loss_coef
+                        * torch.logsumexp(logits[valid].float(), dim=-1).pow(2).mean()
+                    )
 
         output = MixtralTrainingOutput(
             logits=logits,

@@ -30,6 +30,7 @@ from model.hybrid.memory import (
     batched_dual_memory_write,
 )
 from model.layers.norm import RMSNorm
+from model.layers.rope import RotaryEmbedding
 
 
 def _top_k_filter(logits: Tensor, top_k: int) -> Tensor:
@@ -73,9 +74,19 @@ class HybridModel(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        layers: list[HybridDecoderLayer] = [
-            HybridDecoderLayer(config) for _ in range(config.num_layers)
-        ]
+        # One RoPE table shared by every attention layer (identical head_dim /
+        # theta everywhere): avoids num_layers duplicate cos/sin caches. The
+        # buffers are non-persistent, so state_dicts are unchanged.
+        shared_rotary_emb = RotaryEmbedding(
+            dim=config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+        layers: list[HybridDecoderLayer] = []
+        for _ in range(config.num_layers):
+            layer = HybridDecoderLayer(config)
+            layer.attention_block.rotary_emb = shared_rotary_emb
+            layers.append(layer)
         if config.use_torch_compile:
             if config.gradient_checkpointing:
                 warnings.warn(
@@ -546,28 +557,39 @@ class HybridForCausalLM(nn.Module):
         labels = self._apply_label_ignore(labels, attention_mask)
         return int((labels != self.config.label_ignore_index).sum().item())
 
+    def _vocab_z_loss(self, logits: Tensor) -> Tensor:
+        """PaLM/OLMo-style z-loss on final logits: mean(logsumexp^2)."""
+        return torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
+
     def _compute_ce_loss(
         self,
         hidden_states: Tensor,
         labels: Tensor,
         attention_mask: Tensor | None = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         """
-        Token-weighted CE mean over non-ignored labels.
+        Token-weighted CE mean over non-ignored labels plus vocab z-loss.
 
         When batches contain padding, lm_head runs only on valid label positions
         so peak activation memory is [N_valid, V] instead of [B*L, V].
+
+        Returns (ce_loss, vocab_z_loss); z-loss is 0 when disabled.
         """
         labels = self._apply_label_ignore(labels, attention_mask)
         ignore_index = self.config.label_ignore_index
+        zero = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
         valid = labels != ignore_index
         if not valid.any():
-            return torch.tensor(
-                0.0, device=hidden_states.device, dtype=hidden_states.dtype
-            )
+            return zero, zero
         hidden_valid = hidden_states[valid]
         logits_valid = self.lm_head(hidden_valid)
-        return F.cross_entropy(logits_valid, labels[valid], reduction="mean")
+        ce_loss = F.cross_entropy(logits_valid, labels[valid], reduction="mean")
+        z_loss = (
+            self._vocab_z_loss(logits_valid)
+            if self.config.vocab_z_loss_coef > 0.0
+            else zero
+        )
+        return ce_loss, z_loss
 
     def _stream_chunk_ce_loss(
         self,
@@ -575,21 +597,20 @@ class HybridForCausalLM(nn.Module):
         labels: Tensor,
         attention_mask: Tensor | None,
         materialize_logits: bool,
-    ) -> tuple[Tensor | None, Tensor, int]:
+    ) -> tuple[Tensor | None, Tensor, int, Tensor]:
         """
         Per-chunk CE without retaining full [B, L, V] logits unless requested.
 
-        Returns (optional_logits_chunk, ce_mean_over_valid, valid_token_count).
+        Returns (optional_logits_chunk, ce_mean_over_valid, valid_token_count,
+        vocab_z_loss_for_chunk).
         """
         labels = self._apply_label_ignore(labels, attention_mask)
         ignore_index = self.config.label_ignore_index
         valid = labels != ignore_index
         n_valid = int(valid.sum().item())
+        zero = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
         if n_valid == 0:
-            zero = torch.tensor(
-                0.0, device=hidden_states.device, dtype=hidden_states.dtype
-            )
-            return None, zero, 0
+            return None, zero, 0, zero
 
         if materialize_logits:
             chunk_logits = self.lm_head(hidden_states)
@@ -598,13 +619,23 @@ class HybridForCausalLM(nn.Module):
                 labels.reshape(-1),
                 ignore_index=ignore_index,
             )
-            return chunk_logits, ce_loss, n_valid
+            z_loss = (
+                self._vocab_z_loss(chunk_logits[valid])
+                if self.config.vocab_z_loss_coef > 0.0
+                else zero
+            )
+            return chunk_logits, ce_loss, n_valid, z_loss
 
         # VRAM: lm_head only on supervised tokens — avoids [B*L, V] peak logits.
         hidden_valid = hidden_states[valid]
         logits_valid = self.lm_head(hidden_valid)
         ce_loss = F.cross_entropy(logits_valid, labels[valid], reduction="mean")
-        return None, ce_loss, n_valid
+        z_loss = (
+            self._vocab_z_loss(logits_valid)
+            if self.config.vocab_z_loss_coef > 0.0
+            else zero
+        )
+        return None, ce_loss, n_valid, z_loss
 
     def _weighted_auxiliary_loss(
         self,
@@ -693,6 +724,9 @@ class HybridForCausalLM(nn.Module):
 
         loss = None
         ce_loss = None
+        vocab_z_total = torch.tensor(
+            0.0, device=hidden_states.device, dtype=hidden_states.dtype
+        )
         if labels is not None:
             if self.config.return_logits:
                 labels = self._apply_label_ignore(labels, attention_mask)
@@ -701,8 +735,14 @@ class HybridForCausalLM(nn.Module):
                 )
                 assert logits is not None
                 ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
+                if self.config.vocab_z_loss_coef > 0.0 and logits is not None:
+                    valid_labels = labels != self.config.label_ignore_index
+                    if valid_labels.any():
+                        vocab_z_total = self._vocab_z_loss(logits[valid_labels])
             else:
-                ce_loss = self._compute_ce_loss(hidden_states, labels, attention_mask)
+                ce_loss, vocab_z_total = self._compute_ce_loss(
+                    hidden_states, labels, attention_mask
+                )
             aux_total = self._weighted_auxiliary_loss(
                 auxiliary_losses,
                 device=hidden_states.device,
@@ -714,6 +754,7 @@ class HybridForCausalLM(nn.Module):
                 ce_loss
                 + (self.router_aux_loss_coef * aux_loss)
                 + (self.router_z_loss_coef * z_loss)
+                + (self.config.vocab_z_loss_coef * vocab_z_total)
                 + aux_total
             )
 
@@ -764,6 +805,7 @@ class HybridForCausalLM(nn.Module):
         gate_stat_counts: dict[str, int] = {}
         token_weight = 0
         ce_loss_sum = torch.tensor(0.0, device=device)
+        vocab_z_sum = torch.tensor(0.0, device=device)
         aux_weighted = HybridLayerAuxLosses.zeros(
             device, self.model.embed_tokens.weight.dtype
         )
@@ -806,7 +848,7 @@ class HybridForCausalLM(nn.Module):
             chunk_logits: Tensor | None = None
             if labels is not None:
                 chunk_labels = labels[:, start:end]
-                chunk_logits, chunk_ce, n_valid = self._stream_chunk_ce_loss(
+                chunk_logits, chunk_ce, n_valid, chunk_z = self._stream_chunk_ce_loss(
                     hidden_states,
                     chunk_labels,
                     chunk_mask,
@@ -814,6 +856,7 @@ class HybridForCausalLM(nn.Module):
                 )
                 if n_valid > 0:
                     ce_loss_sum = ce_loss_sum + chunk_ce * n_valid
+                    vocab_z_sum = vocab_z_sum + chunk_z * n_valid
                     token_weight += n_valid
                 if materialize_logits and chunk_logits is not None:
                     logits_chunks.append(chunk_logits)
@@ -875,6 +918,7 @@ class HybridForCausalLM(nn.Module):
                 ce_loss
                 + (self.router_aux_loss_coef * aux_loss)
                 + (self.router_z_loss_coef * z_loss)
+                + (self.config.vocab_z_loss_coef * vocab_z_sum / max(token_weight, 1))
                 + aux_total
             )
 

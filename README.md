@@ -193,9 +193,9 @@ python scripts/toy_train.py
 
 ```bash
 python train.py \
-  --data-dir /path/to/shards \
+  --cache-dir /path/to/shards \
   --run-dir runs/hybrid-150m \
-  --config-json config.json
+  --ckpt-dir ./model_ckpt
 ```
 
 It handles seeding (with an optional fully-deterministic mode), rotating run logs, streaming shard consumption via `MmapShardDataset`, periodic cyclic validation against `Salesforce/wikitext`, gradient clipping, checkpoint save/resume (`model_ckpt.pth` + `config.json`), and warmup schedules for the auxiliary and expert-routing losses. `scripts/test_cloud_train.py` provides a smaller, self-contained IMDB-based smoke test for verifying the full objective end-to-end on cloud hardware before a long run.

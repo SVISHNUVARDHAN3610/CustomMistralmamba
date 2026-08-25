@@ -30,6 +30,10 @@ from torch.utils.data import DataLoader
 from model.core.builders import count_trainable_params
 from model.core.config import HybridMambaMoEConfig
 from model.core.constants import MEMORY_NAN_FIX_ID
+from model.core.optim import (
+    _is_adamw_no_decay,
+    split_muon_adam_params,
+)
 from model.hybrid.losses import _aux_loss_schedule, _expert_loss_schedule
 from model.hybrid.mamba import (
     fused_mamba_scan_available,
@@ -147,56 +151,9 @@ def build_training_config(vocab_size: int) -> HybridMambaMoEConfig:
     )
 
 
-# Token / slot embeddings and classifier head stay on AdamW (Moonshot + Keller).
-# Router expert-selection matrices are 2D hidden weights and stay on Muon
-# (Moonlight SVD analysis includes routers under Muon).
-_ADAMW_NAME_SUBSTRINGS = (
-    "embed_tokens",
-    "lm_head",
-    "init_memory",
-    "summary_query",
-)
-
-
-def _is_adamw_parameter(name: str, param: nn.Parameter) -> bool:
-    """True when Muon must not own this parameter.
-
-    Rules from arXiv:2502.16982 + torch.optim.Muon docs:
-      - Muon only accepts 2D matrices (hidden-layer weights).
-      - Embeddings, LM head, RMSNorm / bias / other non-matrix params -> AdamW.
-      - MoE router matrices are 2D and should use Muon (not AdamW).
-      - Mamba Conv1d weights are 3D -> AdamW.
-      - Dual-memory slot banks (init_memory / summary_query) are embedding-like -> AdamW.
-    """
-    if param.ndim != 2:
-        return True
-    return any(key in name for key in _ADAMW_NAME_SUBSTRINGS)
-
-
-def split_muon_adam_params(
-    model: nn.Module,
-) -> tuple[list[nn.Parameter], list[nn.Parameter], dict[str, list[str]]]:
-    """Split parameters into AdamW vs Muon groups with name inventories."""
-    adam_params: list[nn.Parameter] = []
-    muon_params: list[nn.Parameter] = []
-    inventory: dict[str, list[str]] = {"adamw": [], "muon": []}
-    seen: set[int] = set()
-
-    for name, param in model.named_parameters():
-        # Tied embeddings / lm_head share storage; optimize once.
-        param_id = id(param)
-        if param_id in seen:
-            continue
-        seen.add(param_id)
-
-        if _is_adamw_parameter(name, param):
-            adam_params.append(param)
-            inventory["adamw"].append(f"{name}{tuple(param.shape)}")
-        else:
-            muon_params.append(param)
-            inventory["muon"].append(f"{name}{tuple(param.shape)}")
-
-    return adam_params, muon_params, inventory
+# Parameter-grouping helpers live in model/core/optim.py (dependency-free so
+# tests can exercise them without this module's dataset imports). The names
+# are re-imported above so existing references keep working.
 
 
 def build_optimizers(
@@ -295,17 +252,26 @@ def build_optimizers(
             muon_optim = optim.Muon(muon_params, **muon_kwargs)
             meta["muon_adjust_lr_fn"] = None
 
+        # Split AdamW params so biases / norm gains / _no_weight_decay params
+        # (Mamba A_log, D) get zero weight decay; embeddings and lm_head keep
+        # the configured decay.
+        adam_decay = [p for p in adam_params if not _is_adamw_no_decay(p)]
+        adam_no_decay = [p for p in adam_params if _is_adamw_no_decay(p)]
+        adam_groups = [
+            {"params": adam_decay, "weight_decay": weight_decay},
+            {"params": adam_no_decay, "weight_decay": 0.0},
+        ]
         adam_optim = optim.AdamW(
-            adam_params,
+            adam_groups,
             lr=resolved_adam_lr,
             betas=(adam_beta1, adam_beta2),
             eps=adam_eps,
-            weight_decay=weight_decay,
             fused=fused_adam,
         )
         logger.info(
             "Muon(lr=%.3e, wd=%.3g, momentum=%.3g, nesterov=%s, ns_steps=%d, "
-            "adjust_lr_fn=%s) + AdamW(lr=%.3e, betas=(%.2f, %.2f), wd=%.3g)",
+            "adjust_lr_fn=%s) + AdamW(lr=%.3e, betas=(%.2f, %.2f), "
+            "wd=%.3g on %d params / wd=0 on %d params)",
             resolved_muon_lr,
             weight_decay,
             muon_momentum,
@@ -316,23 +282,33 @@ def build_optimizers(
             adam_beta1,
             adam_beta2,
             weight_decay,
+            len(adam_decay),
+            len(adam_no_decay),
         )
         return [muon_optim, adam_optim], True, meta
 
+    adam_only_params = list(model.parameters())
+    only_decay = [p for p in adam_only_params if not _is_adamw_no_decay(p)]
+    only_no_decay = [p for p in adam_only_params if _is_adamw_no_decay(p)]
     adam_optim = optim.AdamW(
-        list(model.parameters()),
+        [
+            {"params": only_decay, "weight_decay": weight_decay},
+            {"params": only_no_decay, "weight_decay": 0.0},
+        ],
         lr=resolved_adam_lr,
         betas=(adam_beta1, adam_beta2),
         eps=adam_eps,
-        weight_decay=weight_decay,
         fused=fused_adam,
     )
     logger.info(
-        "AdamW-only (lr=%.3e, betas=(%.2f, %.2f), wd=%.3g)",
+        "AdamW-only (lr=%.3e, betas=(%.2f, %.2f), wd=%.3g on %d params / "
+        "wd=0 on %d params)",
         resolved_adam_lr,
         adam_beta1,
         adam_beta2,
         weight_decay,
+        len(only_decay),
+        len(only_no_decay),
     )
     return [adam_optim], False, meta
 
