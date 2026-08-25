@@ -6,7 +6,7 @@ tests/__pycache__/
 reviews/
 *.log
 Improvments/
-.claude/settings.json
+.claude/
 claude.md
 
 # Training artifacts (multi-GB binaries; never commit)
