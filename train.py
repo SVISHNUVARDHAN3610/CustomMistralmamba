@@ -380,25 +380,56 @@ class RollingAverage:
         return sum(self._values) / len(self._values)
 
 
-def _weighted_terms(
+def _weighted_term_tensors(
     model: HybridForCausalLM, out: Any, step: int, max_steps: int
-) -> dict[str, float]:
+) -> dict[str, Any]:
+    """Weighted auxiliary-loss terms, kept on-device.
+
+    The hot training loop folds these straight into its single batched
+    metric transfer; each ``.item()`` here would serialize its own GPU→CPU
+    round-trip against everything already enqueued on the stream.
+    """
     cfg = model.config
     aux = out.auxiliary_losses
     assert aux is not None
     assoc_scale = _aux_loss_schedule(step, max_steps, cfg.assoc_warmup_fraction)
     expert_scale = _expert_loss_schedule(step, max_steps, cfg.expert_warmup_fraction)
     return {
-        "recon_w": float((cfg.lambda_recon * aux.recon).item()),
-        "assoc_w": float((cfg.lambda_assoc * assoc_scale * aux.assoc).item()),
-        "gate_w": float((cfg.lambda_gate * aux.gate).item()),
-        "read_w": float((cfg.lambda_read * aux.read).item()),
-        "fusion_w": float((cfg.lambda_fusion * aux.fusion).item()),
-        "expert_w": float((cfg.lambda_expert * expert_scale * aux.expert).item()),
-        "ssm_w": float((cfg.lambda_ssm * aux.ssm).item()),
-        "slot_w": float((cfg.lambda_slot * aux.slot).item()),
+        "recon_w": cfg.lambda_recon * aux.recon,
+        "assoc_w": cfg.lambda_assoc * assoc_scale * aux.assoc,
+        "gate_w": cfg.lambda_gate * aux.gate,
+        "read_w": cfg.lambda_read * aux.read,
+        "fusion_w": cfg.lambda_fusion * aux.fusion,
+        "expert_w": cfg.lambda_expert * expert_scale * aux.expert,
+        "ssm_w": cfg.lambda_ssm * aux.ssm,
+        "slot_w": cfg.lambda_slot * aux.slot,
+        # Schedule scales are plain Python floats — no device transfer.
         "assoc_scale": assoc_scale,
         "expert_scale": expert_scale,
+    }
+
+
+def _as_flush_scalar(value: Any, device: torch.device) -> torch.Tensor:
+    """Coerce a logged metric to a 0-dim fp32 tensor on ``device``.
+
+    Tensors are detached and cast (no sync); Python floats take an
+    asynchronous H2D copy when stacked with their CUDA siblings.
+    """
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device=device, dtype=torch.float32).reshape(())
+    return torch.tensor(value, device=device, dtype=torch.float32)
+
+
+def _weighted_terms(
+    model: HybridForCausalLM, out: Any, step: int, max_steps: int
+) -> dict[str, float]:
+    """Float view of :func:`_weighted_term_tensors`.
+
+    Failure-path only (non-finite diagnosis); never called per-step.
+    """
+    return {
+        name: float(value.item()) if isinstance(value, torch.Tensor) else value
+        for name, value in _weighted_term_tensors(model, out, step, max_steps).items()
     }
 
 
@@ -876,6 +907,18 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     stop_event = threading.Event()
     producer_thread: threading.Thread | None = None
     ce_smooth = RollingAverage(args.smooth_window)
+    # GPU-side metric accumulators: per-step scalars are summed on-device and
+    # pulled to the host with ONE transfer every --log-interval steps instead
+    # of ~25 blocking .item() round-trips per step (each would synchronize
+    # against the whole enqueued stream).
+    metric_sum: torch.Tensor | None = None
+    metric_fin_cnt: torch.Tensor | None = None
+    metric_bad_cnt: torch.Tensor | None = None
+    metric_count = 0
+    assoc_scale_sum = 0.0
+    expert_scale_sum = 0.0
+    metric_main_names: list[str] | None = None
+    metric_gate_names: list[str] | None = None
     reset_mamba_scan_stats()
 
     try:
@@ -954,7 +997,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
             )
 
             shard_fully_consumed = True
-            for input_ids, labels in dataloader:
+            for batches_in_shard, (input_ids, labels) in enumerate(dataloader):
                 if global_step >= args.max_steps:
                     # Hitting max-steps mid-shard: leave the shard unmarked
                     # and the cursor where it is so a later --max-steps
@@ -965,12 +1008,21 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
                 input_ids = input_ids.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
-                validate_token_batch(
-                    input_ids,
-                    cfg.vocab_size,
-                    labels=labels,
-                    ignore_index=cfg.label_ignore_index,
-                )
+                # The min/max reductions force a device sync each; shards are
+                # immutable memmaps, so checking shard starts plus a periodic
+                # sample catches corrupt files / vocab drift at ~1/256th of
+                # the pipeline cost. --validate-token-interval 1 restores
+                # every-batch checking.
+                if batches_in_shard == 0 or (
+                    args.validate_token_interval > 0
+                    and global_step % args.validate_token_interval == 0
+                ):
+                    validate_token_batch(
+                        input_ids,
+                        cfg.vocab_size,
+                        labels=labels,
+                        ignore_index=cfg.label_ignore_index,
+                    )
 
                 for opt in optimizers:
                     opt.zero_grad(set_to_none=True)
@@ -988,29 +1040,13 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     )
                 assert outputs.loss is not None
 
-                if not torch.isfinite(outputs.loss):
-                    diagnosis = _non_finite_diagnosis(
-                        model, outputs, global_step, args.max_steps
-                    )
-                    logger.error(
-                        "Non-finite loss at step=%d: %s", global_step, diagnosis
-                    )
-                    if jsonl_path is not None:
-                        with jsonl_path.open("a", encoding="utf-8") as f:
-                            f.write(
-                                json.dumps(
-                                    {
-                                        "event": "non_finite_loss",
-                                        "step": global_step,
-                                        "shard_idx": current_shard_idx,
-                                        **diagnosis,
-                                    }
-                                )
-                                + "\n"
-                            )
-                    global_step += 1
-                    continue
-
+                # Non-finiteness is handled entirely ON-DEVICE (counters +
+                # masking in the metric accumulation below, plus grad
+                # sanitation after clipping). A NaN/Inf loss or gradient no
+                # longer branches on the host mid-step: branching on a CUDA
+                # scalar (.item() / __bool__ / error_if_nonfinite=True) would
+                # force a stream-syncing D2H copy EVERY step. The cost is a
+                # wasted backward pass on an already-failed step.
                 if use_fp16_scaler:
                     scaler.scale(outputs.loss).backward()
                 else:
@@ -1021,122 +1057,279 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 if use_fp16_scaler:
                     for opt in optimizers:
                         scaler.unscale_(opt)
-                grad_norm = float(
-                    clip_grad_norm_(model.parameters(), args.max_grad_norm).item()
-                )
-
-                # Gate on gradient finiteness too: a finite loss can still
-                # produce NaN/Inf grads, which clip_grad_norm_ only logs and
-                # opt.step() would happily fold into the weights (and the next
-                # periodic checkpoint would capture the poisoned state).
-                if not math.isfinite(grad_norm):
-                    logger.error(
-                        "Non-finite grad norm at step=%d (norm=%r) — skipping "
-                        "optimizer step",
-                        global_step,
-                        grad_norm,
-                    )
-                    if jsonl_path is not None:
-                        with jsonl_path.open("a", encoding="utf-8") as f:
-                            f.write(
-                                json.dumps(
-                                    {
-                                        "event": "non_finite_grad",
-                                        "step": global_step,
-                                        "shard_idx": current_shard_idx,
-                                        "grad_norm": grad_norm,
-                                    }
+                # No .item(): the raw norm tensor feeds the metric vector,
+                # and non-finite norms surface via the flush-time counter.
+                # (Exception: --grad-nan-guard=strict deliberately reads it
+                # every step — see below.)
+                grad_norm = clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                allow_update = True
+                if args.grad_nan_guard == "strict":
+                    # The ONE deliberate per-step D2H sync in this mode
+                    # (bool() on a CUDA scalar) buys TRUE skip semantics: a
+                    # bad-grad step executes no optimizer update, no scheduler
+                    # tick, and mutates no Adam/Muon moments. This is exactly
+                    # what 'sanitize' approximates asynchronously — pick this
+                    # mode only if the per-step sync stall is acceptable.
+                    # Redundant but harmless on the fp16 GradScaler path,
+                    # which already syncs inside scaler.step().
+                    allow_update = bool(torch.isfinite(grad_norm))
+                    if not allow_update:
+                        logger.error(
+                            "Non-finite gradient norm at step %d — optimizer "
+                            "update SKIPPED (--grad-nan-guard=strict)",
+                            global_step,
+                        )
+                        if jsonl_path is not None:
+                            with jsonl_path.open("a", encoding="utf-8") as f:
+                                f.write(
+                                    json.dumps(
+                                        {
+                                            "event": "non_finite_grad",
+                                            "step": global_step,
+                                            "shard_idx": current_shard_idx,
+                                            **_non_finite_diagnosis(
+                                                model,
+                                                outputs,
+                                                global_step,
+                                                args.max_steps,
+                                            ),
+                                        }
+                                    )
+                                    + "\n"
                                 )
-                                + "\n"
-                            )
-                    global_step += 1
-                    continue
+                elif args.grad_nan_guard == "sanitize" and not use_fp16_scaler:
+                    # A non-finite norm makes clip's coef NaN, which spreads
+                    # NaN across EVERY gradient (norm-bad <=> some grad bad);
+                    # zero them so the optimizer update stays finite instead
+                    # of permanently poisoning Adam/Muon moments (M10
+                    # protection, now async). Cost: one read+write pass over
+                    # all grads per step (~sub-ms at production scale) — the
+                    # price of a hard guarantee without a host branch. The
+                    # GradScaler path must NOT be pre-sanitized: scaler.step()
+                    # only skips the update and shrinks the scale when it
+                    # still sees inf/nan itself.
+                    for p in model.parameters():
+                        if p.grad is not None:
+                            torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
 
-                for i, opt in enumerate(optimizers):
+                if allow_update:
+                    for i, opt in enumerate(optimizers):
+                        if use_fp16_scaler:
+                            # Internally no-ops when unscaled grads contain
+                            # inf/nan; update() then shrinks the scale.
+                            scaler.step(opt)
+                        else:
+                            opt.step()
                     if use_fp16_scaler:
-                        # Internally no-ops when unscaled grads contain
-                        # inf/nan; update() then shrinks the scale.
-                        scaler.step(opt)
-                    else:
-                        opt.step()
-                if use_fp16_scaler:
-                    scaler.update()
-                for sched in schedulers:
-                    sched.step()
-
-                step_ce = (
-                    float(outputs.ce_loss.item())
-                    if outputs.ce_loss is not None
-                    else 0.0
-                )
-                ce_smooth.update(step_ce)
+                        scaler.update()
+                    for sched in schedulers:
+                        sched.step()
+                # When strict skipped the update, the NaN grads are freed by
+                # the zero_grad(set_to_none=True) at the top of the next
+                # iteration — they never reach an optimizer or accumulate.
 
                 aux = outputs.auxiliary_losses
                 assert aux is not None
-                weighted = _weighted_terms(model, outputs, global_step, args.max_steps)
-                muon_lr = float(schedulers[0].get_last_lr()[0])
-                adam_lr = float(schedulers[-1].get_last_lr()[0])
 
-                record: dict[str, Any] = {
-                    "step": global_step,
-                    "shard_idx": current_shard_idx,
-                    "loss": float(outputs.loss.item()),
-                    "ce_loss": step_ce,
-                    "ce_smooth": ce_smooth.mean,
-                    "router_aux_loss": float(outputs.router_aux_loss.item())
-                    if outputs.router_aux_loss is not None
-                    else 0.0,
-                    "router_z_loss": float(outputs.router_z_loss.item())
-                    if outputs.router_z_loss is not None
-                    else 0.0,
-                    "recon": float(aux.recon.item()),
-                    "assoc": float(aux.assoc.item()),
-                    "gate": float(aux.gate.item()),
-                    "read": float(aux.read.item()),
-                    "fusion": float(aux.fusion.item()),
-                    "expert": float(aux.expert.item()),
-                    "ssm": float(aux.ssm.item()),
-                    "slot": float(aux.slot.item()),
+                # ---- metrics: accumulate on-device, transfer on flush ------
+                # Every logged scalar (losses, aux terms, weighted terms,
+                # gate stats, schedule scales) is summed into one fp32 vector
+                # on the compute device. Nothing here synchronizes; the only
+                # host readback happens in the flush below, once per
+                # --log-interval steps.
+                weighted_t = _weighted_term_tensors(
+                    model, outputs, global_step, args.max_steps
+                )
+                scalars: dict[str, Any] = {
+                    "loss": outputs.loss,
+                    "ce_loss": (
+                        outputs.ce_loss
+                        if outputs.ce_loss is not None
+                        else outputs.loss.new_zeros(())
+                    ),
+                    "router_aux_loss": (
+                        outputs.router_aux_loss
+                        if outputs.router_aux_loss is not None
+                        else outputs.loss.new_zeros(())
+                    ),
+                    "router_z_loss": (
+                        outputs.router_z_loss
+                        if outputs.router_z_loss is not None
+                        else outputs.loss.new_zeros(())
+                    ),
                     "grad_norm": grad_norm,
-                    "muon_lr": muon_lr,
-                    "adam_lr": adam_lr,
-                    **weighted,
-                    "gate_stats": {
-                        k: float(v.item())
-                        for k, v in (outputs.gate_stats or {}).items()
-                    },
                 }
-
-                if (
-                    validator is not None
-                    and args.val_interval > 0
-                    and global_step % args.val_interval == 0
+                # Schedule scales are pure-Python values: averaging them
+                # host-side avoids two device-tensor constructions (H2D)
+                # every step for numbers the GPU never needs.
+                assoc_scale_sum += weighted_t["assoc_scale"]
+                expert_scale_sum += weighted_t["expert_scale"]
+                for name in (
+                    "recon",
+                    "assoc",
+                    "gate",
+                    "read",
+                    "fusion",
+                    "expert",
+                    "ssm",
+                    "slot",
                 ):
-                    val_record = validator.evaluate(
-                        model,
-                        device=device,
-                        global_step=global_step,
-                        max_training_steps=args.max_steps,
-                        use_amp=use_amp,
-                        amp_dtype=amp_dtype,
-                        ignore_index=cfg.label_ignore_index,
+                    scalars[name] = getattr(aux, name)
+                for name, value in weighted_t.items():
+                    if isinstance(value, torch.Tensor):
+                        scalars[name] = value
+
+                gate_stats = outputs.gate_stats or {}
+                # Schema is static for a fixed config; reuse the cached
+                # name lists instead of rebuilding them every step (the
+                # equality check below still guards against drift).
+                main_names = (
+                    metric_main_names
+                    if metric_main_names is not None
+                    else list(scalars)
+                )
+                gate_names = (
+                    metric_gate_names
+                    if metric_gate_names is not None
+                    else list(gate_stats)
+                )
+                step_vec = torch.stack(
+                    [
+                        _as_flush_scalar(scalars[n], outputs.loss.device)
+                        for n in main_names
+                    ]
+                    + [
+                        _as_flush_scalar(gate_stats[n], outputs.loss.device)
+                        for n in gate_names
+                    ]
+                )
+                # Non-finite entries are masked out of the running sums and
+                # counted per name instead: instability is recorded without
+                # ever branching on a device scalar mid-step.
+                finite = torch.isfinite(step_vec)
+                if (
+                    metric_sum is None
+                    or metric_main_names != main_names
+                    or metric_gate_names != gate_names
+                ):
+                    # First step (or schema drift): (re)initialize.
+                    metric_main_names, metric_gate_names = main_names, gate_names
+                    metric_sum = torch.zeros_like(step_vec)
+                    metric_fin_cnt = torch.zeros_like(step_vec)
+                    metric_bad_cnt = torch.zeros_like(step_vec)
+                    metric_count = 0
+                metric_sum += torch.where(finite, step_vec, 0.0)
+                metric_fin_cnt += finite.to(step_vec.dtype)
+                metric_bad_cnt += (~finite).to(step_vec.dtype)
+                metric_count += 1
+
+                if global_step % args.log_interval == 0:
+                    # The window's single deliberate metrics GPU→CPU sync.
+                    assert (
+                        metric_sum is not None
+                        and metric_fin_cnt is not None
+                        and metric_bad_cnt is not None
+                        and metric_main_names is not None
+                        and metric_gate_names is not None
                     )
-                    record["val_loss"] = val_record["val_loss"]
-                    record["val_ce_loss"] = val_record["val_ce_loss"]
-                    record["val_router_aux_loss"] = val_record["val_router_aux_loss"]
-                    record["val_router_z_loss"] = val_record["val_router_z_loss"]
+                    # Masked mean over steps where each entry was finite;
+                    # means and bad-counts ride ONE host transfer.
+                    means_vec = metric_sum / metric_fin_cnt.clamp(min=1.0)
+                    flush_values = torch.cat([means_vec, metric_bad_cnt]).tolist()
+                    values = flush_values[: means_vec.numel()]
+                    bad_counts = flush_values[means_vec.numel() :]
+                    n_main = len(metric_main_names)
+                    metrics = dict(zip(metric_main_names, values[:n_main]))
+                    ce_smooth.update(metrics["ce_loss"])
+                    window = max(metric_count, 1)
+                    record: dict[str, Any] = {
+                        "step": global_step,
+                        "shard_idx": current_shard_idx,
+                        **metrics,
+                        "assoc_scale": assoc_scale_sum / window,
+                        "expert_scale": expert_scale_sum / window,
+                        "ce_smooth": ce_smooth.mean,
+                        "muon_lr": float(schedulers[0].get_last_lr()[0]),
+                        "adam_lr": float(schedulers[-1].get_last_lr()[0]),
+                        "gate_stats": dict(zip(metric_gate_names, values[n_main:])),
+                    }
+                    bad_names = {
+                        name: int(cnt)
+                        for name, cnt in list(
+                            zip(metric_main_names, bad_counts[:n_main])
+                        )
+                        + list(zip(metric_gate_names, bad_counts[n_main:]))
+                        if cnt > 0.0
+                    }
+                    if bad_names:
+                        # Aggregated replacement for the old per-step
+                        # non_finite_loss/non_finite_grad events; diagnosis
+                        # reflects the last step of the window.
+                        diagnosis = _non_finite_diagnosis(
+                            model, outputs, global_step, args.max_steps
+                        )
+                        logger.error(
+                            "Non-finite metrics in steps %d-%d: %s",
+                            global_step - metric_count + 1,
+                            global_step,
+                            bad_names,
+                        )
+                        if jsonl_path is not None:
+                            with jsonl_path.open("a", encoding="utf-8") as f:
+                                f.write(
+                                    json.dumps(
+                                        {
+                                            "event": "non_finite_metrics",
+                                            "step": global_step,
+                                            "shard_idx": current_shard_idx,
+                                            "window_steps": metric_count,
+                                            "counts": bad_names,
+                                            **diagnosis,
+                                        }
+                                    )
+                                    + "\n"
+                                )
+                    metric_sum = None
+                    metric_fin_cnt = None
+                    metric_bad_cnt = None
+                    metric_count = 0
+                    assoc_scale_sum = 0.0
+                    expert_scale_sum = 0.0
+
+                    # JSONL records and console lines are emitted per flush
+                    # window (means over --log-interval steps), matching the
+                    # single-transfer cadence rather than per-step.
+                    if (
+                        validator is not None
+                        and args.val_interval > 0
+                        and global_step % args.val_interval == 0
+                    ):
+                        val_record = validator.evaluate(
+                            model,
+                            device=device,
+                            global_step=global_step,
+                            max_training_steps=args.max_steps,
+                            use_amp=use_amp,
+                            amp_dtype=amp_dtype,
+                            ignore_index=cfg.label_ignore_index,
+                        )
+                        record["val_loss"] = val_record["val_loss"]
+                        record["val_ce_loss"] = val_record["val_ce_loss"]
+                        record["val_router_aux_loss"] = val_record[
+                            "val_router_aux_loss"
+                        ]
+                        record["val_router_z_loss"] = val_record["val_router_z_loss"]
+
+                        if jsonl_path is not None:
+                            with jsonl_path.open("a", encoding="utf-8") as f:
+                                f.write(json.dumps(val_record) + "\n")
+
+                        logger.info(_format_val_log_line(val_record))
 
                     if jsonl_path is not None:
                         with jsonl_path.open("a", encoding="utf-8") as f:
-                            f.write(json.dumps(val_record) + "\n")
+                            f.write(json.dumps(record) + "\n")
 
-                    logger.info(_format_val_log_line(val_record))
-
-                if jsonl_path is not None:
-                    with jsonl_path.open("a", encoding="utf-8") as f:
-                        f.write(json.dumps(record) + "\n")
-
-                if global_step % args.log_interval == 0:
                     logger.info(_format_log_line(global_step, args.max_steps, record))
 
                 if global_step % args.save_interval == 0 and global_step > 0:
@@ -1157,6 +1350,13 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     )
                     producer.save_checkpoint(args.dataset_ckpt_path)
 
+                # Convention: global_step counts iterations ENTERED, so the
+                # first completed update logs as step=0 ("updates completed
+                # before this iteration"). Every consumer — assoc/expert
+                # warmups, log/validation/save cadence, checkpoint contents,
+                # resume — shares this convention consistently; do not shift
+                # it without migrating checkpoints and scripts/
+                # test_cloud_train.py in lockstep.
                 global_step += 1
 
             if not shard_fully_consumed:
@@ -1333,6 +1533,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--save-interval", type=int, default=1000)
+    parser.add_argument(
+        "--validate-token-interval",
+        type=int,
+        default=256,
+        help="Check token-id ranges on each shard's first batch and every Nth "
+        "step (1 = every batch; 0 = shard starts only). Each check forces a "
+        "GPU sync for the min/max reduction, so per-batch checking stalls "
+        "the CPU/GPU pipeline in the hot loop.",
+    )
+    parser.add_argument(
+        "--grad-nan-guard",
+        choices=("sanitize", "strict", "monitor"),
+        default="sanitize",
+        help="Non-finite-gradient handling on the bf16/fp32 path (fp16's "
+        "GradScaler always has its own found_inf skip). Of {no per-step "
+        "sync, true optimizer-skip, low complexity} you can pick any two: "
+        "'sanitize' (default): zero NaN/Inf grads after clipping EVERY "
+        "step — no sync, params can never be poisoned; the price is one "
+        "read+write pass over all grads (~0.5-1%% of step time at 148M "
+        "params, benchmark with scripts/bench_grad_guard.py) and a "
+        "skipped-bad step still applying bounded momentum-decay/"
+        "weight-decay drift instead of being a perfect no-op. 'strict': "
+        "one deliberate D2H sync EVERY step in exchange for TRUE skip "
+        "semantics — a bad-grad step runs no optimizer or scheduler "
+        "update and mutates no optimizer state. 'monitor': zero overhead "
+        "and zero protection — NaN grads reach opt.step() and poison "
+        "Adam/Muon moments permanently; flush-time counters report the "
+        "damage, but treat the affected run as dead-from-that-point and "
+        "roll back to the last good checkpoint.",
+    )
     parser.add_argument(
         "--smooth-window", type=int, default=50, help="Rolling CE mean window."
     )
