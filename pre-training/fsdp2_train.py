@@ -714,8 +714,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
     model = train_mod.HybridForCausalLM(cfg).to(device)
     # Calibration AFTER process-group init (its rank0 broadcast engages) and
-    # BEFORE fully_shard (plain params/buffers, no DTensor plumbing yet).
-    model.calibrate_ssm_norm_thresholds()
+    # BEFORE fully_shard (plain params/buffers, no DTensor plumbing yet). It
+    # lives on the inner HybridModel, not the HybridForCausalLM wrapper.
+    model.model.calibrate_ssm_norm_thresholds()
     reset_mamba_scan_stats()
     n_params = count_trainable_params(model)
     if is_rank0:
@@ -730,12 +731,12 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     fully_shard = api["fully_shard"]
     # Inner-to-outer: layers first (independent reshard-after-forward /
     # prefetch), then the root gathers everything left outside the layers.
-    for layer in model.layers:
+    for layer in model.model.layers:
         fully_shard(layer, mp_policy=mp_policy)
     fully_shard(model, mp_policy=mp_policy)
     logger.info(
         "fully_shard applied: layers=%d world=%d mp=%s",
-        len(model.layers),
+        len(model.model.layers),
         world_size,
         "bf16/fp32-reduce" if not args.no_amp else "fp32",
     )
