@@ -707,6 +707,10 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     if tokenizer.eos_token_id is not None:
         cfg.eos_token_id = tokenizer.eos_token_id
 
+    if args.no_fused_mamba:
+        # Diagnostic knob: force the PyTorch scan tiers (e.g. to isolate a
+        # suspected mamba-ssm x FSDP2 interaction without uninstalling).
+        cfg.use_fused_mamba_scan = False
     logger.info(log_mamba_backend(cfg))
     logger.info(
         "rank=%d/%d device=%s dist_backend=%s fused_mamba=%s memory_nan_fix=%s",
@@ -1381,6 +1385,12 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "nccl", "gloo"),
         default="auto",
         help="'auto' picks nccl on CUDA hosts, gloo otherwise.",
+    )
+    parser.add_argument(
+        "--no-fused-mamba",
+        action="store_true",
+        help="Force the PyTorch scan tiers even when mamba-ssm is importable "
+        "(diagnostic knob for suspected fused-kernel/FSDP2 issues).",
     )
     parser.add_argument(
         "--no-amp",
