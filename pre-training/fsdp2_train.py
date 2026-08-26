@@ -162,6 +162,21 @@ def init_distributed(dist_backend: str | None) -> tuple[int, int, torch.device]:
             backend = "nccl" if torch.cuda.is_available() else "gloo"
         else:
             backend = dist_backend
+        # Fail fast when more workers than GPUs were launched: every worker
+        # pins cuda:<local_rank>, so ranks beyond the device count would die
+        # much later on an opaque "invalid device ordinal" from set_device.
+        if (
+            backend == "nccl"
+            and world_size > 1
+            and world_size > torch.cuda.device_count()
+        ):
+            n_gpus = max(torch.cuda.device_count(), 1)
+            raise RuntimeError(
+                f"Launched world_size={world_size} but only {n_gpus} CUDA "
+                f"device(s) are visible — each worker needs its own GPU. "
+                f"Relaunch with: torchrun --standalone "
+                f"--nproc_per_node={n_gpus} ..."
+            )
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", "29517")
         torch.distributed.init_process_group(
