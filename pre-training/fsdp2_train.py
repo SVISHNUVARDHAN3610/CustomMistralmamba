@@ -6,10 +6,16 @@ nan-guard trilemma, zero-sync logging discipline) executed over ``fully_shard``
 sharded parameters. Only the execution model changes.
 
 Deliberate deviations from ``train.py`` (each required by distribution):
-  * ``fully_shard`` wrapping (inner-to-outer) with module-level mixed
-    precision ``MixedPrecisionPolicy(param_dtype=bfloat16,
-    reduce_dtype=float32)`` REPLACES autocast. The fp16 GradScaler path is
-    removed entirely: its inf-reduction assumes plain gradients.
+  * ``fully_shard`` wrapping (inner-to-outer). Parameters stay FP32 under
+    FSDP2 and mixed precision is a real ``torch.autocast(bfloat16)`` around
+    the forward, exactly like ``train.py`` — NOT
+    ``MixedPrecisionPolicy(param_dtype=bfloat16)``: physically casting
+    weights to bf16 during forward breaks ``model/hybrid/layer.py``'s
+    auxiliary-loss block, which runs under ``autocast(enabled=False)`` on
+    fp32-promoted activations ("recon/gate/slot paths need fp32") and hits
+    fp32-activation x bf16-weight matmul errors (found on the first GPU
+    smoke). The fp16 GradScaler path is removed entirely: its inf-reduction
+    assumes plain gradients.
   * ``DistributedSampler(shuffle=True, seed, drop_last=True)`` replaces
     DataLoader shuffle. drop_last is mandatory — an uneven final batch would
     deadlock the collective backward. The intra-shard permutation is a pure
@@ -724,10 +730,13 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         logger.info("trainable_params=%s (%.3fB)", f"{n_params:,}", n_params / 1e9)
 
     api = _require_fsdp2()
-    mp_policy = api["MixedPrecisionPolicy"](
-        param_dtype=None if args.no_amp else torch.bfloat16,
-        reduce_dtype=torch.float32,
-    )
+    # Params stay fp32; the autocast below provides bf16 compute, mirroring
+    # train.py. MixedPrecisionPolicy(param_dtype=bfloat16) would swap weights
+    # to bf16 inside forward and crash layer.py's aux-loss block, which runs
+    # under autocast(enabled=False) on fp32-promoted activations.
+    mp_policy = api["MixedPrecisionPolicy"](reduce_dtype=torch.float32)
+    use_amp = device.type == "cuda" and not args.no_amp
+    amp_dtype = torch.bfloat16  # main() rejects anything else
     fully_shard = api["fully_shard"]
     # Inner-to-outer: layers first (independent reshard-after-forward /
     # prefetch), then the root gathers everything left outside the layers.
@@ -738,7 +747,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         "fully_shard applied: layers=%d world=%d mp=%s",
         len(model.model.layers),
         world_size,
-        "bf16/fp32-reduce" if not args.no_amp else "fp32",
+        f"{'autocast-bf16' if use_amp else 'fp32'}/fp32-params/fp32-reduce",
     )
 
     optimizers, use_muon, opt_meta = build_fsdp2_optimizers(
@@ -1005,12 +1014,17 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 for micro_idx, (m_ids, m_labels) in enumerate(micro_inputs):
                     if accum > 1 and micro_idx == len(micro_inputs) - 1:
                         model.set_requires_gradient_sync(True, recurse=True)
-                    outputs = model(
-                        input_ids=m_ids,
-                        labels=m_labels,
-                        training_step=global_step,
-                        max_training_steps=args.max_steps,
-                    )
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=amp_dtype,
+                        enabled=use_amp,
+                    ):
+                        outputs = model(
+                            input_ids=m_ids,
+                            labels=m_labels,
+                            training_step=global_step,
+                            max_training_steps=args.max_steps,
+                        )
                     assert outputs.loss is not None
                     # Mean-of-means: equal-size micro-batches (drop_last), so
                     # dividing by count averages correctly.
@@ -1021,9 +1035,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 assert loss_for_metrics is not None
                 outputs.loss = loss_for_metrics
 
-                # No autocast: MixedPrecisionPolicy casts params/inputs at the
-                # module level; gradients arrive fp32 (reduce_dtype), so clip
-                # sees TRUE magnitudes — the scaler unscale step disappears.
+                # Params are fp32 masters (see the mp_policy note above), so
+                # gradients arrive fp32 and clip sees TRUE magnitudes — no
+                # scaler unscale step exists on this bf16-autocast path.
                 grad_norm_dt = clip_grad_norm_(model.parameters(), args.max_grad_norm)
                 grad_norm = (
                     grad_norm_dt.full_tensor()
@@ -1251,8 +1265,8 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                             device=device,
                             global_step=global_step,
                             max_training_steps=args.max_steps,
-                            use_amp=False,  # MP policy replaces autocast
-                            amp_dtype=torch.bfloat16,
+                            use_amp=use_amp,
+                            amp_dtype=amp_dtype,
                             ignore_index=cfg.label_ignore_index,
                         )
                         if world_size > 1:
