@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from model.core.dtype import _is_low_precision, _promote_fp32
+from model.core.dtype import _is_low_precision, _promote_fp32, _restore_dtype
 from model.hybrid.losses import MemoryReconstructionDecoder
 
 
@@ -402,13 +402,20 @@ def batched_dual_memory_read(
     k = k.view(2 * bsz, m_len, num_heads, head_dim)
     v = v.view(2 * bsz, m_len, num_heads, head_dim)
 
+    # Promote v alongside q/k: outside autocast (native-bf16 weights) a
+    # fp32-attn x bf16-v einsum raises a dtype-mismatch RuntimeError. Under
+    # autocast this is a no-op (autocast already widened both operands).
     if _is_low_precision(q.dtype):
         q = _promote_fp32(q)
         k = _promote_fp32(k)
+        v = _promote_fp32(v)
     scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * scale
     attn = F.softmax(scores, dim=-1)
     out = torch.einsum("bhqk,bkhd->bqhd", attn, v)
     out = out.reshape(2 * bsz, seq_len, hidden)
+    # Restore activation dtype before the out_proj bmm so the stacked weights
+    # (native weight dtype) and `out` always match outside autocast too.
+    out = _restore_dtype(out, queries.dtype)
     out = torch.bmm(out, out_w[bank_idx].transpose(1, 2))
 
     return out[:bsz], out[bsz:]
@@ -452,9 +459,12 @@ def _batched_memory_summarize(
     q = q.view(2 * bsz, m_len, num_heads, head_dim)
     k = k.view(2 * bsz, buf_len, num_heads, head_dim)
     v = v.view(2 * bsz, buf_len, num_heads, head_dim)
+    # Promote v alongside q/k (see batched_dual_memory_read): native-bf16
+    # callers crash on a fp32-attn x bf16-v einsum without autocast.
     if _is_low_precision(q.dtype):
         q = _promote_fp32(q)
         k = _promote_fp32(k)
+        v = _promote_fp32(v)
     scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * scale
     all_masked: Tensor | None = None
     if key_padding_mask is not None:
@@ -471,6 +481,8 @@ def _batched_memory_summarize(
         attn[all_masked] = 0.0
     out = torch.einsum("bhqk,bkhd->bqhd", attn, v)
     out = out.reshape(2 * bsz, m_len, bank_a.hidden_size)
+    # Restore buffer dtype before the stacked out_proj bmm (native-bf16 safe).
+    out = _restore_dtype(out, keys.dtype)
     out = torch.bmm(out, out_w[bank_idx].transpose(1, 2))
 
     return out[:bsz], out[bsz:]

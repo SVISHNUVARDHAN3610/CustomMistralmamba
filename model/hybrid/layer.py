@@ -274,14 +274,20 @@ class HybridDecoderLayer(nn.Module):
             layer_checkpointing_active=layer_checkpointing_active,
         )
 
+        # Zero pad positions' raw branch outputs BEFORE fusion so the fusion
+        # gate sees identical inputs in both the dual-memory arm and the
+        # Jamba-like ablation arm (use_dual_memory=False). The residual output
+        # is masked again after fusion either way; this keeps `fusion_gate`
+        # stats/loss comparable across ablation arms on padded batches.
+        if hidden_mask is not None:
+            attn_out = attn_out * hidden_mask
+            mamba_out = mamba_out * hidden_mask
+
         if self.use_dual_memory:
             assert memory_state is not None
             a_mem, s_mem = memory_state
             prev_a_mem = a_mem
             prev_s_mem = s_mem
-            if hidden_mask is not None:
-                attn_out = attn_out * hidden_mask
-                mamba_out = mamba_out * hidden_mask
 
             # Accumulate raw branch outputs for chunk-aligned memory writes.
             buf_attn = attn_out
@@ -470,7 +476,9 @@ class HybridDecoderLayer(nn.Module):
                 ) + combine_read_utilization_loss(
                     self.state_memory_combine, cfg.read_util_min_fraction
                 )
-            fusion_loss = fusion_balance_loss(fusion_gate)
+            fusion_loss = fusion_balance_loss(
+                fusion_gate, target=cfg.fusion_balance_target
+            )
             ssm_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
             if ssm_state is not None:
                 gamma = getattr(self, "ssm_norm_gamma", None)

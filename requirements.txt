@@ -1,9 +1,16 @@
 # Runtime — model/ package + tests/test_model.py
 torch>=2.1.0
 
+# Training entry points (train.py, utils/, scripts/) — NOT needed for the
+# model package or unit tests (CI installs torch only).
+numpy>=1.24
+datasets>=2.16
+transformers>=4.38
+
 # Optional GPU acceleration for MambaBlock (CUDA only; auto-fallback if missing):
 # mamba-ssm>=2.2.0
 
-# Development — lint (CI) and local git hooks
-ruff>=0.6.0
+# Development — lint (CI) and local git hooks. Pinned to the same revision as
+# .pre-commit-config.yaml and .github/workflows/ci.yaml; bump all three together.
+ruff==0.16.2
 pre-commit>=3.0.0

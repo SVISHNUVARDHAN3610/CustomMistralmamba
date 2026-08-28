@@ -113,7 +113,10 @@ def main() -> None:
     print(f"trainable_params={n_params:,} (target ~5M)")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    log_path = args.log_jsonl if str(args.log_jsonl) else None
+    # `--log-jsonl ""` parses to Path("") whose str() is "." — treat both ""
+    # and "." as "logging disabled" instead of trying to open the directory.
+    log_arg = str(args.log_jsonl)
+    log_path = args.log_jsonl if log_arg and log_arg != "." else None
     if log_path is not None:
         log_path.parent.mkdir(parents=True, exist_ok=True)
 

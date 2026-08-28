@@ -17,6 +17,7 @@ REQUIRED_MODULES = [
     "model.core.builders",
     "model.core.config",
     "model.core.constants",
+    "model.core.optim",
     "model.layers",
     "model.layers.attention",
     "model.layers.moe",

@@ -321,20 +321,30 @@ class MambaBlock(nn.Module):
                 token_mask = attention_mask[:, -seq_len:]
                 _assert_right_padded_attention_mask(token_mask, debug_state_checks)
                 # Right-padding assumption: valid prefix length per row.
-                valid_lens = token_mask.sum(dim=1)
-                conv_state = torch.zeros(
-                    x.size(0),
-                    self.d_inner,
-                    self.conv_kernel,
-                    device=x.device,
-                    dtype=x_in.dtype,
-                )
-                for b in range(x.size(0)):
-                    vl = int(valid_lens[b].item())
-                    if vl <= 0:
-                        continue
-                    take = min(self.conv_kernel, vl)
-                    conv_state[b, :, -take:] = x_in[b, vl - take : vl].transpose(0, 1)
+                # Vectorized gather (no per-row .item() host syncs): row b
+                # fills columns [K - take_b, K) with x_in[b, vl_b - take_b :
+                # vl_b]^T where take_b = min(K, vl_b); every other column is
+                # zeroed via the validity mask (rows with vl == 0 stay all
+                # zero) — identical to the previous per-row loop.
+                k = self.conv_kernel
+                valid_lens = token_mask.sum(dim=1)  # [B]
+                take = torch.clamp(valid_lens, max=k)  # [B]
+                # Source position for destination column j: vl - K + j;
+                # clamped into range for lanes the mask discards.
+                src_idx = (
+                    valid_lens.unsqueeze(1) - k + torch.arange(k, device=x.device)
+                ).clamp(min=0, max=seq_len - 1)  # [B, K]
+                dst_valid = (
+                    torch.arange(k, device=x.device).unsqueeze(0)
+                    >= (k - take).unsqueeze(1)
+                ).to(x_in.dtype)  # [B, K]; all-zero rows when vl == 0
+                conv_state = (
+                    x_in.gather(
+                        dim=1,
+                        index=src_idx.unsqueeze(-1).expand(-1, -1, x_in.size(2)),
+                    ).transpose(1, 2)
+                    * dst_valid.unsqueeze(1)
+                ).contiguous()  # [B, d_inner, K]; step() shifts it in-place
             else:
                 pad = max(self.conv_kernel - seq_len, 0)
                 conv_state = F.pad(x_conv, (pad, 0))[
@@ -508,7 +518,13 @@ class MambaBlock(nn.Module):
         use_scan_checkpoint = (
             training and mamba_internal_checkpoint and not layer_checkpointing_active
         )
-        if use_parallel_scan or seq_len <= parallel_scan_fallback_max_len:
+        # `blocked_scan_min_len` is the intended lower bound of the blocked
+        # tier: raising it above `parallel_scan_fallback_max_len` extends the
+        # parallel tier to match. Lowering it below that ceiling has no effect
+        # (the parallel tier keeps priority). With the defaults (4096/4096)
+        # this reduces to the original two-knob dispatch exactly.
+        parallel_limit = max(parallel_scan_fallback_max_len, blocked_scan_min_len - 1)
+        if use_parallel_scan or seq_len <= parallel_limit:
             return cls._parallel_associative_scan(delta_a, delta_b_u)
         if seq_len <= sequential_scan_min_len:
             scan_fn = lambda a, b: cls._blocked_associative_scan(

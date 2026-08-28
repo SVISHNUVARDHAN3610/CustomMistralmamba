@@ -5,3 +5,20 @@ __pycache__/
 tests/__pycache__/
 reviews/
 *.log
+Improvments/
+.claude/
+claude.md
+
+# Training artifacts (multi-GB binaries; never commit)
+runs/
+data_cache/
+model_ckpt/
+*.pth
+*.pth.tmp
+shard_*.bin
+shard_*.bin.tmp
+*.done
+*.jsonl
+
+# Tooling caches
+.ruff_cache/

@@ -1,8 +1,12 @@
 """Mixture-of-Experts components."""
 
+import warnings
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+_GROUPED_GEMM_FALLBACK_WARNED = False
 
 
 class SwiGLUExpert(nn.Module):
@@ -337,8 +341,12 @@ class DroplessMoELayer(nn.Module):
 
         sorted_inputs = x_flat[sorted_token]
         counts = torch.bincount(sorted_expert, minlength=self.num_experts)
-        offs = torch.zeros(self.num_experts + 1, dtype=torch.long, device=x_flat.device)
-        offs[1:] = counts.cumsum(0)
+        # Some CUDA builds of torch._grouped_mm require int32 offsets; CPU is
+        # fine with int64. Use the narrow type on CUDA to avoid a permanent
+        # silent fallback to the loop dispatch below.
+        offs_dtype = torch.int32 if x_flat.is_cuda else torch.long
+        offs = torch.zeros(self.num_experts + 1, dtype=offs_dtype, device=x_flat.device)
+        offs[1:] = counts.cumsum(0).to(offs_dtype)
 
         w_gate, w_up, w_down = self._stack_expert_weights()
         grouped_mm = torch._grouped_mm
@@ -348,6 +356,15 @@ class DroplessMoELayer(nn.Module):
             hidden = F.silu(gate) * up
             expert_outputs = grouped_mm(hidden, w_down.transpose(1, 2), offs)
         except (RuntimeError, TypeError):
+            global _GROUPED_GEMM_FALLBACK_WARNED
+            if not _GROUPED_GEMM_FALLBACK_WARNED:
+                warnings.warn(
+                    "torch._grouped_mm MoE dispatch failed on this build; "
+                    "falling back to the stacked-weight loop dispatch for the "
+                    "rest of the process (results identical, slower).",
+                    stacklevel=2,
+                )
+                _GROUPED_GEMM_FALLBACK_WARNED = True
             return self._forward_grouped(
                 x_flat,
                 topk_weights,

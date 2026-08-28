@@ -96,15 +96,15 @@ Full per-layer diagrams, compute-cost tables, and a component-by-component refer
 The reference implementation is feature-complete for training and autoregressive inference:
 
 - Both model families (`MixtralForCausalLM`, `HybridForCausalLM`) with matched GQA/MoE building blocks for apples-to-apples ablation.
-- `CompressiveMemoryBank` with GRU-style gated writes, padding-safe batched read/write, and a training-only reconstruction/associative auxiliary path.
+- `CompressiveMemoryBank` with single-sigmoid gated EMA writes, padding-safe batched read/write, and a training-only reconstruction/associative auxiliary path.
 - `MambaBlock` with a four-tier scan dispatch (fused CUDA kernel when `mamba-ssm` is available, Hillis-Steele parallel scan, blocked vectorized scan, sequential scan with checkpointing) so behavior is correct with or without GPU fused kernels.
 - **Eight auxiliary losses** (reconstruction, associative recall, gate regularization, slot utilization, read/fusion/SSM-calibration/expert-routing terms) with warmup schedules, documented formula-by-formula in [`research/loss-definitions.md`](research/loss-definitions.md).
 - Chunked, truncated-BPTT training for long sequences, with memory and Mamba state threaded across chunks.
 - Incremental KV / Mamba / memory caching for `generate()`, including a fast single-token decode path (`MambaBlock.step()`, `MemoryWriteBuffer.append_single_token()`).
 - A parameter-matched **null baseline builder** (`build_test3_null_baseline_config`) that expands the Mamba state size to compensate for a disabled memory bank, so memory's contribution can be isolated from raw parameter count.
 - Production training script (`train.py`) consuming memory-mapped tokenized shards, with cyclic WikiText validation, mixed-precision-safe FP32 promotion for numerically sensitive ops, and full checkpoint/resume support.
-- A cloud training smoke test (`scripts/test_cloud_train.py`) exercising the complete training objective at ~150M parameters on IMDB.
-- 66 unit tests covering forward/backward correctness, shape invariants, caching, memory falsification hooks, and numerical stability (`MEMORY_NAN_FIX_ID` guards against NaNs on the memory path).
+- A cloud training smoke test (`scripts/test_cloud_train.py`) exercising the complete training objective at ~200M parameters on IMDB.
+- 83 unit tests covering forward/backward correctness, shape invariants, caching, memory falsification hooks, and numerical stability (`MEMORY_NAN_FIX_ID` guards against NaNs on the memory path), plus a separate CPU smoke module (`tests.test_toy_train_smoke`) that runs real chunked-BPTT training steps.
 
 ## 6. Repository Structure
 
@@ -128,7 +128,7 @@ CustomMistralmamba/
 │
 ├── scripts/
 │   ├── toy_train.py               # ~5M-param smoke test, single file, no dataset needed
-│   ├── test_cloud_train.py        # ~150M-param IMDB training smoke test
+│   ├── test_cloud_train.py        # ~200M-param IMDB training smoke test
 │   └── verify_model_package.py    # Import / API surface sanity check
 │
 ├── utils/
@@ -137,7 +137,7 @@ CustomMistralmamba/
 │
 ├── train.py                       # Production training loop (streaming shards + checkpointing)
 └── tests/
-    ├── test_model.py              # 66 unit tests over the model package
+    ├── test_model.py              # 83 unit tests over the model package
     └── test_toy_train_smoke.py    # Smoke test for scripts/toy_train.py
 ```
 
@@ -193,9 +193,9 @@ python scripts/toy_train.py
 
 ```bash
 python train.py \
-  --data-dir /path/to/shards \
+  --cache-dir /path/to/shards \
   --run-dir runs/hybrid-150m \
-  --config-json config.json
+  --ckpt-dir ./model_ckpt
 ```
 
 It handles seeding (with an optional fully-deterministic mode), rotating run logs, streaming shard consumption via `MmapShardDataset`, periodic cyclic validation against `Salesforce/wikitext`, gradient clipping, checkpoint save/resume (`model_ckpt.pth` + `config.json`), and warmup schedules for the auxiliary and expert-routing losses. `scripts/test_cloud_train.py` provides a smaller, self-contained IMDB-based smoke test for verifying the full objective end-to-end on cloud hardware before a long run.
@@ -203,14 +203,19 @@ It handles seeding (with an optional fully-deterministic mode), rotating run log
 ## 10. Testing
 
 ```bash
-pytest tests/ -v
+python -m unittest tests.test_model -v
+python -m unittest tests.test_toy_train_smoke -v
+# Single test:
+python -m unittest tests.test_model.TestHybridModel.test_forward_backward -v
 ```
+
+(The project standard is `unittest`; pytest is not a dependency.)
 
 `tests/test_model.py` covers both model families across forward/backward correctness, shape and dtype invariants under AMP, KV/Mamba/memory cache threading through `generate()`, padding-mask correctness in the memory write path, the four Mamba scan-backend tiers, and the memory-zeroing falsification hook (`HybridModel.zero_memory_states()`). `tests/test_toy_train_smoke.py` verifies the minimal training loop runs end-to-end without dataset dependencies.
 
 ## 11. Scientific Status — What's Proven vs. Unproven
 
-**Implemented and verified:** the architecture runs correctly forward and backward at multiple scales, from a ~5M-parameter toy config to a ~150M-parameter cloud smoke run; gradients flow through both branches and both memory banks; caching is correct across incremental decode; the four Mamba scan tiers produce numerically consistent results with and without fused CUDA kernels.
+**Implemented and verified:** the architecture runs correctly forward and backward at multiple scales, from a ~5M-parameter toy config to a ~200M-parameter cloud smoke run; gradients flow through both branches and both memory banks; caching is correct across incremental decode; the four Mamba scan tiers produce numerically consistent results with and without fused CUDA kernels.
 
 **Not yet established:** whether the dual memory banks are *necessary* rather than *redundant* with the Mamba branch's own hidden state, which is already a compressed summary of everything seen so far. This is the central open question the codebase is built to answer, not a claim it currently makes.
 
@@ -267,7 +272,7 @@ A longer, prioritized backlog — gate regularizers, content-addressable slots, 
 
 - No large-scale hyperparameter sweep has been run over the eight auxiliary-loss coefficients; current defaults are informed starting points from `loss-definitions.md`, not tuned values.
 - Fused CUDA scan kernels are optional and untested at the largest sequence-length tiers on every hardware target; wall-clock linear-time claims are FLOP-true but not yet wall-clock-verified at 100K+ tokens.
-- All current training runs are smoke-scale (toy config, ~150M-parameter IMDB run); no long-context or large-scale training run has been completed.
+- All current training runs are smoke-scale (toy config, ~200M-parameter IMDB run); no long-context or large-scale training run has been completed.
 - The central scientific claim — that dual memory improves rare-fact recall beyond what a larger Mamba state alone provides — is explicitly unproven pending the falsification suite in §12.
 
 ## 18. Citation

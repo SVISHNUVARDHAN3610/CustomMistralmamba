@@ -30,27 +30,9 @@ from model.hybrid.memory import (
     batched_dual_memory_write,
 )
 from model.layers.norm import RMSNorm
-
-
-def _top_k_filter(logits: Tensor, top_k: int) -> Tensor:
-    top_k = min(top_k, logits.size(-1))
-    values, _ = torch.topk(logits, top_k, dim=-1)
-    min_values = values[:, -1].unsqueeze(-1)
-    return torch.where(
-        logits < min_values, torch.full_like(logits, float("-inf")), logits
-    )
-
-
-def _top_p_filter(logits: Tensor, top_p: float) -> Tensor:
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-    sorted_mask = cumulative_probs > top_p
-    sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
-    sorted_mask[..., 0] = False
-
-    mask = torch.zeros_like(sorted_mask).scatter(1, sorted_indices, sorted_mask)
-    return logits.masked_fill(mask, float("-inf"))
+from model.layers.rope import RotaryEmbedding
+from model.layers.sampling import top_k_filter as _top_k_filter
+from model.layers.sampling import top_p_filter as _top_p_filter
 
 
 @dataclass
@@ -73,9 +55,19 @@ class HybridModel(nn.Module):
         super().__init__()
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        layers: list[HybridDecoderLayer] = [
-            HybridDecoderLayer(config) for _ in range(config.num_layers)
-        ]
+        # One RoPE table shared by every attention layer (identical head_dim /
+        # theta everywhere): avoids num_layers duplicate cos/sin caches. The
+        # buffers are non-persistent, so state_dicts are unchanged.
+        shared_rotary_emb = RotaryEmbedding(
+            dim=config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
+        )
+        layers: list[HybridDecoderLayer] = []
+        for _ in range(config.num_layers):
+            layer = HybridDecoderLayer(config)
+            layer.attention_block.rotary_emb = shared_rotary_emb
+            layers.append(layer)
         if config.use_torch_compile:
             if config.gradient_checkpointing:
                 warnings.warn(
@@ -385,95 +377,25 @@ class HybridModel(nn.Module):
         )
 
 
-@dataclass
-class _CudaDecodeGraphRunner:
-    """CUDA graph replay for fixed-shape single-token decode steps."""
+def _per_row_position_ids(attention_mask: Tensor) -> Tensor:
+    """Absolute RoPE positions for right-padded rows.
 
-    model: HybridForCausalLM
-    graph: torch.cuda.CUDAGraph | None = None
-    static_input_ids: Tensor | None = None
-    static_attention_mask: Tensor | None = None
-    static_position_ids: Tensor | None = None
-    static_out: HybridTrainingOutput | None = None
-    mask_width: int = 0
+    Each token's position is its index among the row's *valid* tokens, so
+    shorter rows in a padded batch are not offset by their pad count. Pad
+    slots get their left neighbor's position (clamped at 0); they are masked
+    out of attention anyway.
+    """
+    return (attention_mask.cumsum(dim=-1) - 1).clamp(min=0).to(torch.long)
 
-    def capture(
-        self,
-        input_ids: Tensor,
-        attention_mask: Tensor,
-        position_ids: Tensor,
-        past_key_values: list | None,
-        memory_states: list | None,
-        mamba_caches: list | None,
-        write_buffers: list | None,
-        past_seen_tokens: int,
-        active_batch_mask: Tensor,
-    ) -> bool:
-        if not torch.cuda.is_available():
-            return False
-        try:
-            self.mask_width = attention_mask.size(1)
-            self.static_input_ids = input_ids.clone()
-            self.static_attention_mask = attention_mask.clone()
-            self.static_position_ids = position_ids.clone()
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(2):
-                    self.static_out = self.model.forward(
-                        input_ids=self.static_input_ids,
-                        attention_mask=self.static_attention_mask,
-                        position_ids=self.static_position_ids,
-                        past_key_values=past_key_values,
-                        mamba_caches=mamba_caches,
-                        memory_states=memory_states,
-                        write_buffers=write_buffers,
-                        past_seen_tokens=past_seen_tokens,
-                        use_cache=True,
-                        skip_memory_write=True,
-                        active_batch_mask=active_batch_mask,
-                        decode_accumulate_only=True,
-                    )
-            torch.cuda.current_stream().wait_stream(stream)
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
-                self.static_out = self.model.forward(
-                    input_ids=self.static_input_ids,
-                    attention_mask=self.static_attention_mask,
-                    position_ids=self.static_position_ids,
-                    past_key_values=past_key_values,
-                    mamba_caches=mamba_caches,
-                    memory_states=memory_states,
-                    write_buffers=write_buffers,
-                    past_seen_tokens=past_seen_tokens,
-                    use_cache=True,
-                    skip_memory_write=True,
-                    active_batch_mask=active_batch_mask,
-                    decode_accumulate_only=True,
-                )
-            return True
-        except (RuntimeError, ValueError):
-            self.graph = None
-            self.static_out = None
-            self.static_attention_mask = None
-            self.static_position_ids = None
-            return False
 
-    def replay(
-        self,
-        input_ids: Tensor,
-        attention_mask: Tensor,
-        position_ids: Tensor,
-    ) -> HybridTrainingOutput:
-        assert self.graph is not None and self.static_input_ids is not None
-        assert self.static_out is not None
-        assert self.static_attention_mask is not None
-        assert self.static_position_ids is not None
-        self.static_input_ids.copy_(input_ids)
-        self.static_attention_mask.copy_(attention_mask)
-        self.static_position_ids.copy_(position_ids)
-        self.graph.replay()
-        return self.static_out
+# NOTE on `config.use_cuda_graph`: the previous CUDA-graph single-token decode
+# runner was removed (audit finding H2). Warm-up passes ran against the live
+# conv/ssm/KV caches (MambaBlock.step() shifts conv_state in place), and graph
+# replay froze KV/SSM/memory state at capture-time addresses whenever an eager
+# flush step interleaved — silently producing garbage continuations. A correct
+# implementation needs persistent captured buffers (in-place copies into
+# static caches + ring-buffer KV). Until that exists the flag stays as a
+# documented no-op: generate() warns once and always decodes eagerly.
 
 
 class HybridForCausalLM(nn.Module):
@@ -546,28 +468,39 @@ class HybridForCausalLM(nn.Module):
         labels = self._apply_label_ignore(labels, attention_mask)
         return int((labels != self.config.label_ignore_index).sum().item())
 
+    def _vocab_z_loss(self, logits: Tensor) -> Tensor:
+        """PaLM/OLMo-style z-loss on final logits: mean(logsumexp^2)."""
+        return torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
+
     def _compute_ce_loss(
         self,
         hidden_states: Tensor,
         labels: Tensor,
         attention_mask: Tensor | None = None,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor]:
         """
-        Token-weighted CE mean over non-ignored labels.
+        Token-weighted CE mean over non-ignored labels plus vocab z-loss.
 
         When batches contain padding, lm_head runs only on valid label positions
         so peak activation memory is [N_valid, V] instead of [B*L, V].
+
+        Returns (ce_loss, vocab_z_loss); z-loss is 0 when disabled.
         """
         labels = self._apply_label_ignore(labels, attention_mask)
         ignore_index = self.config.label_ignore_index
+        zero = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
         valid = labels != ignore_index
         if not valid.any():
-            return torch.tensor(
-                0.0, device=hidden_states.device, dtype=hidden_states.dtype
-            )
+            return zero, zero
         hidden_valid = hidden_states[valid]
         logits_valid = self.lm_head(hidden_valid)
-        return F.cross_entropy(logits_valid, labels[valid], reduction="mean")
+        ce_loss = F.cross_entropy(logits_valid, labels[valid], reduction="mean")
+        z_loss = (
+            self._vocab_z_loss(logits_valid)
+            if self.config.vocab_z_loss_coef > 0.0
+            else zero
+        )
+        return ce_loss, z_loss
 
     def _stream_chunk_ce_loss(
         self,
@@ -575,21 +508,20 @@ class HybridForCausalLM(nn.Module):
         labels: Tensor,
         attention_mask: Tensor | None,
         materialize_logits: bool,
-    ) -> tuple[Tensor | None, Tensor, int]:
+    ) -> tuple[Tensor | None, Tensor, int, Tensor]:
         """
         Per-chunk CE without retaining full [B, L, V] logits unless requested.
 
-        Returns (optional_logits_chunk, ce_mean_over_valid, valid_token_count).
+        Returns (optional_logits_chunk, ce_mean_over_valid, valid_token_count,
+        vocab_z_loss_for_chunk).
         """
         labels = self._apply_label_ignore(labels, attention_mask)
         ignore_index = self.config.label_ignore_index
         valid = labels != ignore_index
         n_valid = int(valid.sum().item())
+        zero = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
         if n_valid == 0:
-            zero = torch.tensor(
-                0.0, device=hidden_states.device, dtype=hidden_states.dtype
-            )
-            return None, zero, 0
+            return None, zero, 0, zero
 
         if materialize_logits:
             chunk_logits = self.lm_head(hidden_states)
@@ -598,13 +530,23 @@ class HybridForCausalLM(nn.Module):
                 labels.reshape(-1),
                 ignore_index=ignore_index,
             )
-            return chunk_logits, ce_loss, n_valid
+            z_loss = (
+                self._vocab_z_loss(chunk_logits[valid])
+                if self.config.vocab_z_loss_coef > 0.0
+                else zero
+            )
+            return chunk_logits, ce_loss, n_valid, z_loss
 
         # VRAM: lm_head only on supervised tokens — avoids [B*L, V] peak logits.
         hidden_valid = hidden_states[valid]
         logits_valid = self.lm_head(hidden_valid)
         ce_loss = F.cross_entropy(logits_valid, labels[valid], reduction="mean")
-        return None, ce_loss, n_valid
+        z_loss = (
+            self._vocab_z_loss(logits_valid)
+            if self.config.vocab_z_loss_coef > 0.0
+            else zero
+        )
+        return None, ce_loss, n_valid, z_loss
 
     def _weighted_auxiliary_loss(
         self,
@@ -693,6 +635,9 @@ class HybridForCausalLM(nn.Module):
 
         loss = None
         ce_loss = None
+        vocab_z_total = torch.tensor(
+            0.0, device=hidden_states.device, dtype=hidden_states.dtype
+        )
         if labels is not None:
             if self.config.return_logits:
                 labels = self._apply_label_ignore(labels, attention_mask)
@@ -701,8 +646,14 @@ class HybridForCausalLM(nn.Module):
                 )
                 assert logits is not None
                 ce_loss = loss_fct(logits.view(-1, self.vocab_size), labels.reshape(-1))
+                if self.config.vocab_z_loss_coef > 0.0 and logits is not None:
+                    valid_labels = labels != self.config.label_ignore_index
+                    if valid_labels.any():
+                        vocab_z_total = self._vocab_z_loss(logits[valid_labels])
             else:
-                ce_loss = self._compute_ce_loss(hidden_states, labels, attention_mask)
+                ce_loss, vocab_z_total = self._compute_ce_loss(
+                    hidden_states, labels, attention_mask
+                )
             aux_total = self._weighted_auxiliary_loss(
                 auxiliary_losses,
                 device=hidden_states.device,
@@ -714,6 +665,7 @@ class HybridForCausalLM(nn.Module):
                 ce_loss
                 + (self.router_aux_loss_coef * aux_loss)
                 + (self.router_z_loss_coef * z_loss)
+                + (self.config.vocab_z_loss_coef * vocab_z_total)
                 + aux_total
             )
 
@@ -757,13 +709,20 @@ class HybridForCausalLM(nn.Module):
         memory_states: list[HybridMemoryState | None] | None = None
         logits_chunks: list[Tensor] = []
         # MOERouter aux/z are per-token means; HybridModel layer-averages them;
-        # here we token-weight across internal chunks.
+        # here we weight across internal chunks by chunk length and divide by
+        # the summed chunk lengths (NOT the valid-token count: the eight layer
+        # aux terms and router aux/z are means over all chunk positions, so
+        # mixing a valid-token denominator with chunk-length weights skews
+        # their scale under right-padding). CE and vocab-z ARE valid-token
+        # quantities and keep the token_weight normalization.
         total_aux = torch.tensor(0.0, device=device)
         total_z = torch.tensor(0.0, device=device)
         gate_stat_sums: dict[str, Tensor] = {}
         gate_stat_counts: dict[str, int] = {}
         token_weight = 0
+        total_chunk_len = 0
         ce_loss_sum = torch.tensor(0.0, device=device)
+        vocab_z_sum = torch.tensor(0.0, device=device)
         aux_weighted = HybridLayerAuxLosses.zeros(
             device, self.model.embed_tokens.weight.dtype
         )
@@ -806,7 +765,7 @@ class HybridForCausalLM(nn.Module):
             chunk_logits: Tensor | None = None
             if labels is not None:
                 chunk_labels = labels[:, start:end]
-                chunk_logits, chunk_ce, n_valid = self._stream_chunk_ce_loss(
+                chunk_logits, chunk_ce, n_valid, chunk_z = self._stream_chunk_ce_loss(
                     hidden_states,
                     chunk_labels,
                     chunk_mask,
@@ -814,6 +773,7 @@ class HybridForCausalLM(nn.Module):
                 )
                 if n_valid > 0:
                     ce_loss_sum = ce_loss_sum + chunk_ce * n_valid
+                    vocab_z_sum = vocab_z_sum + chunk_z * n_valid
                     token_weight += n_valid
                 if materialize_logits and chunk_logits is not None:
                     logits_chunks.append(chunk_logits)
@@ -824,6 +784,7 @@ class HybridForCausalLM(nn.Module):
                 del chunk_logits
             total_aux = total_aux + aux_loss * chunk_len
             total_z = total_z + z_loss * chunk_len
+            total_chunk_len += chunk_len
             aux_weighted = HybridLayerAuxLosses(
                 recon=aux_weighted.recon + chunk_aux.recon * chunk_len,
                 assoc=aux_weighted.assoc + chunk_aux.assoc * chunk_len,
@@ -843,21 +804,21 @@ class HybridForCausalLM(nn.Module):
                     gate_stat_counts[key] += 1
 
         logits = torch.cat(logits_chunks, dim=1) if materialize_logits else None
-        aux_loss = total_aux / max(token_weight, 1)
-        z_loss = total_z / max(token_weight, 1)
+        chunk_tw = max(total_chunk_len, 1)
+        aux_loss = total_aux / chunk_tw
+        z_loss = total_z / chunk_tw
         all_gate_stats = {
             k: gate_stat_sums[k] / gate_stat_counts[k] for k in gate_stat_sums
         }
-        tw = max(token_weight, 1)
         auxiliary_losses = HybridAuxiliaryLossBreakdown(
-            recon=aux_weighted.recon / tw,
-            assoc=aux_weighted.assoc / tw,
-            gate=aux_weighted.gate / tw,
-            read=aux_weighted.read / tw,
-            fusion=aux_weighted.fusion / tw,
-            expert=aux_weighted.expert / tw,
-            ssm=aux_weighted.ssm / tw,
-            slot=aux_weighted.slot / tw,
+            recon=aux_weighted.recon / chunk_tw,
+            assoc=aux_weighted.assoc / chunk_tw,
+            gate=aux_weighted.gate / chunk_tw,
+            read=aux_weighted.read / chunk_tw,
+            fusion=aux_weighted.fusion / chunk_tw,
+            expert=aux_weighted.expert / chunk_tw,
+            ssm=aux_weighted.ssm / chunk_tw,
+            slot=aux_weighted.slot / chunk_tw,
         )
 
         loss = None
@@ -875,6 +836,7 @@ class HybridForCausalLM(nn.Module):
                 ce_loss
                 + (self.router_aux_loss_coef * aux_loss)
                 + (self.router_z_loss_coef * z_loss)
+                + (self.config.vocab_z_loss_coef * vocab_z_sum / max(token_weight, 1))
                 + aux_total
             )
 
@@ -945,14 +907,28 @@ class HybridForCausalLM(nn.Module):
         Autoregressive generation with incremental KV + Mamba + memory caches.
         Prefill and decode write memory in chunks of ``memory_write_interval``
         (buffered branch outputs), matching training ``memory_chunk_size``.
+
+        ``eos_token_id=None`` falls back to ``config.eos_token_id``; any
+        negative value (e.g. ``-1``) *disables* EOS early-stopping entirely.
+
+        Works regardless of ``config.return_logits``: the flag is forced on
+        for the duration of generation (as-trained checkpoints ship with it
+        off for VRAM). Note for right-padded batches: per-row RoPE positions
+        honor the padding mask, but pad K/V entries still occupy sliding-window
+        cache slots, so very long pads relative to the window can crowd out
+        real context at the tail.
         """
         was_training = self.training
         self.eval()
 
         device = input_ids.device
+        if input_ids.numel() == 0 or input_ids.size(1) == 0:
+            raise ValueError("generate() requires a non-empty prompt.")
         eos_token_id = (
             eos_token_id if eos_token_id is not None else self.config.eos_token_id
         )
+        # Negative sentinel = caller explicitly wants no EOS early-stop.
+        eos_stopping_enabled = eos_token_id is None or eos_token_id >= 0
 
         generated = input_ids
         if attention_mask is None:
@@ -995,22 +971,34 @@ class HybridForCausalLM(nn.Module):
         write_buffers: list[MemoryWriteBuffer | None] | None = None
         past_seen_tokens = 0
         tokens_in_write_buffer = 0
-        out = None
-        cuda_runner: _CudaDecodeGraphRunner | None = None
+        out: HybridTrainingOutput | None = None
+
+        # As-trained configs set return_logits=False (saves VRAM during
+        # training); generation needs last-step logits, so force materialization
+        # for the duration and restore afterwards. Configs defaulting to True
+        # are unaffected.
+        prev_return_logits = self.config.return_logits
+        self.config.return_logits = True
+        if self.config.use_cuda_graph:
+            warnings.warn(
+                "config.use_cuda_graph=True is a no-op: the CUDA-graph decode "
+                "path was removed because it silently corrupted recurrent "
+                "state (capture-time cache addresses frozen across replay). "
+                "Decoding eagerly.",
+                stacklevel=2,
+            )
 
         try:
-            # Chunked prefill so memory writes match training chunk size.
+            # Chunked prefill so memory writes match training chunk size. The
+            # FULL prefix mask is passed (not window-truncated): the attention
+            # layer truncates mask columns in lockstep with KV eviction, which
+            # keeps sink slots aligned with absolute positions 0..K-1 even
+            # when interior pads exist.
             for start in range(0, prompt_len, write_interval):
                 end = min(start + write_interval, prompt_len)
                 chunk = generated_buf[:, start:end]
                 chunk_mask = attn_buf[:, :end]
-                if chunk_mask.size(1) > self.config.window_size:
-                    chunk_mask = chunk_mask[:, -self.config.window_size :]
-                chunk_pos = (
-                    torch.arange(start, end, dtype=torch.long, device=device)
-                    .unsqueeze(0)
-                    .expand(batch_size, -1)
-                )
+                chunk_pos = _per_row_position_ids(chunk_mask)[:, start:end]
                 # Flush write at end of each prefill chunk.
                 out = self.forward(
                     input_ids=chunk,
@@ -1032,11 +1020,14 @@ class HybridForCausalLM(nn.Module):
                 tokens_in_write_buffer = 0
 
             assert out is not None
+            assert out.logits is not None
 
             for _step in range(max_new_tokens):
                 logits = out.logits[:, -1, :]
                 if do_sample:
-                    next_token_logits = logits / max(temperature, 1e-8)
+                    # fp32 sampling: softmax/multinomial in bf16/fp16 lose
+                    # low-probability tails and can zero them out entirely.
+                    next_token_logits = logits.float() / max(temperature, 1e-8)
                     if top_k is not None:
                         next_token_logits = _top_k_filter(next_token_logits, top_k)
                     if top_p is not None:
@@ -1044,34 +1035,33 @@ class HybridForCausalLM(nn.Module):
                     probs = F.softmax(next_token_logits, dim=-1)
                     next_token = torch.multinomial(probs, num_samples=1)
                 else:
-                    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+                    next_token = torch.argmax(logits.float(), dim=-1, keepdim=True)
 
-                next_token = torch.where(
-                    finished.unsqueeze(-1),
-                    torch.full_like(next_token, eos_token_id),
-                    next_token,
-                )
+                if eos_stopping_enabled:
+                    next_token = torch.where(
+                        finished.unsqueeze(-1),
+                        torch.full_like(next_token, int(eos_token_id)),
+                        next_token,
+                    )
 
                 generated_buf[:, cur_len : cur_len + 1] = next_token
                 attn_buf[:, cur_len : cur_len + 1] = (~finished).long().unsqueeze(-1)
                 cur_len += 1
-                finished = finished | (next_token.squeeze(-1) == eos_token_id)
-                if finished.all():
-                    break
+                if eos_stopping_enabled:
+                    finished = finished | (next_token.squeeze(-1) == eos_token_id)
+                    if finished.all():
+                        break
 
                 active = ~finished
                 if not active.any():
                     break
 
-                step_position_ids = torch.full(
-                    (batch_size, 1),
-                    past_seen_tokens,
-                    dtype=torch.long,
-                    device=device,
-                )
+                # Per-row decode position: index among this row's valid tokens
+                # (padded prompts must not inflate shorter rows' positions).
+                step_position_ids = (
+                    attn_buf[:, :cur_len].sum(dim=1, keepdim=True).long() - 1
+                ).clamp(min=0)
                 step_attn_mask = attn_buf[:, :cur_len]
-                if step_attn_mask.size(1) > self.config.window_size:
-                    step_attn_mask = step_attn_mask[:, -self.config.window_size :]
 
                 step_input = next_token.clone()
                 step_input[~active] = self.config.pad_token_id
@@ -1079,69 +1069,20 @@ class HybridForCausalLM(nn.Module):
                 do_memory_write = tokens_in_write_buffer >= write_interval
                 decode_accumulate = not do_memory_write
 
-                use_graph = (
-                    self.config.use_cuda_graph
-                    and not do_sample
-                    and decode_accumulate
-                    and active.all()
-                    and torch.cuda.is_available()
+                out = self.forward(
+                    input_ids=step_input,
+                    attention_mask=step_attn_mask,
+                    position_ids=step_position_ids,
+                    past_key_values=past_key_values,
+                    memory_states=memory_states,
+                    mamba_caches=mamba_caches,
+                    write_buffers=write_buffers,
+                    past_seen_tokens=past_seen_tokens,
+                    use_cache=True,
+                    skip_memory_write=not do_memory_write,
+                    active_batch_mask=active,
+                    decode_accumulate_only=decode_accumulate,
                 )
-
-                if use_graph:
-                    if (
-                        cuda_runner is not None
-                        and cuda_runner.mask_width != step_attn_mask.size(1)
-                    ):
-                        cuda_runner = None
-                    if cuda_runner is None:
-                        cuda_runner = _CudaDecodeGraphRunner(self)
-                        if not cuda_runner.capture(
-                            step_input,
-                            step_attn_mask,
-                            step_position_ids,
-                            past_key_values,
-                            memory_states,
-                            mamba_caches,
-                            write_buffers,
-                            past_seen_tokens,
-                            active,
-                        ):
-                            cuda_runner = None
-                    if cuda_runner is not None:
-                        out = cuda_runner.replay(
-                            step_input, step_attn_mask, step_position_ids
-                        )
-                    else:
-                        out = self.forward(
-                            input_ids=step_input,
-                            attention_mask=step_attn_mask,
-                            position_ids=step_position_ids,
-                            past_key_values=past_key_values,
-                            memory_states=memory_states,
-                            mamba_caches=mamba_caches,
-                            write_buffers=write_buffers,
-                            past_seen_tokens=past_seen_tokens,
-                            use_cache=True,
-                            skip_memory_write=True,
-                            active_batch_mask=active,
-                            decode_accumulate_only=True,
-                        )
-                else:
-                    cuda_runner = None
-                    out = self.forward(
-                        input_ids=step_input,
-                        attention_mask=step_attn_mask,
-                        position_ids=step_position_ids,
-                        past_key_values=past_key_values,
-                        memory_states=memory_states,
-                        mamba_caches=mamba_caches,
-                        write_buffers=write_buffers,
-                        past_seen_tokens=past_seen_tokens,
-                        use_cache=True,
-                        skip_memory_write=not do_memory_write,
-                        active_batch_mask=active,
-                        decode_accumulate_only=decode_accumulate,
-                    )
                 past_key_values = out.past_key_values
                 memory_states = out.memory_states
                 mamba_caches = out.mamba_caches
@@ -1156,6 +1097,7 @@ class HybridForCausalLM(nn.Module):
                     memory_states, write_buffers
                 )
         finally:
+            self.config.return_logits = prev_return_logits
             self.train(was_training)
 
         return generated_buf[:, :cur_len]

@@ -4,12 +4,16 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from model.core.config import MixtralConfig
 from model.layers.attention import SlidingWindowGQA
 from model.layers.moe import DroplessMoELayer, MOERouter, SwiGLUExpert
 from model.layers.norm import RMSNorm
+from model.layers.rope import RotaryEmbedding
+from model.layers.sampling import top_k_filter as _top_k_filter
+from model.layers.sampling import top_p_filter as _top_p_filter
 
 
 class MixtralDecoderLayer(nn.Module):
@@ -90,10 +94,22 @@ class MixtralTrainingOutput:
 class MixtralModel(nn.Module):
     def __init__(self, config: MixtralConfig) -> None:
         super().__init__()
+        self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList(
-            [MixtralDecoderLayer(config) for _ in range(config.num_layers)]
+        # One RoPE table shared by every attention layer (identical head_dim /
+        # theta everywhere): avoids num_layers duplicate cos/sin caches. The
+        # buffers are non-persistent, so state_dicts are unchanged.
+        shared_rotary_emb = RotaryEmbedding(
+            dim=config.head_dim,
+            max_position_embeddings=config.max_position_embeddings,
+            base=config.rope_theta,
         )
+        layers = []
+        for _ in range(config.num_layers):
+            layer = MixtralDecoderLayer(config)
+            layer.attention_block.rotary_emb = shared_rotary_emb
+            layers.append(layer)
+        self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -103,14 +119,29 @@ class MixtralModel(nn.Module):
         position_ids: torch.Tensor | None = None,
         past_key_values: list | None = None,
         use_cache: bool = False,
+        past_seen_tokens: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list | None]:
         hidden_states = self.embed_tokens(input_ids)
         seq_len = hidden_states.size(1)
 
         if position_ids is None:
+            # Incremental decoding must continue RoPE at the cached offset,
+            # not restart at 0 (which silently scrambles relative distances).
+            offset = past_seen_tokens if past_seen_tokens is not None else 0
             position_ids = torch.arange(
-                seq_len, dtype=torch.long, device=hidden_states.device
+                offset,
+                offset + seq_len,
+                dtype=torch.long,
+                device=hidden_states.device,
             ).unsqueeze(0)
+            if position_ids.size(0) == 1 and hidden_states.size(0) > 1:
+                position_ids = position_ids.expand(hidden_states.size(0), -1)
+
+        if int(position_ids.max().item()) >= self.config.max_position_embeddings:
+            raise ValueError(
+                f"position_ids exceed max_position_embeddings="
+                f"{self.config.max_position_embeddings}; fixed caches cannot grow."
+            )
 
         total_aux_loss = torch.tensor(
             0.0, device=hidden_states.device, dtype=hidden_states.dtype
@@ -180,6 +211,7 @@ class MixtralForCausalLM(nn.Module):
         past_key_values: list | None = None,
         use_cache: bool = False,
         labels: Tensor | None = None,
+        past_seen_tokens: int | None = None,
     ) -> MixtralTrainingOutput:
 
         hidden_states, aux_loss, z_loss, present_key_values = self.model(
@@ -188,6 +220,7 @@ class MixtralForCausalLM(nn.Module):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            past_seen_tokens=past_seen_tokens,
         )
         logits = self.lm_head(hidden_states)
 
@@ -216,6 +249,14 @@ class MixtralForCausalLM(nn.Module):
                 + (self.router_aux_loss_coef * aux_loss)
                 + (self.router_z_loss_coef * z_loss)
             )
+            if self.config.vocab_z_loss_coef > 0.0:
+                valid = labels != self.config.label_ignore_index
+                if valid.any():
+                    loss = (
+                        loss
+                        + self.config.vocab_z_loss_coef
+                        * torch.logsumexp(logits[valid].float(), dim=-1).pow(2).mean()
+                    )
 
         output = MixtralTrainingOutput(
             logits=logits,
@@ -226,3 +267,135 @@ class MixtralForCausalLM(nn.Module):
             past_key_values=present_key_values,
         )
         return output
+
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: Tensor,
+        max_new_tokens: int = 50,
+        temperature: float = 1.0,
+        top_k: int | None = None,
+        top_p: float | None = None,
+        do_sample: bool = True,
+        eos_token_id: int | None = None,
+        attention_mask: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Autoregressive generation with an incremental KV cache, mirroring the
+        hybrid family's ``generate()`` (minus the memory/Mamba machinery).
+
+        ``eos_token_id=None`` falls back to ``config.eos_token_id``; any
+        negative value (e.g. ``-1``) *disables* EOS early-stopping entirely.
+        Per-row RoPE positions honor right-padding; pad K/V entries still
+        occupy sliding-window cache slots.
+        """
+        if input_ids.numel() == 0 or input_ids.size(1) == 0:
+            raise ValueError("generate() requires a non-empty prompt.")
+        device = input_ids.device
+        eos_token_id = (
+            eos_token_id if eos_token_id is not None else self.config.eos_token_id
+        )
+        eos_stopping_enabled = eos_token_id is None or eos_token_id >= 0
+
+        generated = input_ids
+        if attention_mask is None:
+            attention_mask = torch.ones_like(generated)
+
+        batch_size = generated.size(0)
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        prompt_len = generated.size(1)
+        max_positions = self.config.max_position_embeddings
+        if prompt_len > max_positions:
+            raise ValueError(
+                f"Prompt length {prompt_len} exceeds "
+                f"max_position_embeddings={max_positions}."
+            )
+        if prompt_len + max_new_tokens > max_positions:
+            raise ValueError(
+                f"prompt_len+max_new_tokens={prompt_len + max_new_tokens} "
+                f"exceeds max_position_embeddings={max_positions}."
+            )
+
+        total_len = prompt_len + max_new_tokens
+        generated_buf = torch.full(
+            (batch_size, total_len),
+            self.config.pad_token_id,
+            dtype=input_ids.dtype,
+            device=device,
+        )
+        generated_buf[:, :prompt_len] = generated
+        attn_buf = torch.zeros(
+            batch_size, total_len, dtype=attention_mask.dtype, device=device
+        )
+        attn_buf[:, :prompt_len] = attention_mask
+        cur_len = prompt_len
+
+        past_key_values: list | None = None
+        past_seen_tokens = 0
+        out: MixtralTrainingOutput | None = None
+
+        # Prefill in one pass (no recurrent state to chunk around); pass
+        # the FULL prefix mask so the attention layer's sink-eviction mask
+        # truncation stays aligned with KV slots.
+        prefill_pos = (attn_buf[:, :prompt_len].cumsum(dim=-1) - 1).clamp(min=0)
+        out = self.forward(
+            input_ids=generated_buf[:, :prompt_len],
+            attention_mask=attn_buf[:, :prompt_len],
+            position_ids=prefill_pos,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = out.past_key_values
+        past_seen_tokens = prompt_len
+
+        for _step in range(max_new_tokens):
+            logits = out.logits[:, -1, :]
+            if do_sample:
+                next_token_logits = logits.float() / max(temperature, 1e-8)
+                if top_k is not None:
+                    next_token_logits = _top_k_filter(next_token_logits, top_k)
+                if top_p is not None:
+                    next_token_logits = _top_p_filter(next_token_logits, top_p)
+                probs = F.softmax(next_token_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            else:
+                next_token = torch.argmax(logits.float(), dim=-1, keepdim=True)
+
+            if eos_stopping_enabled:
+                next_token = torch.where(
+                    finished.unsqueeze(-1),
+                    torch.full_like(next_token, int(eos_token_id)),
+                    next_token,
+                )
+
+            generated_buf[:, cur_len : cur_len + 1] = next_token
+            attn_buf[:, cur_len : cur_len + 1] = (~finished).long().unsqueeze(-1)
+            cur_len += 1
+            if eos_stopping_enabled:
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
+                if finished.all():
+                    break
+
+            active = ~finished
+            if not active.any():
+                break
+
+            step_input = next_token.clone()
+            step_input[~active] = self.config.pad_token_id
+            step_position_ids = (
+                attn_buf[:, :cur_len].sum(dim=1, keepdim=True).long() - 1
+            ).clamp(min=0)
+
+            out = self.forward(
+                input_ids=step_input,
+                attention_mask=attn_buf[:, :cur_len],
+                position_ids=step_position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                past_seen_tokens=past_seen_tokens,
+            )
+            past_key_values = out.past_key_values
+            past_seen_tokens += 1
+
+        return generated_buf[:, :cur_len]

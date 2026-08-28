@@ -17,10 +17,10 @@ retaining a mechanism for long-range, non-recurring information that both
 attention and the SSM branch tend to lose over long contexts.
 
 A reference PyTorch implementation exists (`model.py`, ~4.4k lines), verified
-with 66 unit tests in `tests/test_model.py`, forward/backward passes, chunked
+with 83 unit tests in `tests/test_model.py`, forward/backward passes, chunked
 long-context training, and an autoregressive `generate()` method. A cloud
 training smoke script (`scripts/test_cloud_train.py`) exercises the full
-training objective on IMDB at ~150M parameters. This document lays out the
+training objective on IMDB at ~200M parameters. This document lays out the
 problem, the design, what's built, what's still unproven, and the evaluation
 plan that determines whether the memory component earns its place in the
 architecture.
@@ -123,8 +123,8 @@ branch and written *from* branch outputs.
 **Why memory is bounded and gated, not a static parameter:** the memory bank
 is read via cross-attention (chunk tokens as queries, m memory slots as
 keys/values — O(L·m), linear because m is fixed) and written via a
-GRU-style gate that blends a compressed summary of the current chunk into
-existing memory. This is what makes it a genuine memory system rather than a
+single-sigmoid gate that blends (EMA-style) a compressed summary of the
+current chunk into existing memory. This is what makes it a genuine memory system rather than a
 learned bias term added to the input.
 
 **Why fusion is per-token, not cross-attention:** the attention branch and
@@ -224,7 +224,7 @@ share the GQA and MoE stacks:
   `get_mamba_scan_stats()` report the active backend at startup.
 
 - ✅ **`CompressiveMemoryBank`** — multi-head attention read/write over m fixed
-  slots. GRU-style write gate blends chunk summary into memory. Padding-safe:
+  slots. Single-sigmoid write gate blends chunk summary into memory. Padding-safe:
   all-masked rows skip writes and use finite softmax guards (see
   `MEMORY_NAN_FIX_ID`). Optional training-only `MemoryReconstructionDecoder`
   and assoc key/value projections.
@@ -252,7 +252,7 @@ share the GQA and MoE stacks:
   | `gradient_checkpointing` | `False` | Per-layer activation checkpointing |
   | `use_fused_mamba_scan` | `True` | Requires `mamba-ssm` + CUDA |
   | `use_grouped_moe_dispatch` | `True` | Sort-by-expert token dispatch |
-  | `use_cuda_graph` | `False` | Optional CUDA-graph single-token decode |
+  | `use_cuda_graph` | `False` | No-op: CUDA-graph decode removed (corrupted recurrent state); warns if enabled |
   | `capacity_factor` | `None` | Fully dropless MoE (batch-independent) |
 
 - ✅ **`MemoryWriteBuffer`** — pre-allocated decode/prefill buffer that
@@ -279,13 +279,13 @@ share the GQA and MoE stacks:
 
 ### 5.3 Training & Test Infrastructure
 
-- ✅ **`tests/test_model.py`** — 66 unit tests covering forward/backward,
+- ✅ **`tests/test_model.py`** — 83 unit tests covering forward/backward,
   chunked training parity, incremental vs full-forward logit cosine similarity,
   memory persistence across chunks, padding/NaN edge cases, fused Mamba parity,
   auxiliary loss gradients, MoE dispatch, CUDA-graph decode parity, and
   falsification hooks.
 
-- ✅ **`scripts/test_cloud_train.py`** — one-epoch IMDB smoke test (~150M
+- ✅ **`scripts/test_cloud_train.py`** — one-epoch IMDB smoke test (~200M
   params, `memory_chunk_size=256`, `stream_chunked_ce_loss=True`,
   `return_logits=False`) with validation CE, cosine LR, and per-loss-term
   logging. Intended for GPU cloud hosts (Colab, Kaggle, etc.).
@@ -345,7 +345,7 @@ more machinery on top of a mechanism that hasn't earned its place.
 | Write-gate saturation | Same failure mode as vanilla RNNs over very long sequences; `L_gate` entropy loss mitigates but may need periodic reset or stronger regularization |
 | Router collapse (MoE) | Standard Mixtral-class issue; load-balancing aux loss + z-loss implemented; `L_expert` adds specialization pressure after warmup |
 | Hardware efficiency | Pure PyTorch scan is unfused (materializes O(L·d·n) state); install `mamba-ssm` for production. Memory read/write is small-shaped — batched dual-bank paths help but custom kernels may still be needed at scale |
-| Incremental generation | ✅ Done — `MambaBlock.step` + KV/memory threading + `MemoryWriteBuffer`; `generate()` is O(L) per step. Optional `use_cuda_graph` for wall-clock. Remaining work is fused CUDA kernels, not correctness |
+| Incremental generation | ✅ Done — `MambaBlock.step` + KV/memory threading + `MemoryWriteBuffer`; `generate()` is O(L) per step. Remaining work is fused CUDA kernels, not correctness (an experimental CUDA-graph decode was removed — replay froze recurrent caches at capture-time addresses) |
 | Padded-batch training stability | All-masked-row NaN guards are in place; cloud runs should log `MEMORY_NAN_FIX_ID` to confirm the correct `model.py` revision is loaded |
 | Auxiliary loss tuning | Eight λ coefficients with warmup schedules; no large-scale sweep yet — defaults are starting points from `loss-definitions.md` |
 | Scientific evidence | Falsification harness (needle/rare-fact eval) not yet built — see `Improvement-suggestions.md` §B |

@@ -166,6 +166,10 @@ class WikiTextCyclicValidator:
             "router_z_loss": 0.0,
         }
         token_weight = 0
+        # Router aux/z are per-batch means (like the model's internal aux
+        # losses), so they must be averaged per batch — weighting them by
+        # active-token counts silently rescales them with each batch's padding.
+        batch_count = 0
 
         for batch in loader:
             input_ids = batch["input_ids"].to(device)
@@ -191,13 +195,14 @@ class WikiTextCyclicValidator:
 
             weight = float(active)
             token_weight += active
+            batch_count += 1
             totals["loss"] += float(out.loss.item()) * weight
             if out.ce_loss is not None:
                 totals["ce_loss"] += float(out.ce_loss.item()) * weight
             if out.router_aux_loss is not None:
-                totals["router_aux_loss"] += float(out.router_aux_loss.item()) * weight
+                totals["router_aux_loss"] += float(out.router_aux_loss.item())
             if out.router_z_loss is not None:
-                totals["router_z_loss"] += float(out.router_z_loss.item()) * weight
+                totals["router_z_loss"] += float(out.router_z_loss.item())
 
         if was_training:
             model.train()
@@ -223,8 +228,8 @@ class WikiTextCyclicValidator:
             "step": global_step,
             "val_loss": totals["loss"] / token_weight,
             "val_ce_loss": totals["ce_loss"] / token_weight,
-            "val_router_aux_loss": totals["router_aux_loss"] / token_weight,
-            "val_router_z_loss": totals["router_z_loss"] / token_weight,
+            "val_router_aux_loss": totals["router_aux_loss"] / max(batch_count, 1),
+            "val_router_z_loss": totals["router_z_loss"] / max(batch_count, 1),
             "val_rows": self.num_rows,
             "val_batch_size": self.batch_size,
             "val_row_start": row_start,
