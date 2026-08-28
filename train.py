@@ -552,7 +552,7 @@ def _as_numpy_rng_state(value: Any) -> Any:
 
 def _as_torch_rng_state(value: Any) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
-        return value.to(dtype=torch.uint8)
+        return value.detach().cpu().to(dtype=torch.uint8)
     return torch.tensor(value, dtype=torch.uint8)
 
 
