@@ -451,11 +451,23 @@ class EMABaseline:
         spike = torch.zeros_like(self.ema, dtype=torch.bool)
         if self.multiplier <= 0.0:
             return spike
-        # A value counts as a spike only once the baseline is trusted and
-        # exceeds the multiplier band. All comparisons stay on-device.
-        ready = self.count >= self.min_history
-        bound = self.ema * self.multiplier
-        spike = ready & finite & (values > bound)
+        # A value is a spike when its MAGNITUDE exceeds multiplier x the
+        # magnitude of the baseline — sign-symmetric, because the vector
+        # contains negative metrics (the gate-entropy loss is -entropy, in
+        # [-ln 2, 0]); a sign-blind ``values > ema * multiplier`` turns the
+        # bound into a large NEGATIVE number for those and flags every
+        # in-range observation forever (the EMA then never ingests them).
+        # ``trusted`` additionally requires a nonzero baseline: a metric that
+        # is exactly 0 while warm (e.g. the expert loss before its 10%
+        # switch-on) would otherwise arm on a zero baseline and flag its
+        # first real value, which is then excluded, keeping the baseline at
+        # zero — flagging forever. Transitioning off an all-zero history
+        # re-arms the min_history warmup instead.
+        trusted = (self.count >= self.min_history) & (self.ema != 0.0)
+        bound = self.ema.abs() * self.multiplier
+        first_value = ~trusted & finite & (values != 0.0) & (self.ema == 0.0)
+        self.count = torch.where(first_value, torch.zeros_like(self.count), self.count)
+        spike = trusted & finite & (values.abs() > bound)
         # Feed the EMA with non-spike finite values (spikes never ratchet it).
         admissible = finite & ~spike
         blended = self.momentum * self.ema + (1.0 - self.momentum) * values
@@ -1427,40 +1439,40 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                                     )
                                     + "\n"
                                 )
-                            # Separate magnitude-spike event: names here may be
-                            # huge-but-FINITE values that the non-finite
-                            # diagnosis above cannot see. One event per window
-                            # listing which metrics spiked and their EMA
-                            # baselines at flush time.
-                            if spike_mask is not None and spike_mask.any():
-                                all_names = list(metric_main_names) + list(
-                                    metric_gate_names
-                                )
-                                spike_host = [bool(s) for s in spike_mask.tolist()]
-                                ema_host = ema_values or [0.0] * len(all_names)
-                                spike_names: dict[str, float] = {}
-                                baselines: dict[str, float] = {}
-                                for idx, (name, spiked) in enumerate(
-                                    zip(all_names, spike_host)
-                                ):
-                                    if spiked:
-                                        spike_names[name] = float(bad_counts[idx])
-                                        baselines[name] = float(ema_host[idx])
-                                f.write(
-                                    json.dumps(
-                                        {
-                                            "event": "loss_spike",
-                                            "step": global_step,
-                                            "shard_idx": current_shard_idx,
-                                            "window_steps": metric_count,
-                                            "multiplier": args.loss_spike_multiplier,
-                                            "spiked": spike_names,
-                                            "ema_baseline": baselines,
-                                            **diagnosis,
-                                        }
+                                # Separate magnitude-spike event: names here may be
+                                # huge-but-FINITE values that the non-finite
+                                # diagnosis above cannot see. One event per window
+                                # listing which metrics spiked and their EMA
+                                # baselines at flush time.
+                                if spike_mask is not None and spike_mask.any():
+                                    all_names = list(metric_main_names) + list(
+                                        metric_gate_names
                                     )
-                                    + "\n"
-                                )
+                                    spike_host = [bool(s) for s in spike_mask.tolist()]
+                                    ema_host = ema_values or [0.0] * len(all_names)
+                                    spike_names: dict[str, float] = {}
+                                    baselines: dict[str, float] = {}
+                                    for idx, (name, spiked) in enumerate(
+                                        zip(all_names, spike_host)
+                                    ):
+                                        if spiked:
+                                            spike_names[name] = float(bad_counts[idx])
+                                            baselines[name] = float(ema_host[idx])
+                                    f.write(
+                                        json.dumps(
+                                            {
+                                                "event": "loss_spike",
+                                                "step": global_step,
+                                                "shard_idx": current_shard_idx,
+                                                "window_steps": metric_count,
+                                                "multiplier": args.loss_spike_multiplier,
+                                                "spiked": spike_names,
+                                                "ema_baseline": baselines,
+                                                **diagnosis,
+                                            }
+                                        )
+                                        + "\n"
+                                    )
                     metric_sum = None
                     metric_fin_cnt = None
                     metric_bad_cnt = None
