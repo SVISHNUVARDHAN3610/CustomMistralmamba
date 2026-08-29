@@ -252,6 +252,42 @@ def build_optimizers(
             muon_optim = optim.Muon(muon_params, **muon_kwargs)
             meta["muon_adjust_lr_fn"] = None
 
+        # Muon LR audit (Issue-3): the observed run logged muon_lr ≈ 1.2e-3
+        # against a configured 1e-3. In the installed torch (2.13) Muon does
+        # NOT touch param_groups['lr'] at construction — the Moonshot
+        # per-shape RMS matching (0.2*sqrt(max(A,B)) for match_rms_adamw) is
+        # applied INSIDE _single_tensor_muon at optimizer-step time, per
+        # parameter. param_groups['lr'] therefore holds the configured base
+        # LR here, and the effective step LR is base_lr * adjusted_ratio
+        # (shape-dependent, so it cannot be summarized by one number). Older
+        # torch builds baked the adjustment into group LR at init; the log
+        # below makes either behavior visible at training start: if
+        # group_lr != resolved_muon_lr, this build inflates the base at init
+        # and the scheduler multiplies on top of the INFLATED value.
+        group_lrs = [float(g["lr"]) for g in muon_optim.param_groups]
+        for gi, group_lr in enumerate(group_lrs):
+            if abs(group_lr - resolved_muon_lr) > 1e-12:
+                logger.warning(
+                    "Muon param_groups[%d].lr=%.6e != configured muon_lr=%.6e: "
+                    "this torch build pre-scales the Muon LR at construction; "
+                    "the scheduler warmup/cosine will apply on the INFLATED "
+                    "base (effective per-step LR is further scaled per-param "
+                    "by adjust_lr_fn=%r).",
+                    gi,
+                    group_lr,
+                    resolved_muon_lr,
+                    muon_adjust_lr_fn,
+                )
+            else:
+                logger.info(
+                    "Muon param_groups[%d].lr=%.6e matches configured muon_lr "
+                    "(adjust_lr_fn=%r scaling is applied per-param at step "
+                    "time, not baked into the group LR).",
+                    gi,
+                    group_lr,
+                    muon_adjust_lr_fn,
+                )
+
         # Split AdamW params so biases / norm gains / _no_weight_decay params
         # (Mamba A_log, D) get zero weight decay; embeddings and lm_head keep
         # the configured decay.
@@ -380,6 +416,58 @@ class RollingAverage:
         return sum(self._values) / len(self._values)
 
 
+class EMABaseline:
+    """Exponential moving average of recent *finite* values, on-device.
+
+    Used by the magnitude-based spike guard: a value is "huge but finite"
+    when it exceeds ``multiplier * ema``. The EMA itself only ingests values
+    below the spike threshold, so one enormous step cannot ratchet the
+    baseline up and hide the next spike.
+    """
+
+    def __init__(
+        self,
+        n_metrics: int,
+        device: torch.device,
+        multiplier: float,
+        momentum: float = 0.99,
+        min_history: int = 5,
+    ) -> None:
+        self.ema = torch.zeros(n_metrics, device=device, dtype=torch.float32)
+        self.count = torch.zeros(n_metrics, device=device, dtype=torch.float32)
+        self.multiplier = multiplier
+        self.momentum = momentum
+        self.min_history = min_history
+
+    def update(self, values: torch.Tensor, finite: torch.Tensor) -> torch.Tensor:
+        """Ingest a step's metric vector; return the spike mask (True = spike).
+
+        ``finite`` is the isfinite mask for this step's values. Entries are
+        only admitted into the EMA once ``min_history`` finite observations
+        have accumulated, and only when the value itself is not a spike —
+        early steps legitimately start large (loss ~10 vs EMA 0), so the
+        warm-up avoids flagging the first steps as spikes forever.
+        """
+        spike = torch.zeros_like(self.ema, dtype=torch.bool)
+        if self.multiplier <= 0.0:
+            return spike
+        # A value counts as a spike only once the baseline is trusted and
+        # exceeds the multiplier band. All comparisons stay on-device.
+        ready = self.count >= self.min_history
+        bound = self.ema * self.multiplier
+        spike = ready & finite & (values > bound)
+        # Feed the EMA with non-spike finite values (spikes never ratchet it).
+        admissible = finite & ~spike
+        blended = self.momentum * self.ema + (1.0 - self.momentum) * values
+        self.ema = torch.where(admissible, blended, self.ema)
+        self.count = self.count + finite.to(self.count.dtype)
+        return spike
+
+    def reset(self) -> None:
+        self.ema.zero_()
+        self.count.zero_()
+
+
 def _weighted_term_tensors(
     model: HybridForCausalLM, out: Any, step: int, max_steps: int
 ) -> dict[str, Any]:
@@ -397,6 +485,7 @@ def _weighted_term_tensors(
     return {
         "recon_w": cfg.lambda_recon * aux.recon,
         "assoc_w": cfg.lambda_assoc * assoc_scale * aux.assoc,
+        "assoc_norm_w": cfg.lambda_assoc_norm * aux.assoc_norm,
         "gate_w": cfg.lambda_gate * aux.gate,
         "read_w": cfg.lambda_read * aux.read,
         "fusion_w": cfg.lambda_fusion * aux.fusion,
@@ -468,6 +557,7 @@ def _non_finite_diagnosis(
             "expert",
             "ssm",
             "slot",
+            "assoc_norm",
         ):
             raw[name] = getattr(aux, name)
     non_finite = [
@@ -749,9 +839,19 @@ def _format_val_log_line(val_record: dict[str, Any]) -> str:
         f"val_ce={val_record['val_ce_loss']:.6f} "
         f"val_router_aux={val_record['val_router_aux_loss']:.6f} "
         f"val_router_z={val_record['val_router_z_loss']:.6f} "
-        f"rows={val_record['val_rows']} batch={val_record['val_batch_size']} "
-        f"cursor={val_record['val_row_start']}->{val_record['val_row_end']} "
-        f"next={val_record['val_cursor']}"
+        + (
+            f"windows={val_record.get('val_windows', '?')} "
+            f"eval_rows={val_record.get('val_eval_rows', '?')} "
+            f"batch={val_record.get('val_batch_size', '?')}"
+            if val_record.get("mode", "rows") == "packed"
+            else (
+                f"rows={val_record.get('val_rows', '?')} "
+                f"batch={val_record.get('val_batch_size', '?')} "
+                f"cursor={val_record.get('val_row_start', '?')}->"
+                f"{val_record.get('val_row_end', '?')} "
+                f"next={val_record.get('val_cursor', '?')}"
+            )
+        )
     )
 
 
@@ -854,14 +954,22 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 bos_id=cfg.bos_token_id,
                 eos_id=cfg.eos_token_id,
                 pad_token_id=cfg.pad_token_id,
+                mode=args.val_mode,
+                eval_rows=args.val_eval_rows,
             )
             logger.info(
                 "Cyclic validation enabled | dataset=Salesforce/wikitext/%s "
-                "rows=%d batch=%d interval=%d",
+                "mode=%s rows=%d batch=%d interval=%d%s",
                 args.val_dataset_config,
+                args.val_mode,
                 args.val_rows,
                 args.val_batch_size,
                 args.val_interval,
+                (
+                    ""
+                    if args.val_mode == "rows"
+                    else f" eval_rows={args.val_eval_rows} (fixed, non-rotating)"
+                ),
             )
         except Exception:
             logger.exception(
@@ -919,6 +1027,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     expert_scale_sum = 0.0
     metric_main_names: list[str] | None = None
     metric_gate_names: list[str] | None = None
+    spike_ema: EMABaseline | None = None
     reset_mamba_scan_stats()
 
     try:
@@ -1173,6 +1282,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     "expert",
                     "ssm",
                     "slot",
+                    "assoc_norm",
                 ):
                     scalars[name] = getattr(aux, name)
                 for name, value in weighted_t.items():
@@ -1207,6 +1317,26 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 # counted per name instead: instability is recorded without
                 # ever branching on a device scalar mid-step.
                 finite = torch.isfinite(step_vec)
+                # Magnitude-based spike guard ("huge but finite"): a finite
+                # value exceeding --loss-spike-multiplier * (EMA of recent
+                # finite values) is treated like non-finite — masked from the
+                # window mean, counted in bad_cnt, and reported at flush.
+                # Entirely on-device; no extra syncs vs the finite-only path.
+                spike_mask: torch.Tensor | None = None
+                if args.loss_spike_multiplier > 0.0:
+                    if (
+                        spike_ema is None
+                        or metric_main_names != main_names
+                        or (metric_gate_names != gate_names)
+                    ):
+                        spike_ema = EMABaseline(
+                            step_vec.numel(),
+                            step_vec.device,
+                            args.loss_spike_multiplier,
+                        )
+                    step_spike = spike_ema.update(step_vec, finite)
+                    finite = finite & ~step_spike
+                    spike_mask = step_spike
                 if (
                     metric_sum is None
                     or metric_main_names != main_names
@@ -1218,6 +1348,8 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     metric_fin_cnt = torch.zeros_like(step_vec)
                     metric_bad_cnt = torch.zeros_like(step_vec)
                     metric_count = 0
+                    if spike_ema is not None:
+                        spike_ema.reset()
                 metric_sum += torch.where(finite, step_vec, 0.0)
                 metric_fin_cnt += finite.to(step_vec.dtype)
                 metric_bad_cnt += (~finite).to(step_vec.dtype)
@@ -1232,9 +1364,15 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         and metric_main_names is not None
                         and metric_gate_names is not None
                     )
-                    # Masked mean over steps where each entry was finite;
-                    # means and bad-counts ride ONE host transfer.
+                    # Masked mean over steps where each entry was finite (or
+                    # within the spike guard's magnitude band); means and
+                    # bad-counts ride ONE host transfer.
                     means_vec = metric_sum / metric_fin_cnt.clamp(min=1.0)
+                    # The spike EMA rides the same single transfer (it is
+                    # host-consumed only at flush, like everything else).
+                    ema_values: list[float] | None = None
+                    if spike_ema is not None:
+                        ema_values = spike_ema.ema.tolist()
                     flush_values = torch.cat([means_vec, metric_bad_cnt]).tolist()
                     values = flush_values[: means_vec.numel()]
                     bad_counts = flush_values[means_vec.numel() :]
@@ -1269,7 +1407,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                             model, outputs, global_step, args.max_steps
                         )
                         logger.error(
-                            "Non-finite metrics in steps %d-%d: %s",
+                            "Non-finite/spiked metrics in steps %d-%d: %s",
                             global_step - metric_count + 1,
                             global_step,
                             bad_names,
@@ -1284,6 +1422,40 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                                             "shard_idx": current_shard_idx,
                                             "window_steps": metric_count,
                                             "counts": bad_names,
+                                            **diagnosis,
+                                        }
+                                    )
+                                    + "\n"
+                                )
+                            # Separate magnitude-spike event: names here may be
+                            # huge-but-FINITE values that the non-finite
+                            # diagnosis above cannot see. One event per window
+                            # listing which metrics spiked and their EMA
+                            # baselines at flush time.
+                            if spike_mask is not None and spike_mask.any():
+                                all_names = list(metric_main_names) + list(
+                                    metric_gate_names
+                                )
+                                spike_host = [bool(s) for s in spike_mask.tolist()]
+                                ema_host = ema_values or [0.0] * len(all_names)
+                                spike_names: dict[str, float] = {}
+                                baselines: dict[str, float] = {}
+                                for idx, (name, spiked) in enumerate(
+                                    zip(all_names, spike_host)
+                                ):
+                                    if spiked:
+                                        spike_names[name] = float(bad_counts[idx])
+                                        baselines[name] = float(ema_host[idx])
+                                f.write(
+                                    json.dumps(
+                                        {
+                                            "event": "loss_spike",
+                                            "step": global_step,
+                                            "shard_idx": current_shard_idx,
+                                            "window_steps": metric_count,
+                                            "multiplier": args.loss_spike_multiplier,
+                                            "spiked": spike_names,
+                                            "ema_baseline": baselines,
                                             **diagnosis,
                                         }
                                     )
@@ -1566,6 +1738,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--smooth-window", type=int, default=50, help="Rolling CE mean window."
     )
+    parser.add_argument(
+        "--loss-spike-multiplier",
+        type=float,
+        default=100.0,
+        help="Magnitude-based spike guard: a finite metric exceeding "
+        "K * (EMA of its recent finite values) is treated like a non-finite "
+        "value (masked out of window means, counted in metric_bad_cnt) and "
+        "reported via a 'loss_spike' JSONL event. 0 disables. Covers loss, "
+        "grad_norm, and every aux term. Purely on-device; no extra syncs.",
+    )
     parser.add_argument("--num-workers", type=int, default=2)
 
     parser.add_argument("--ckpt-dir", type=str, default="./model_ckpt")
@@ -1614,6 +1796,24 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="wikitext-2-raw-v1",
         help="Salesforce/wikitext config name (e.g. wikitext-2-raw-v1, wikitext-103-raw-v1).",
+    )
+    parser.add_argument(
+        "--val-mode",
+        choices=("packed", "rows"),
+        default="packed",
+        help="'packed' (default): fixed, non-rotating eval slice tokenized into "
+        "full seq_len windows with cross-document left context — matches "
+        "training packing; deterministic across calls. 'rows' (legacy): each "
+        "wikitext row scored independently (short rows inflate the loss) with "
+        "a rotating num_rows cursor; kept for comparison with old metrics.",
+    )
+    parser.add_argument(
+        "--val-eval-rows",
+        type=int,
+        default=500,
+        help="Number of leading non-empty validation rows packed into the "
+        "fixed eval set in --val-mode=packed (larger = lower sampling "
+        "variance, slower per call).",
     )
     args = parser.parse_args()
     if not args.log_jsonl:

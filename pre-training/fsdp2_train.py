@@ -1127,6 +1127,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 for name in (
                     "recon",
                     "assoc",
+                    "assoc_norm",
                     "gate",
                     "read",
                     "fusion",

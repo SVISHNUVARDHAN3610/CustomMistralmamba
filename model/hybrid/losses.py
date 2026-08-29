@@ -27,12 +27,21 @@ class HybridLayerAuxLosses:
     expert: Tensor
     ssm: Tensor
     slot: Tensor
+    assoc_norm: Tensor
 
     @staticmethod
     def zeros(device: torch.device, dtype: torch.dtype) -> HybridLayerAuxLosses:
         z = torch.tensor(0.0, device=device, dtype=dtype)
         return HybridLayerAuxLosses(
-            recon=z, assoc=z, gate=z, read=z, fusion=z, expert=z, ssm=z, slot=z
+            recon=z,
+            assoc=z,
+            gate=z,
+            read=z,
+            fusion=z,
+            expert=z,
+            ssm=z,
+            slot=z,
+            assoc_norm=z,
         )
 
 
@@ -48,6 +57,7 @@ class HybridAuxiliaryLossBreakdown:
     expert: Tensor | None = None
     ssm: Tensor | None = None
     slot: Tensor | None = None
+    assoc_norm: Tensor | None = None
 
 
 def _aux_loss_schedule(
@@ -164,6 +174,19 @@ def ssm_state_norm_loss(ssm_state: Tensor, gamma: Tensor) -> Tensor:
     return torch.relu(s_bar - gamma)
 
 
+def assoc_state_norm_loss(memory_state: Tensor, gamma: Tensor) -> Tensor:
+    """Hinge penalty keeping the associative memory bank state bounded.
+
+    Analogous to :func:`ssm_state_norm_loss`: the mean squared entry of the
+    post-write bank state is penalized once it exceeds ``gamma``. Without it
+    the recurrent ``memory = gate*memory + (1-gate)*write_update(...)`` update
+    receives almost no CE gradient within a chunk and can drift unbounded,
+    which in turn feeds the (now normalized) retrieval loss with huge keys.
+    """
+    s_bar = memory_state.float().pow(2).mean()
+    return torch.relu(s_bar - gamma)
+
+
 class MemoryReconstructionDecoder(nn.Module):
     """Training-only decoder: reconstruct x from compressed summary s."""
 
@@ -217,6 +240,7 @@ def associative_retrieval_loss(
     per_token_residual: Tensor,
     sample_count: int,
     attention_mask: Tensor | None,
+    err_clip: float | None = None,
 ) -> Tensor:
     batch_size, seq_len, hidden = x.shape
     device = x.device
@@ -260,7 +284,18 @@ def associative_retrieval_loss(
     keys = bank.assoc_key(x_sel)
     values = bank.assoc_val(x_sel)
     retrieved = bank.read_query(keys, new_memory)
-    err = (retrieved - values).pow(2).sum(dim=-1)
+    # Stability: the previous form (unnormalized (v̂-v)^2 summed over hidden)
+    # was unbounded in BOTH the hidden dimension and the linear-layer outputs —
+    # a single large-magnitude chunk drove assoc to 1e8..1e23 and poisoned the
+    # whole loss (metrics.jsonl steps 2800/5400/10200/10600). Now the targets
+    # and predictions are L2-normalized (err per-sample ≤ 4) and clamped by
+    # ``err_clip`` as a hard backstop, so the loss can no longer explode.
+    values = F.normalize(values.float(), dim=-1)
+    retrieved = F.normalize(retrieved.float(), dim=-1)
+    err = (retrieved - values).pow(2).mean(dim=-1)
+    if err_clip is not None:
+        err = err.clamp(max=err_clip)
+    err = err.to(dtype)
     surprise = per_token_residual.gather(1, indices).detach()
     if n_sel > 1:
         sigma = surprise.std(dim=1, keepdim=True, unbiased=False).clamp(min=1e-6)

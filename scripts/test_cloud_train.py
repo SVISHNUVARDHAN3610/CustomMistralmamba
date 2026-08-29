@@ -155,6 +155,7 @@ def _weighted_terms(
     return {
         "recon_w": float((cfg.lambda_recon * aux.recon).item()),
         "assoc_w": float((cfg.lambda_assoc * assoc_scale * aux.assoc).item()),
+        "assoc_norm_w": float((cfg.lambda_assoc_norm * aux.assoc_norm).item()),
         "gate_w": float((cfg.lambda_gate * aux.gate).item()),
         "read_w": float((cfg.lambda_read * aux.read).item()),
         "fusion_w": float((cfg.lambda_fusion * aux.fusion).item()),
@@ -209,6 +210,7 @@ def _non_finite_loss_diagnosis(
         for name in (
             "recon",
             "assoc",
+            "assoc_norm",
             "gate",
             "read",
             "fusion",
@@ -257,10 +259,12 @@ def _format_non_finite_warning(step: int, diagnosis: dict[str, object]) -> str:
         f"loss={values['loss']} ce={values['ce_loss']} "
         f"router_aux={values['router_aux']} router_z={values['router_z']} "
         f"router_aux_w={values['router_aux_w']} router_z_w={values['router_z_w']} "
-        f"recon={values['recon']} assoc={values['assoc']} gate={values['gate']} "
+        f"recon={values['recon']} assoc={values['assoc']} assoc_norm={values['assoc_norm']} "
+        f"gate={values['gate']} "
         f"read={values['read']} fusion={values['fusion']} expert={values['expert']} "
         f"ssm={values['ssm']} slot={values['slot']} "
         f"recon_w={values['recon_w']} assoc_w={values['assoc_w']} "
+        f"assoc_norm_w={values['assoc_norm_w']} "
         f"gate_w={values['gate_w']} read_w={values['read_w']} "
         f"fusion_w={values['fusion_w']} expert_w={values['expert_w']} "
         f"ssm_w={values['ssm_w']} slot_w={values['slot_w']}"
@@ -449,6 +453,7 @@ def _format_loss_line(step: int, max_steps: int, record: dict[str, float]) -> st
         f"router_z={record['router_z_loss']:.8f} "
         f"recon={record['recon']:.8f} "
         f"assoc={record['assoc']:.8f}({assoc_tag}) "
+        f"assoc_norm={record.get('assoc_norm', 0.0):.8f} "
         f"gate={record['gate']:.8f} "
         f"read={record['read']:.8f} "
         f"fusion={record['fusion']:.8f} "
@@ -457,6 +462,7 @@ def _format_loss_line(step: int, max_steps: int, record: dict[str, float]) -> st
         f"slot={record['slot']:.8f} "
         f"recon_w={record['recon_w']:.8f} "
         f"assoc_w={record['assoc_w']:.8f} "
+        f"assoc_norm_w={record.get('assoc_norm_w', 0.0):.8f} "
         f"gate_w={record['gate_w']:.8f} "
         f"read_w={record['read_w']:.8f} "
         f"fusion_w={record['fusion_w']:.8f} "
@@ -748,6 +754,7 @@ def main() -> None:
                 else 0.0,
                 "recon": float(aux.recon.item()),
                 "assoc": float(aux.assoc.item()),
+                "assoc_norm": float(aux.assoc_norm.item()),
                 "gate": float(aux.gate.item()),
                 "read": float(aux.read.item()),
                 "fusion": float(aux.fusion.item()),

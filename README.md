@@ -200,6 +200,21 @@ python train.py \
 
 It handles seeding (with an optional fully-deterministic mode), rotating run logs, streaming shard consumption via `MmapShardDataset`, periodic cyclic validation against `Salesforce/wikitext`, gradient clipping, checkpoint save/resume (`model_ckpt.pth` + `config.json`), and warmup schedules for the auxiliary and expert-routing losses. `scripts/test_cloud_train.py` provides a smaller, self-contained IMDB-based smoke test for verifying the full objective end-to-end on cloud hardware before a long run.
 
+### Optimizer: Muon + AdamW (Moonshot-style)
+
+Training uses the Moonlight hybrid optimizer (arXiv:2502.16982): 2D hidden matrices are updated by Muon, everything else (embeddings, `lm_head`, 1D norms/biases, `_no_weight_decay` params) by AdamW. A shared peak LR (`--lr`) is used for both — with `adjust_lr_fn='match_rms_adamw'`, Muon internally scales each update by `0.2·sqrt(max(A,B))` so its update RMS matches AdamW's at the same nominal LR.
+
+**LR visibility note:** in current PyTorch builds the Muon RMS matching is applied *per parameter at optimizer-step time*; `param_groups[i]['lr']` keeps the configured base LR, and the scheduler's warmup/cosine multiplies that base. Some torch versions instead bake the shape-dependent scaling into the group LR at construction, which inflates the base the scheduler acts on (observed as `muon_lr ≈ 1.2×` the configured value in an earlier run's logs). Training start now logs every Muon group LR and warns if it differs from the configured `--muon-lr`, so whichever behavior your torch build has is visible in the run log.
+
+### Validation methodology
+
+Two validation modes are available (`--val-mode`):
+
+- **`packed` (default)** — a **fixed, non-rotating** slice of the first `--val-eval-rows` (default 500) non-empty wikitext validation rows is tokenized into one contiguous stream of `[BOS] doc [EOS]` documents and sliced into full `seq_len` windows with pre-shifted labels — identical packing to training. Every validation call scores the same windows, so val loss curves are directly comparable across steps (no rotating-cursor sampling noise), and cross-document windows see left context, so short rows are no longer penalized.
+- **`rows` (legacy)** — the original behavior: each wikitext row scored independently with per-row BOS/EOS and right-padding, over a rotating 50-row cursor. Kept only for comparison with historical metrics; it systematically reports *higher and noisier* val loss than packed mode (short rows have no left context, and each call samples a different row slice).
+
+The same validation event includes `"mode"` in `metrics.jsonl`, so packed and legacy numbers are never confused in analysis.
+
 ## 10. Testing
 
 ```bash

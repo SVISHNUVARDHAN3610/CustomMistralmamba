@@ -10,6 +10,7 @@ from model.core.dtype import _promote_fp32, _restore_dtype
 from model.hybrid.losses import (
     HybridLayerAuxLosses,
     _expert_loss_schedule,
+    assoc_state_norm_loss,
     associative_retrieval_loss,
     combine_read_utilization_loss,
     fusion_balance_loss,
@@ -413,6 +414,7 @@ class HybridDecoderLayer(nn.Module):
                             attn_recon_tok,
                             cfg.assoc_sample_count,
                             write_mask,
+                            err_clip=cfg.assoc_err_clip,
                         )
                         mamba_assoc = associative_retrieval_loss(
                             self.state_memory_bank,
@@ -421,6 +423,7 @@ class HybridDecoderLayer(nn.Module):
                             mamba_recon_tok,
                             cfg.assoc_sample_count,
                             write_mask,
+                            err_clip=cfg.assoc_err_clip,
                         )
                         gate_loss = write_gate_entropy_loss(
                             a_write_gate,
@@ -437,6 +440,18 @@ class HybridDecoderLayer(nn.Module):
                             cfg.slot_similarity_margin,
                             cfg.slot_cross_bank_alpha,
                         )
+                        # Bound the post-write bank state (ssm_state_norm_loss
+                        # analog). Zero state contributes nothing (hinge at 0),
+                        # so a Jamba-like zero-bank start never adds a bias.
+                        assoc_norm_gamma = getattr(self, "assoc_norm_gamma", None)
+                        if assoc_norm_gamma is not None:
+                            assoc_norm_loss = assoc_state_norm_loss(
+                                new_a_mem, assoc_norm_gamma
+                            ) + assoc_state_norm_loss(new_s_mem, assoc_norm_gamma)
+                        else:
+                            assoc_norm_loss = torch.tensor(
+                                0.0, device=x.device, dtype=x.dtype
+                            )
                     layer_aux = HybridLayerAuxLosses(
                         recon=_restore_dtype((attn_recon + mamba_recon) / 2.0, x.dtype),
                         assoc=_restore_dtype((attn_assoc + mamba_assoc) / 2.0, x.dtype),
@@ -446,6 +461,7 @@ class HybridDecoderLayer(nn.Module):
                         expert=layer_aux.expert,
                         ssm=layer_aux.ssm,
                         slot=_restore_dtype(slot_loss, x.dtype),
+                        assoc_norm=_restore_dtype(assoc_norm_loss / 2.0, x.dtype),
                     )
 
         fused, fusion_gate = self.fusion(attn_out, mamba_out)
@@ -493,6 +509,7 @@ class HybridDecoderLayer(nn.Module):
                 expert=expert_loss,
                 ssm=ssm_loss,
                 slot=layer_aux.slot,
+                assoc_norm=layer_aux.assoc_norm,
             )
 
         return (

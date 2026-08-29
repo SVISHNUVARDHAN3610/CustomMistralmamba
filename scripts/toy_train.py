@@ -61,6 +61,7 @@ def _weighted_terms(
     return {
         "recon_w": float((cfg.lambda_recon * aux.recon).item()),
         "assoc_w": float((cfg.lambda_assoc * assoc_scale * aux.assoc).item()),
+        "assoc_norm_w": float((cfg.lambda_assoc_norm * aux.assoc_norm).item()),
         "gate_w": float((cfg.lambda_gate * aux.gate).item()),
         "read_w": float((cfg.lambda_read * aux.read).item()),
         "fusion_w": float((cfg.lambda_fusion * aux.fusion).item()),
@@ -155,6 +156,7 @@ def main() -> None:
             else None,
             "recon": float(aux.recon.item()),
             "assoc": float(aux.assoc.item()),
+            "assoc_norm": float(aux.assoc_norm.item()),
             "gate": float(aux.gate.item()),
             "read": float(aux.read.item()),
             "fusion": float(aux.fusion.item()),

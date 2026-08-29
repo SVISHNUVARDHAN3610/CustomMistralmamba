@@ -828,7 +828,16 @@ class TestHybridModel(unittest.TestCase):
         self.assertIsNotNone(out.auxiliary_losses)
         aux = out.auxiliary_losses
         assert aux is not None
-        for name in ("recon", "gate", "read", "fusion", "expert", "ssm", "slot"):
+        for name in (
+            "recon",
+            "gate",
+            "read",
+            "fusion",
+            "expert",
+            "ssm",
+            "slot",
+            "assoc_norm",
+        ):
             val = getattr(aux, name)
             self.assertIsNotNone(val)
             self.assertFalse(torch.isnan(val).any())
@@ -878,23 +887,76 @@ class TestHybridModel(unittest.TestCase):
         weighted_assoc = cfg.lambda_assoc * scale * out.auxiliary_losses.assoc
         self.assertEqual(weighted_assoc.item(), 0.0)
 
-    def test_assoc_loss_uses_squared_l2_norm(self) -> None:
+    def test_assoc_loss_uses_normalized_squared_error(self) -> None:
         hidden = 64
         bank = CompressiveMemoryBank(hidden, memory_size=8, num_heads=4)
         x = torch.randn(1, 4, hidden)
         new_mem = bank.init_state(1, x.device, x.dtype)
         residual = torch.ones(1, 4)
         torch.manual_seed(0)
-        associative_retrieval_loss(
+        loss = associative_retrieval_loss(
             bank, x, new_mem, residual, sample_count=4, attention_mask=None
         )
-        keys = bank.assoc_key(x)
-        values = bank.assoc_val(x)
-        retrieved = bank.read_query(keys, new_mem)
-        err_sum = (retrieved - values).pow(2).sum(dim=-1).mean()
-        self.assertGreater(err_sum.item(), 0.0)
-        err_mean = (retrieved - values).pow(2).mean(dim=-1).mean()
-        self.assertGreater(err_sum.item(), err_mean.item() * (hidden - 1))
+        # Reformulated loss (see Issue-1 fix): targets/predictions are
+        # L2-normalized, err is the MEAN over hidden of squared error —
+        # bounded in [0, 4] per sample regardless of vector magnitude.
+        self.assertGreater(float(loss.item()), 0.0)
+        self.assertLessEqual(float(loss.item()), 4.0)
+
+    def test_assoc_loss_bounded_for_large_magnitude_inputs(self) -> None:
+        """Issue-1 acceptance: huge synthetic inputs must not explode the loss.
+
+        The pre-fix formulation ((retrieved-values)^2 summed over hidden on
+        raw linear outputs) reached 1e8..1e23 in production. With scale 1e6
+        inputs the old err term would be ~1e12 * hidden; the new one stays
+        bounded by normalization + the err_clip backstop.
+        """
+        hidden = 64
+        bank = CompressiveMemoryBank(hidden, memory_size=8, num_heads=4)
+        x = torch.randn(1, 8, hidden) * 1e6
+        new_mem = bank.init_state(1, x.device, x.dtype) * 1e6
+        residual = torch.full((1, 8), 100.0)
+        loss = associative_retrieval_loss(
+            bank,
+            x,
+            new_mem,
+            residual,
+            sample_count=8,
+            attention_mask=None,
+            err_clip=25.0,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        # surprise (≤ 3σ of residual ≈ 0 here, but ≤ 100 hard) * err (≤ 25):
+        # the bound below only fails if normalization/clamping regressed.
+        self.assertLess(float(loss.item()), 100.0)
+
+    def test_assoc_state_norm_loss_hinges_at_gamma(self) -> None:
+        from model.hybrid.losses import assoc_state_norm_loss
+
+        gamma = torch.tensor(2.0)
+        small = torch.zeros(1, 4, 8)
+        large = torch.full((1, 4, 8), 10.0)
+        self.assertEqual(float(assoc_state_norm_loss(small, gamma).item()), 0.0)
+        # mean(entry^2) = 100 -> hinge = 98
+        self.assertAlmostEqual(
+            float(assoc_state_norm_loss(large, gamma).item()), 98.0, places=4
+        )
+
+    def test_assoc_norm_loss_present_and_weighted(self) -> None:
+        cfg = _small_hybrid_config(num_layers=1, lambda_assoc_norm=1.0)
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 16))
+        labels = torch.randint(0, cfg.vocab_size, (1, 16))
+        out = model(
+            input_ids=ids,
+            labels=labels,
+            training_step=100,
+            max_training_steps=1000,
+        )
+        assert out.auxiliary_losses is not None
+        self.assertIsNotNone(out.auxiliary_losses.assoc_norm)
+        self.assertFalse(torch.isnan(out.auxiliary_losses.assoc_norm).any())
+        self.assertTrue(torch.isfinite(out.loss))
 
     def test_assoc_loss_padded_batch_no_oob(self) -> None:
         """Variable-length rows must not gather at sentinel index seq_len."""
@@ -2001,6 +2063,90 @@ class TestImprovementFeatures(unittest.TestCase):
             p for n, p in model.named_parameters() if p.ndim == 2 and ".w_gate" in n
         )
         self.assertFalse(_is_adamw_no_decay(moe_2d))
+
+    # ---------- packed validation windows (Issue 4) ----------
+
+    def test_packed_validation_windows_match_training_packing(self) -> None:
+        """Packed windows must replicate training packing exactly.
+
+        Checks (a) BOS/EOS placement across document boundaries, (b) window
+        size == seq_len with pre-shifted labels, (c) no padding exists, and
+        (d) determinism (identical windows rebuilt from the same rows).
+        """
+        # Minimal stub tokenizer — the packing path only needs deterministic
+        # encode() ids, not real vocab semantics.
+        word_to_id: dict[str, int] = {}
+        bos_id, eos_id = 1, 2
+
+        def encode(text: str) -> list[int]:
+            ids: list[int] = []
+            for w in text.split():
+                if w not in word_to_id:
+                    word_to_id[w] = len(word_to_id) + 3
+                ids.append(word_to_id[w])
+            return ids
+
+        class _Tok:
+            def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+                del add_special_tokens
+                return encode(text)
+
+        seq_len = 8
+        texts = ["alpha beta", "gamma delta epsilon", "zeta"] * 3
+        stream: list[int] = []
+        for t in texts:
+            raw = _Tok().encode(t)
+            stream.extend([bos_id] + raw + [eos_id])
+
+        try:
+            from utils.validation import _WikiTextPackedDataset
+        except ModuleNotFoundError as exc:  # transformers not installed locally
+            self.skipTest(f"utils.validation deps unavailable: {exc}")
+        ds = _WikiTextPackedDataset(
+            texts,
+            _Tok(),  # type: ignore[arg-type]
+            seq_len=seq_len,
+            bos_id=bos_id,
+            eos_id=eos_id,
+        )
+        n = len(ds)
+        self.assertGreater(n, 0)
+        for i in range(n):
+            item = ds[i]
+            inp, lab = item["input_ids"], item["labels"]
+            # (b) window size + pre-shifted labels lengths.
+            self.assertEqual(inp.numel(), seq_len)
+            self.assertEqual(lab.numel(), seq_len)
+            # (c) no padding token anywhere (pack is dense).
+            self.assertFalse((inp == 0).any())
+
+        stream_t = torch.tensor(stream)
+        # (a) BOS/EOS boundaries: documents are packed contiguously, so every
+        # EOS in the stream is immediately followed by a BOS.
+        eos_idx = (stream_t == eos_id).nonzero().flatten()
+        self.assertGreater(len(eos_idx), 0)
+        for p in eos_idx:
+            if int(p) + 1 < stream_t.numel():
+                self.assertEqual(int(stream_t[p + 1]), bos_id)
+
+        # (d) determinism: rebuilding yields identical windows.
+        ds2 = _WikiTextPackedDataset(
+            texts,
+            _Tok(),  # type: ignore[arg-type]
+            seq_len=seq_len,
+            bos_id=bos_id,
+            eos_id=eos_id,
+        )
+        self.assertTrue(torch.equal(ds.windows, ds2.windows))
+
+        # Pre-shifted label contract: labels[i] == next token in the stream,
+        # including across window boundaries (no roll-based relabeling).
+        for i in range(n):
+            inp = ds[i]["input_ids"]
+            lab = ds[i]["labels"]
+            start = i * (seq_len + 1)
+            self.assertTrue(torch.equal(inp, stream_t[start : start + seq_len]))
+            self.assertTrue(torch.equal(lab, stream_t[start + 1 : start + 1 + seq_len]))
 
 
 if __name__ == "__main__":

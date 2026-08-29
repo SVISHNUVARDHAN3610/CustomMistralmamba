@@ -145,18 +145,30 @@ After `write()` produces `M_new`, sample `T` token positions. Let `k_t, v_t` be 
 ```
 s_t = stopgrad( ‖ x_t − g(s) ‖₂ )          # per-token reconstruction residual from Loss #1
 
-L_assoc = (1/T) · Σ_t  clip(s_t, 0, 3σ) · ‖ v̂_t − v_t ‖²₂
+v̄_t = v_t / ‖v_t‖₂ ,  v̂̄_t = v̂_t / ‖v̂_t‖₂   # L2-normalize (stability, see below)
+
+L_assoc = (1/T) · Σ_t  clip(s_t, 0, 3σ) · mean_d( (v̂̄_t − v̄_t)² )
 ```
 
 - `T`: sampled positions per chunk (default 24; constant cost vs `L`).
 - `s_t`: surprise weight — **proxy** for Titans' gradient-of-loss surprise (cheaper at this scale).
 - `clip(s_t, 0, 3σ)`: per-chunk, prevents one outlier from dominating.
+- **Stability (v4 revision):** the original form penalized `‖v̂_t − v_t‖²₂` — an
+  *unnormalized* `.sum(dim=-1)` over `d` hidden dims of raw linear outputs,
+  which is unbounded in both `d` and projection magnitude. A single
+  large-magnitude chunk drove `L_assoc` to 1e8–1e23 in the 22.9k-step run
+  (steps 2800/5400/10200/10600 in `metrics.jsonl`), poisoning the total loss
+  and gradients. The revision (a) L2-normalizes `v̂_t` and `v_t` so the
+  per-sample error is bounded in `[0, 4]`, (b) takes the **mean** over `d`
+  instead of the sum, and (c) clamps per-sample error at `assoc_err_clip`
+  (default 25, a backstop; normalization already bounds it below this).
 
 **Hyperparameters:**
 
 | Param | Default | Range | Notes |
 |-------|---------|-------|-------|
-| `lambda_assoc` | `1.2e-4` | `[5e-5, 3e-4]` | Ramp from 0 over first 5% of training steps; scaled for `.sum(dim=-1)` squared L2 |
+| `lambda_assoc` | `0.0614` | `[2e-2, 2e-1]` | Ramp from 0 over first 5% of training steps; **rescaled for the normalized/mean formulation** — `0.0614 ≈ 1.2e-4 · 512` preserves the original effective weighting for `hidden_size=512` |
+| `assoc_err_clip` | `25.0` | `[4, 100]` | Hard per-sample error clamp (backstop; normalized err ≤ 4) |
 | `T` | `24` | `[16, 32]` | Fixed sample count per chunk |
 | Warm-up | 0 → full over steps 0–5% | — | Memory needs basic content before retrieval scoring |
 
@@ -360,6 +372,38 @@ L_slot = L_slot_intra + α · L_slot_cross
 
 ---
 
+### Loss 9 — Associative Memory State Norm (`L_assoc_norm`) *(v4 addition)*
+
+| Field | Detail |
+|-------|--------|
+| **Priority** | Low–medium — numerical health of the recurrent bank state |
+| **Goal** | Keep the post-write compressive-memory state bounded (`ssm_state_norm_loss` analogue) |
+| **Why** | The recurrent update `M ← g·M + (1−g)·write_update(summary)` receives little/no CE gradient within a chunk; `write_update` outputs are unbounded linear projections, so the bank state can drift large over many chunks (late-run gate saturation >0.9 in layers 5–7 correlates with this drift). |
+
+**Formula:**
+
+For post-write bank state `M ∈ ℝ^{B×m×d}`:
+
+```
+M̄ = mean_{B,m,d}( M² )
+
+L_assoc_norm = max(0, M̄ − γ)
+```
+
+`γ`: max of the 90th-percentile post-write state norms of both banks, measured
+once from a dummy write at initialization (`assoc_norm_gammas` buffer; fallback
+`assoc_norm_gamma_init = 1e-3` before calibration). Summed over both banks per
+layer and averaged over layers, like every other aux loss.
+
+**Hyperparameters:**
+
+| Param | Default | Range | Notes |
+|-------|---------|-------|-------|
+| `lambda_assoc_norm` | `1e-3` | `[1e-4, 1e-2]` | Same order as `lambda_gate` — a soft leash, not a hard clamp |
+| `γ` quantile | `0.9` | `[0.8, 0.99]` | Calibration percentile (`assoc_norm_gamma_quantile`) |
+
+---
+
 ## 5. Combined objective (proposed)
 
 **Keep unchanged:** `ce_loss`, `aux_loss`, `z_loss` — same coefficients, same implementations.
@@ -371,13 +415,14 @@ L_total = (
     + router_z_loss_coef * z_loss  # 5e-3
     + lambda_recon * L_recon  # 0.08
     + assoc_weight(step)
-    * L_assoc  # → 1.2e-4 (5% warm-up; squared L2 uses sum over hidden)
+    * L_assoc  # → 0.0614 (5% warm-up; normalized vectors, mean over hidden)
     + lambda_gate * L_gate  # 1e-3
     + lambda_read * L_read  # 5e-3
     + lambda_fusion * L_fusion  # 8e-3
     + expert_weight(step) * L_expert  # → 2e-3 (on at 10%)
     + lambda_ssm * L_ssm  # 1e-5
     + lambda_slot * L_slot  # 3e-3
+    + lambda_assoc_norm * L_assoc_norm  # 1e-3 (v4: memory-state bound)
 )
 ```
 
@@ -409,6 +454,7 @@ L_total = (
 | 6 | `L_expert` | Expert redundancy | Small–moderate | Low | Low–moderate | 2e-3 |
 | 7 | `L_ssm` | Long-context SSM precision | Small–moderate | Negligible | Moderate | 1e-5 |
 | 8 | `L_slot` | Slot collapse | Moderate (capacity) | Low | Moderate | 3e-3 |
+| 9 | `L_assoc_norm` | Memory-state drift (v4) | Small | Negligible | Low | 1e-3 |
 
 ---
 
@@ -426,7 +472,7 @@ L_total = (
 
 | Topic | Notes |
 |-------|-------|
-| **Auxiliary-loss budget** | Eight small terms still add up — gradient-norm audit early in training is mandatory. |
+| **Auxiliary-loss budget** | Nine small terms still add up — gradient-norm audit early in training is mandatory. |
 | **Loss #1 decoder** | Training-only parameters; can be omitted from inference checkpoints. |
 | **Mixed vs separate optimizers** | Compressive Transformer sometimes used separate compression training; this design uses one combined loss — validate that write path does not collapse activations to ease reconstruction. |
 | **Deferred 9th candidate** | Contrastive memory-key structuring (Focused-Transformer-style) — deferred until Tests 1–3 confirm memory is worth keeping. |
