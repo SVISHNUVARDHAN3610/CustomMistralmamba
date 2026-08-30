@@ -320,6 +320,9 @@ class HybridDecoderLayer(nn.Module):
                 new_buf.append_single_token(buf_attn, buf_mamba, token_attention_mask)
             else:
                 new_buf.append(buf_attn, buf_mamba, token_attention_mask)
+            # buf_attn/buf_mamba were copied (masked where) into the buffer;
+            # drop the locals so the only live references are the buffer's own.
+            del buf_attn, buf_mamba
 
             if skip_memory_write:
                 new_memory_state = memory_state
@@ -369,12 +372,21 @@ class HybridDecoderLayer(nn.Module):
                 new_memory_state = (new_a_mem, new_s_mem)
                 new_write_buffer = None
                 gate_stats = {
+                    # Diagnostics only (Test-2 gate monitoring): detached so the
+                    # metric path keeps no reference into the autograd graph
+                    # (a live gate tensor would retain the whole write graph
+                    # until the logging flush).
                     "attn_write_gate_mean": a_write_gate.detach().mean(),
                     "state_write_gate_mean": s_write_gate.detach().mean(),
                 }
 
                 if self.training and self.use_auxiliary_losses:
                     # FP16 AMP: recon/gate/slot paths need fp32 attention + logs.
+                    # VRAM note: recon/gate/slot/assoc are SCALAR losses over the
+                    # chunk buffers; intermediates here peak at a few
+                    # [B, buf_len, H] fp32 tensors and each is released as soon
+                    # as its scalar is computed (del below) so the fp32
+                    # promotions don't stack.
                     with torch.autocast(
                         device_type=buf_attn_cat.device.type, enabled=False
                     ):
@@ -425,6 +437,12 @@ class HybridDecoderLayer(nn.Module):
                             write_mask,
                             err_clip=cfg.assoc_err_clip,
                         )
+                        # attn_recon_tok/mamba_recon_tok are the per-token
+                        # residualSurprise inputs of assoc above; once both
+                        # assoc scalars exist they are dead weight ([B, buf_len]
+                        # each). Released here rather than carried to the next
+                        # allocation point.
+                        del attn_recon_tok, mamba_recon_tok
                         gate_loss = write_gate_entropy_loss(
                             a_write_gate,
                             cfg.gate_entropy_eps,
@@ -472,6 +490,7 @@ class HybridDecoderLayer(nn.Module):
         moe_in = self.rmsnorm_moe(x)
         if hidden_mask is not None:
             moe_in = moe_in * hidden_mask
+        # aux sums stay live through the whole model forward as intermediates.
         expert_scale = _expert_loss_schedule(
             training_step, max_training_steps, cfg.expert_warmup_fraction
         )
@@ -483,6 +502,9 @@ class HybridDecoderLayer(nn.Module):
             expert_var_beta=cfg.expert_var_beta,
         )
         x_out = x + moe_out
+        # fused/fusion_gate/moe_out/moe_in feed nothing past the aux block
+        # below; drop the local references so the only live handle left is
+        # x_out (the aux losses retain whatever part of the graph they need).
 
         if self.training and self.use_auxiliary_losses:
             read_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)

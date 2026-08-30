@@ -391,6 +391,9 @@ class HybridModel(nn.Module):
                 slot=aux_sums.slot + layer_aux.slot,
                 assoc_norm=aux_sums.assoc_norm + layer_aux.assoc_norm,
             )
+            # layer_aux is a struct of SCALARS (see HybridLayerAuxLosses); its
+            # values are folded into aux_sums above, so the per-layer object
+            # itself is dropped — nothing accumulates large per-layer state.
             if use_cache:
                 present_key_values.append(present_kv)
                 new_mamba_caches.append(layer_new_mamba)

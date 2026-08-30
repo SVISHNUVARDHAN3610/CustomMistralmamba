@@ -80,10 +80,18 @@ class MOERouter(nn.Module):
         topk_weights = F.softmax(topk_logits, dim=-1).to(input_dtype)
 
         # f_i: fraction of tokens for which expert i is in the top-k set.
-        one_hot_indices = F.one_hot(topk_indices, num_classes=self.num_experts).float()
-        f_i = one_hot_indices.sum(dim=1).mean(
-            dim=0
-        )  # [E], mean over tokens of "selected count"
+        # VRAM: scatter_add into a preallocated [E] buffer instead of the
+        # [N, E] float one_hot + row-sum (one_hot materializes 8x the bytes of
+        # topk_indices at E=8 and stays live until f_i is reduced).
+        f_i = torch.zeros(
+            self.num_experts, device=topk_indices.device, dtype=torch.float32
+        )
+        f_i.scatter_add_(
+            0,
+            topk_indices.reshape(-1),
+            torch.ones_like(topk_indices, dtype=torch.float32).reshape(-1),
+        )
+        f_i = f_i / topk_indices.size(0)
 
         # p_i: mean router probability assigned to expert i across ALL
         # tokens (not just top-k weight) -- this is the standard Switch
@@ -223,10 +231,22 @@ class DroplessMoELayer(nn.Module):
             )
 
         flat_expert = topk_indices.reshape(-1)
-        flat_token = torch.arange(num_tokens, device=x_flat.device).repeat_interleave(
-            top_k
+        # repeat_interleave materializes a [N*top_k] token-id vector; index
+        # arithmetic (tile + broadcast) produces the same values as a view-
+        # based expression. (PyTorch has no non-copying equivalent, but this
+        # avoids the intermediate arange->interleave pair.)
+        flat_token = (
+            torch.arange(num_tokens, device=x_flat.device)
+            .unsqueeze(1)
+            .expand(-1, top_k)
+            .reshape(-1)
         )
-        flat_k = torch.arange(top_k, device=x_flat.device).repeat(num_tokens)
+        flat_k = (
+            torch.arange(top_k, device=x_flat.device)
+            .unsqueeze(0)
+            .expand(num_tokens, -1)
+            .reshape(-1)
+        )
 
         sort_order = flat_expert.argsort()
         sorted_expert = flat_expert[sort_order]
@@ -279,6 +299,10 @@ class DroplessMoELayer(nn.Module):
             expert_loss = expert_specialization_loss(
                 expert_out, logits, var_beta=expert_var_beta
             )
+            # The [N, top_k, H] per-token expert outputs are dead once the
+            # scalar loss exists — releasing them here (instead of at return)
+            # drops them before the caller allocates anything else.
+            del expert_out
         return moe_output, expert_loss
 
     @staticmethod
@@ -326,10 +350,18 @@ class DroplessMoELayer(nn.Module):
             )
 
         flat_expert = topk_indices.reshape(-1)
-        flat_token = torch.arange(num_tokens, device=x_flat.device).repeat_interleave(
-            top_k
+        flat_token = (
+            torch.arange(num_tokens, device=x_flat.device)
+            .unsqueeze(1)
+            .expand(-1, top_k)
+            .reshape(-1)
         )
-        flat_k = torch.arange(top_k, device=x_flat.device).repeat(num_tokens)
+        flat_k = (
+            torch.arange(top_k, device=x_flat.device)
+            .unsqueeze(0)
+            .expand(num_tokens, -1)
+            .reshape(-1)
+        )
         sort_order = flat_expert.argsort()
         sorted_expert = flat_expert[sort_order]
         sorted_token = flat_token[sort_order]
@@ -394,6 +426,7 @@ class DroplessMoELayer(nn.Module):
             expert_loss = expert_specialization_loss(
                 expert_out, logits, var_beta=expert_var_beta
             )
+            del expert_out
         return moe_output, expert_loss
 
     def _forward_loop(
@@ -466,6 +499,7 @@ class DroplessMoELayer(nn.Module):
             expert_loss = expert_specialization_loss(
                 expert_out, logits, var_beta=expert_var_beta
             )
+            del expert_out
         return moe_output, expert_loss
 
     def forward(
@@ -508,5 +542,10 @@ class DroplessMoELayer(nn.Module):
             expert_var_beta,
             logits,
         )
+        # logits [N, E] fp32 is consumed by the expert-variance part of the
+        # specialization loss inside dispatch; nothing downstream needs the
+        # full [N, E] matrix, so drop the local reference (autograd retains
+        # whatever the losses themselves still require).
+        del logits
 
         return moe_output.reshape(*orig_shape), aux_loss, z_loss, expert_loss

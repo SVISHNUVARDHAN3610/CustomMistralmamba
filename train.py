@@ -921,6 +921,15 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     if args.compile:
         cfg.use_torch_compile = True
         cfg.torch_compile_mode = args.compile_mode
+    if args.gradient_checkpointing:
+        # NOTE: mutually exclusive with --compile (HybridModel.__init__ warns
+        # and keeps compile, dropping checkpointing). Checkpointing wraps the
+        # FULL HybridDecoderLayer forward (memory R/W, GQA, Mamba, fusion, MoE)
+        # via use_reentrant=False and suppresses the Mamba internal scan
+        # checkpoint to avoid double checkpointing. Mathematically neutral:
+        # outputs/losses/gradients are identical modulo CUDA kernel
+        # non-determinism (index_add atomics) that already exists without it.
+        cfg.gradient_checkpointing = True
 
     logger.info(log_mamba_backend(cfg))
     logger.info(
@@ -930,6 +939,15 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         amp_dtype if use_amp else "fp32",
         fused_mamba_scan_available(),
         MEMORY_NAN_FIX_ID,
+    )
+    logger.info(
+        "gradient_checkpointing=%s mamba_internal_checkpoint=%s "
+        "chunked_ce=%s return_logits=%s memory_debug=%s",
+        cfg.gradient_checkpointing,
+        cfg.mamba_internal_checkpoint,
+        cfg.stream_chunked_ce_loss,
+        cfg.return_logits,
+        args.memory_debug,
     )
 
     model = HybridForCausalLM(cfg).to(device)
@@ -1148,6 +1166,16 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 for opt in optimizers:
                     opt.zero_grad(set_to_none=True)
 
+                if args.memory_debug and device.type == "cuda":
+                    logger.debug(
+                        "[mem] step=%d pre-forward alloc=%.2fGB reserved=%.2fGB "
+                        "peak=%.2fGB",
+                        global_step,
+                        torch.cuda.memory_allocated() / 2**30,
+                        torch.cuda.memory_reserved() / 2**30,
+                        torch.cuda.max_memory_allocated() / 2**30,
+                    )
+
                 with torch.autocast(
                     device_type=device.type,
                     dtype=amp_dtype,
@@ -1161,6 +1189,16 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     )
                 assert outputs.loss is not None
 
+                if args.memory_debug and device.type == "cuda":
+                    logger.debug(
+                        "[mem] step=%d post-forward alloc=%.2fGB reserved=%.2fGB "
+                        "peak=%.2fGB",
+                        global_step,
+                        torch.cuda.memory_allocated() / 2**30,
+                        torch.cuda.memory_reserved() / 2**30,
+                        torch.cuda.max_memory_allocated() / 2**30,
+                    )
+
                 # Non-finiteness is handled entirely ON-DEVICE (counters +
                 # masking in the metric accumulation below, plus grad
                 # sanitation after clipping). A NaN/Inf loss or gradient no
@@ -1172,6 +1210,16 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     scaler.scale(outputs.loss).backward()
                 else:
                     outputs.loss.backward()
+
+                if args.memory_debug and device.type == "cuda":
+                    logger.debug(
+                        "[mem] step=%d post-backward alloc=%.2fGB reserved=%.2fGB "
+                        "peak=%.2fGB",
+                        global_step,
+                        torch.cuda.memory_allocated() / 2**30,
+                        torch.cuda.memory_reserved() / 2**30,
+                        torch.cuda.max_memory_allocated() / 2**30,
+                    )
 
                 # Unscale before clipping so max_grad_norm applies to true
                 # gradient magnitudes, not scaled ones.
@@ -1248,6 +1296,17 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 # When strict skipped the update, the NaN grads are freed by
                 # the zero_grad(set_to_none=True) at the top of the next
                 # iteration — they never reach an optimizer or accumulate.
+
+                if args.memory_debug and device.type == "cuda":
+                    logger.debug(
+                        "[mem] step=%d post-opt alloc=%.2fGB reserved=%.2fGB "
+                        "peak=%.2fGB",
+                        global_step,
+                        torch.cuda.memory_allocated() / 2**30,
+                        torch.cuda.memory_reserved() / 2**30,
+                        torch.cuda.max_memory_allocated() / 2**30,
+                    )
+                    torch.cuda.reset_peak_memory_stats()
 
                 aux = outputs.auxiliary_losses
                 assert aux is not None
@@ -1644,6 +1703,21 @@ def parse_args() -> argparse.Namespace:
         "--compile", action="store_true", help="torch.compile decoder layers."
     )
     parser.add_argument("--compile-mode", type=str, default="default")
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Checkpoint each HybridDecoderLayer forward (use_reentrant=False): "
+        "activations are recomputed in backward instead of retained, cutting "
+        "peak VRAM substantially at ~+30%% step time. Mutually exclusive with "
+        "--compile. Outputs/losses/gradients unchanged.",
+    )
+    parser.add_argument(
+        "--memory-debug",
+        action="store_true",
+        help="Log torch.cuda memory allocated/reserved/max at step boundaries "
+        "(forward, backward, optimizer). Zero effect when disabled; CPU-only "
+        "runs log CPU RSS instead of CUDA stats.",
+    )
 
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument(

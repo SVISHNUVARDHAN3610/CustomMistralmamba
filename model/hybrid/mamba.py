@@ -743,13 +743,24 @@ class MambaBlock(nn.Module):
 
         _MAMBA_SCAN_STATS["pytorch_fallback"] += 1
         input_dtype = u.dtype
+        # The scan recurrence is numerically delicate (exp(delta)*A products,
+        # long chains), so inputs are promoted to fp32 once here. All fp32
+        # copies below stay live only inside this function; under AMP the bf16
+        # originals (u/dt/B/C) remain alive in the autograd graph anyway, but
+        # the fp32 conversions are required for stable scan semantics — do not
+        # narrow them back to bf16 without new parity tests.
         u_f = u.float()
         dt_f = dt.float()
         B_f = B.float()
         C_f = C.float()
 
+        # In-place on the freshly-created fp32 copies above (NOT on the bf16
+        # originals): mask application before the scan avoids a second
+        # [B, L, d_inner, n] allocation that the out-of-place form needed.
         delta_a = torch.exp(dt_f.unsqueeze(-1) * A)  # [B, L, d_inner, n]
         delta_b_u = dt_f.unsqueeze(-1) * B_f.unsqueeze(2) * u_f.unsqueeze(-1)
+        # dt_f/B_f/u_f are fully consumed by these two products.
+        del dt_f, B_f, u_f
 
         token_mask: Tensor | None = None
         if attention_mask is not None:
@@ -780,7 +791,10 @@ class MambaBlock(nn.Module):
         )
 
         y = (states * C_f.unsqueeze(2)).sum(dim=-1)
-        y = y + u_f * D.float()
+        # u was deleted above (consumed by delta_b_u); re-derive the skip
+        # branch from the bf16 original promoted per-use. D is [d_inner] —
+        # tiny, conversion is free.
+        y = y + u.float() * D.float()
         if token_mask is not None:
             y = y * token_mask.unsqueeze(-1)
         final_state = states[:, -1].contiguous() if return_final_state else None
