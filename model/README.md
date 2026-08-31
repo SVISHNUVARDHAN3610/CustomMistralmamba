@@ -1,856 +1,507 @@
-# Hybrid Mamba–MoE with Dual Memory
+# Hybrid Mamba–MoE with Dual Compressive Memory: Architecture Specification & Developer Reference
 
-**Reference Implementation — Package Documentation**
+[![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-ee4c2c.svg)](https://pytorch.org/)
+[![Package: model](https://img.shields.io/badge/package-model-blue.svg)](__init__.py)
+[![Architecture: Hybrid v2.1](https://img.shields.io/badge/architecture-v2.1-green.svg)](../research/research.md)
+[![Revision Tag](https://img.shields.io/badge/revision-MEMORY__NAN__FIX__ID-orange.svg)](core/constants.py)
 
-| Field | Value |
-|-------|-------|
-| **Author** | Vishnu Vardhan |
-| **Status** | Research prototype — design finalized (v2.1), implementation complete |
-| **Primary entry point** | `from model import HybridForCausalLM, HybridMambaMoEConfig` |
-| **Design document** | [`research/research.md`](../research/research.md) |
-| **Loss specification** | [`research/loss-definitions.md`](../research/loss-definitions.md) |
-| **Unit tests** | [`tests/test_model.py`](../tests/test_model.py) — 66 tests |
-| **Revision marker** | `MEMORY_NAN_FIX_ID` (see §12) |
+> **Author / Lead Architect:** Vishnu Vardhan  
+> **Status:** Research Reference Implementation (v2.1 Finalized & Verified)  
+> **Primary Public Exports:** `from model import HybridForCausalLM, HybridMambaMoEConfig, MixtralForCausalLM, MixtralConfig`  
+> **Design Specifications:** [`research/research.md`](../research/research.md) | [`research/loss-definitions.md`](../research/loss-definitions.md)  
+> **Unit Test Coverage:** [`tests/test_model.py`](../tests/test_model.py) (83 tests covering forward, backward, AMP, caching, and scan backends)
 
 ---
 
 ## Table of Contents
 
-1. [Executive Summary](#1-executive-summary)
-2. [Problem Statement](#2-problem-statement)
-3. [Package Layout](#3-package-layout)
-4. [Two Model Families](#4-two-model-families)
-5. [Hybrid Decoder Layer — Architecture](#5-hybrid-decoder-layer--architecture)
-6. [Component Reference](#6-component-reference)
-7. [Compressive Memory System](#7-compressive-memory-system)
-8. [Mamba Selective-SSM Branch](#8-mamba-selective-ssm-branch)
-9. [Attention and MoE Subsystems](#9-attention-and-moe-subsystems)
-10. [Training Objective](#10-training-objective)
-11. [Chunked Long-Context Training](#11-chunked-long-context-training)
-12. [Inference and `generate()`](#12-inference-and-generate)
-13. [Configuration Reference](#13-configuration-reference)
-14. [Falsification Hooks](#14-falsification-hooks)
-15. [Numerical Stability and Correctness](#15-numerical-stability-and-correctness)
-16. [Performance and Backends](#16-performance-and-backends)
-17. [Testing Infrastructure](#17-testing-infrastructure)
-18. [Usage Guide](#18-usage-guide)
-19. [Comparison to Prior Architectures](#19-comparison-to-prior-architectures)
-20. [Related Work](#20-related-work)
-21. [Open Questions and Roadmap](#21-open-questions-and-roadmap)
-22. [Appendix A — Per-Layer Data Flow](#appendix-a--per-layer-data-flow)
-23. [Appendix B — File Map](#appendix-b--file-map)
-24. [Appendix C — Glossary](#appendix-c--glossary)
+1. [Architectural Philosophy & Design Principles](#1-architectural-philosophy--design-principles)
+2. [Package Hierarchy & Modular Taxonomy](#2-package-hierarchy--modular-taxonomy)
+3. [Two Model Families: Dual-Track Ablation Architecture](#3-two-model-families-dual-track-ablation-architecture)
+4. [Mathematical Specification of `HybridDecoderLayer`](#4-mathematical-specification-of-hybriddecoderlayer)
+5. [Subsystem Deep-Dive: Compressive Memory (`model.hybrid.memory`)](#5-subsystem-deep-dive-compressive-memory-modelhybridmemory)
+6. [Subsystem Deep-Dive: Selective State-Space Branch (`model.hybrid.mamba`)](#6-subsystem-deep-dive-selective-state-space-branch-modelhybridmamba)
+7. [Subsystem Deep-Dive: Attention & MoE Primitives (`model.layers`)](#7-subsystem-deep-dive-attention--moe-primitives-modellayers)
+8. [Subsystem Deep-Dive: Multi-Task Objectives (`model.hybrid.losses`)](#8-subsystem-deep-dive-multi-task-objectives-modelhybridlosses)
+9. [Subsystem Deep-Dive: Full Model Stacking & Long-Context Execution (`model.hybrid.model`)](#9-subsystem-deep-dive-full-model-stacking--long-context-execution-modelhybridmodel)
+10. [Subsystem Deep-Dive: Core Utilities & Configuration (`model.core`)](#10-subsystem-deep-dive-core-utilities--configuration-modelcore)
+11. [Numerical Stability, Padding Contracts & Defensive Engineering](#11-numerical-stability-padding-contracts--defensive-engineering)
+12. [Falsification & Ablation API Reference](#12-falsification--ablation-api-reference)
+13. [Developer Guide & Code Recipes](#13-developer-guide--code-recipes)
+14. [Comprehensive Symbol Index](#14-comprehensive-symbol-index)
 
 ---
 
-## 1. Executive Summary
+## 1. Architectural Philosophy & Design Principles
 
-This package implements a **sub-quadratic language model architecture** that combines four ideas in a single decoder stack:
+The `model/` package provides a reference PyTorch implementation of a sub-quadratic, long-context language model architecture. The design is governed by five foundational architectural principles:
 
-1. **Sliding-window grouped-query attention (GQA)** — precise local context at O(L·w) cost.
-2. **Mamba selective state-space model (SSM)** — linear-time global context via a continuously updated hidden state.
-3. **Dual compressive memory banks** — bounded-size (m slots), gated read/write explicit memory, one bank per branch.
-4. **Top-2 sparse Mixture-of-Experts (MoE)** — conditional compute in the feed-forward path, Mixtral-style.
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       CORE ARCHITECTURAL PRINCIPLES                         │
+├──────────────────────────────┬──────────────────────────────┬───────────────┤
+│ 1. Sub-Quadratic Complexity  │ 2. Genuine Read/Write Memory │ 3. Linear     │
+│    Every layer scales as     │    Reads condition inputs;   │    Fusion     │
+│    O(L) with sequence length │    writes accumulate outputs │    O(L·d²)    │
+├──────────────────────────────┴──────────────────────────────┴───────────────┤
+│ 4. Defensive Numerical Engineering: AMP FP32 promotions & logit clamping    │
+│ 5. Multi-Tier Backend Acceleration: Fused CUDA -> Parallel -> Blocked Scan  │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-The central research hypothesis is that **explicit, addressable memory** can improve recall of rare, long-range facts that both sliding-window attention and SSM state tend to lose — without reintroducing O(L²) cost. The architecture achieves linear per-layer complexity throughout by:
-
-- Bounding memory reads/writes to O(L·m) with fixed m ≪ L.
-- Fusing attention-branch and SSM-branch outputs via **per-token gating** at O(L·d²), not sequence cross-attention at O(L²).
-- Reusing Mixtral-class sparse MoE for the FFN.
-
-Two complete model families share the GQA and MoE building blocks:
-
-| Family | Config | Model | Role |
-|--------|--------|-------|------|
-| **Baseline** | `MixtralConfig` | `MixtralForCausalLM` | Ablation control: GQA + MoE only |
-| **Hybrid** | `HybridMambaMoEConfig` | `HybridForCausalLM` | Full architecture with dual memory |
-
-The implementation is feature-complete for training and autoregressive inference, including eight memory-specific auxiliary losses, chunked truncated-BPTT training, VRAM-efficient CE streaming, incremental KV/Mamba/memory caching, and 83 unit tests. **What remains scientifically unproven** is whether the memory component is *indispensable* — see §21 and the falsification plan in `research/research.md` §6.
-
----
-
-## 2. Problem Statement
-
-Transformer decoders face three structural limitations that worsen at long context:
-
-| Limitation | Mechanism | Consequence |
-|------------|-----------|-------------|
-| **Quadratic compute** | Full self-attention is O(L²) | Long-context inference (100K+ tokens) is expensive or infeasible |
-| **No persistent addressable memory** | Knowledge lives only in KV cache or SSM state | Rare facts stated early get diluted or fall outside the attention window |
-| **Uniform per-token compute** | Every token uses the same dense FFN | No mechanism to allocate extra compute where needed |
-
-Existing partial solutions:
-
-- **Mamba / SSMs** — fix compute (O(L)) but exhibit recency bias; state is continuously overwritten.
-- **Sliding-window attention** — cheap and precise locally, zero visibility beyond window w.
-- **Mixtral MoE** — sparse routing, but does not address context length or explicit memory.
-- **Jamba** — Mamba + attention + MoE, closest prior work, but **no explicit queryable memory**.
-
-**Our question:** Can we retain linear-time, sparse-compute benefits while adding bounded-cost memory that measurably improves rare long-range recall — without quadratic fusion or attention?
+1. **Strictly Sub-Quadratic Per-Layer Design:** Every neural component—sliding-window GQA, selective SSM, compressive memory cross-attention, token-wise fusion, and MoE routing—exhibits $\mathcal{O}(L)$ time complexity when sequence length $L$ scales and architectural hyper-parameters ($w, m, n, d$) remain constant.
+2. **Genuine Read/Write Memory Semantics:** Memory banks are **not** static learned biases added to residual streams. Memory is explicitly read *prior* to branch execution to condition branch inputs, while *raw* branch outputs are written back into memory banks via gated Exponential Moving Average (EMA) updates.
+3. **Linear Token-Gated Fusion:** Attention and SSM branch outputs are merged via an elementwise sigmoid gating network ($\mathcal{O}(L \cdot d^2)$), completely avoiding the quadratic $\mathcal{O}(L^2)$ sequence cross-attention bottleneck present in early hybrid concepts.
+4. **Defensive Numerical Engineering:** Autocast mixed precision safely promotes numerically sensitive operations (selective scan recurrences, write-gate entropy calculations, memory slot cosine similarities, router logit normalization) to FP32 while executing high-throughput tensor contractions in native low precision.
+5. **Pluggable Backend Acceleration:** The selective state-space branch implements a 4-tier execution hierarchy that automatically leverages fused CUDA kernels (`mamba-ssm`) when present, while gracefully falling back to numerically equivalent pure-PyTorch parallel, blocked, or sequential scans on standard CPU/GPU environments.
 
 ---
 
-## 3. Package Layout
+## 2. Package Hierarchy & Modular Taxonomy
 
-The `model/` package is organized into four logical subpackages plus a root re-export layer. External code should import from `model` directly; subpackage paths are for maintainers and internal wiring.
+The `model/` package is structured into four functional subpackages plus a top-level re-export layer:
 
 ```
 model/
-├── __init__.py          # Public API — re-exports all symbols
-├── README.md            # This document
+├── __init__.py                  # Top-level public API exports
+├── README.md                    # This architecture specification
 │
-├── core/                # Configuration, constants, dtype helpers, builders
-│   ├── config.py        # MixtralConfig, HybridMambaMoEConfig, MambaCache
-│   ├── constants.py     # MEMORY_NAN_FIX_ID
-│   ├── dtype.py         # FP32 promotion under AMP
-│   └── builders.py      # count_trainable_params, build_test3_null_baseline_config
+├── core/                        # Dataclasses, precision helpers, parameter builders
+│   ├── config.py                # MixtralConfig, HybridMambaMoEConfig, MambaCache
+│   ├── constants.py             # MEMORY_NAN_FIX_ID revision tags
+│   ├── dtype.py                 # _promote_fp32, _restore_dtype, precision guards
+│   ├── optim.py                 # split_muon_adam_params, _is_adamw_no_decay
+│   └── builders.py              # count_trainable_params, build_test3_null_baseline_config
 │
-├── layers/              # Shared neural building blocks (both model families)
-│   ├── norm.py          # RMSNorm
-│   ├── rope.py          # RotaryEmbedding, apply_rotary_pos_emb
-│   ├── attention.py     # SlidingWindowGQA
-│   ├── moe.py           # MOERouter, SwiGLUExpert, DroplessMoELayer
-│   └── fusion.py        # TokenGatedFusion (hybrid only, but logically a layer)
+├── layers/                      # Shared neural building blocks (used across model families)
+│   ├── norm.py                  # RMSNorm
+│   ├── rope.py                  # RotaryEmbedding (fixed-capacity cache, FSDP-safe)
+│   ├── attention.py             # SlidingWindowGQA (SDPA, sink tokens, QK-norm)
+│   ├── moe.py                   # MOERouter, SwiGLUExpert, DroplessMoELayer
+│   ├── fusion.py                # TokenGatedFusion
+│   └── sampling.py              # top_k_filter, top_p_filter
 │
-├── mixtral/             # Baseline ablation model
-│   └── model.py         # MixtralDecoderLayer, MixtralModel, MixtralForCausalLM
+├── mixtral/                     # Baseline control model (ablation reference)
+│   └── model.py                 # MixtralDecoderLayer, MixtralModel, MixtralForCausalLM
 │
-└── hybrid/              # Research model + specialized subsystems
-    ├── losses.py        # Eight auxiliary losses + schedules
-    ├── memory.py        # CompressiveMemoryBank, MemoryWriteBuffer, batched ops
-    ├── mamba.py         # MambaBlock, scan backends, diagnostics
-    ├── layer.py         # HybridDecoderLayer
-    └── model.py         # HybridModel, HybridForCausalLM, generate()
+└── hybrid/                      # Hybrid Mamba–MoE research architecture & memory subsystem
+    ├── layer.py                 # HybridDecoderLayer, _hybrid_layer_forward
+    ├── memory.py                # CompressiveMemoryBank, MemoryWriteBuffer, batched ops
+    ├── mamba.py                 # MambaBlock, scan dispatch tiers, telemetry
+    ├── losses.py                # 8 auxiliary loss functions, warmup schedules
+    └── model.py                 # HybridModel, HybridForCausalLM, chunked BPTT, generate()
 ```
 
-### Dependency graph
+### Dependency Architecture
 
 ```mermaid
-flowchart TD
-    init["model/__init__.py"]
-    core["model/core/"]
-    layers["model/layers/"]
-    mixtral["model/mixtral/"]
-    hybrid["model/hybrid/"]
+graph TD
+    classDef init fill:#f8fafc,stroke:#334155,stroke-width:1.5px;
+    classDef core fill:#eff6ff,stroke:#2563eb,stroke-width:1.5px;
+    classDef layer fill:#f0fdf4,stroke:#16a34a,stroke-width:1.5px;
+    classDef model fill:#faf5ff,stroke:#9333ea,stroke-width:1.5px;
 
-    init --> core
-    init --> layers
-    init --> mixtral
-    init --> hybrid
+    Init["model/__init__.py"]:::init
+    Core["model.core (Config, Dtype, Builders)"]:::core
+    Layers["model.layers (Norm, RoPE, GQA, MoE, Fusion)"]:::layer
+    Mixtral["model.mixtral (Baseline Control)"]:::model
+    Hybrid["model.hybrid (Memory, Mamba, Losses, HybridModel)"]:::model
 
-    mixtral --> core
-    mixtral --> layers
-    hybrid --> core
-    hybrid --> layers
-    layers --> core
+    Init --> Core
+    Init --> Layers
+    Init --> Mixtral
+    Init --> Hybrid
+
+    Layers --> Core
+    Mixtral --> Core
+    Mixtral --> Layers
+    Hybrid --> Core
+    Hybrid --> Layers
 ```
-
-**Design principle:** Hybrid-only components (`memory`, `mamba`, auxiliary `losses`) live under `hybrid/` so `layers/` remains genuinely shared between Mixtral and Hybrid families.
 
 ---
 
-## 4. Two Model Families
+## 3. Two Model Families: Dual-Track Ablation Architecture
 
-### 4.1 Mixtral Baseline (`MixtralForCausalLM`)
-
-A control model for ablations. Each `MixtralDecoderLayer` applies:
+To ensure scientific rigor and reproducible ablation analysis, the package provides two parallel, parameter-matched model families:
 
 ```
-x → RMSNorm → SlidingWindowGQA → residual
-  → RMSNorm → Top-2 MoE → residual
+                            MODEL FAMILY DUAL TRACK
+                                       │
+        ┌──────────────────────────────┴──────────────────────────────┐
+        │                                                             │
+        ▼                                                             ▼
+[Mixtral Baseline Family]                                  [Hybrid Research Family]
+• Class: MixtralForCausalLM                                • Class: HybridForCausalLM
+• Config: MixtralConfig                                    • Config: HybridMambaMoEConfig
+• Backbone: Sliding-Window GQA + MoE                       • Backbone: GQA + Mamba + Dual Memory + MoE
+• Loss: CE + Router Aux + Router Z                         • Loss: CE + Router Aux + Router Z + 8 Aux Losses
+• Purpose: Control for attention & MoE                     • Purpose: Long-context memory & SSM research
 ```
 
-Training loss:
+### 1. Baseline Control Family (`MixtralForCausalLM`)
+* **Layer Composition:** `RMSNorm` $\to$ `SlidingWindowGQA` $\to$ `Residual` $\to$ `RMSNorm` $\to$ `DroplessMoELayer` $\to$ `Residual`.
+* **Standard Loss Formulation:**
+  $$\mathcal{L}_{\text{baseline}} = \mathcal{L}_{\text{CE}} + 0.02 \cdot \mathcal{L}_{\text{router\_aux}} + 0.005 \cdot \mathcal{L}_{\text{router\_z}}$$
+* **Role:** Serves as the primary control for measuring the isolated impact of adding the selective SSM branch and dual compressive memory banks.
 
-```
-loss = ce_loss + 0.02 · aux_loss + 0.005 · z_loss
-```
-
-Where `aux_loss` is Switch-Transformer load balancing and `z_loss` penalizes large router log-sum-exp values. No Mamba branch, no memory banks, no fusion gate.
-
-**When to use:** Any experiment where you need an apples-to-apples comparison against the hybrid stack at matched GQA+MoE capacity — e.g., "does dual memory help beyond what a bigger SSM state would provide?" (Test 3).
-
-### 4.2 Hybrid Model (`HybridForCausalLM`)
-
-The full research architecture. Each `HybridDecoderLayer` runs parallel GQA and Mamba branches, conditions each branch on its memory bank, fuses branch outputs, and applies MoE. See §5 for the complete per-layer diagram.
-
-**When to use:** All experiments targeting long-context recall, memory falsification tests, and production training runs described in `research/research.md`.
+### 2. Full Hybrid Family (`HybridForCausalLM`)
+* **Layer Composition:** `RMSNorm` $\to$ `Dual Memory Read` $\to$ Parallel (`SlidingWindowGQA` $\parallel$ `MambaBlock`) $\to$ `Dual Memory Write` $\to$ `TokenGatedFusion` $\to$ `Residual` $\to$ `RMSNorm` $\to$ `DroplessMoELayer` $\to$ `Residual`.
+* **Full Multi-Task Loss Formulation:** Integrates language modeling cross-entropy, router load balancing, router z-loss, final logit z-loss, and the 8-objective memory auxiliary loss suite.
 
 ---
 
-## 5. Hybrid Decoder Layer — Architecture
+## 4. Mathematical Specification of `HybridDecoderLayer`
 
-### 5.1 High-level diagram
-
-```mermaid
-flowchart TD
-    subgraph Layer["HybridDecoderLayer"]
-        A[Input x] --> B[RMSNorm]
-        B --> C[SlidingWindowGQA]
-        B --> D[MambaBlock]
-
-        AM[(attn_memory_bank)] -. read .-> C
-        SM[(state_memory_bank)] -. read .-> D
-
-        C --> E[attn_out]
-        D --> F[mamba_out]
-
-        E -. write .-> AM
-        F -. write .-> SM
-
-        E --> G[TokenGatedFusion]
-        F --> G
-        G --> H[Residual + RMSNorm]
-        H --> I[Top-2 MoE]
-        I --> J[Output]
-    end
-
-    AM ==> AM2[Carried to next chunk/layer]
-    SM ==> SM2[Carried to next chunk/layer]
-```
-
-### 5.2 Per-layer compute summary
-
-| Component | Role | Asymptotic cost |
-|-----------|------|-----------------|
-| Sliding Window GQA | Local precise attention | O(L·w), w = window size |
-| MambaBlock | Linear global context via SSM | O(L·d·n), n = state dim |
-| CompressiveMemoryBank (×2) | Gated read/write over m slots | O(L·m), m fixed |
-| TokenGatedFusion | Per-token branch combination | O(L·d²) |
-| Top-2 MoE | Sparse FFN | O(L·2·d_ff·d) |
-
-**Total per layer:** O(L) when m, w, n, d are held constant — the design target for 100K+ token contexts.
-
-### 5.3 Memory conditioning semantics (critical detail)
-
-Memory is **not** mixed after the branches. The implementation matches `research/research.md` §3.3:
-
-1. **Read path:** Each bank is read with the current token representations as queries. The read output is concatenated with the shared RMSNorm'd hidden state and projected through `attn_memory_combine` / `state_memory_combine` **before** entering GQA and Mamba respectively.
-
-2. **Write path:** **Raw** branch outputs (`attn_out`, `mamba_out`) — not the memory-augmented tensors — are accumulated and written back to the banks via a single-sigmoid gated EMA update.
-
-This read-into-input / write-from-output contract is what makes the banks a genuine memory system rather than a static learned bias on the residual stream.
-
-### 5.4 Layer forward signature
-
-`HybridDecoderLayer.forward()` returns:
-
-| Output | Type | Description |
-|--------|------|-------------|
-| `x_out` | `Tensor [B,L,d]` | Layer output hidden states |
-| `aux_loss` | `Tensor` | MoE router load-balancing loss |
-| `z_loss` | `Tensor` | MoE router z-loss |
-| `present_key_value` | `tuple` or `None` | GQA KV cache if `use_cache=True` |
-| `new_memory_state` | `HybridMemoryState` or `None` | Updated (attn_bank, state_bank) |
-| `new_mamba_cache` | `MambaCache` or `None` | `(conv_state, ssm_state)` |
-| `gate_stats` | `dict[str, Tensor]` | Detached write-gate means for logging |
-| `new_write_buffer` | `MemoryWriteBuffer` or `None` | Pending decode writes |
-| `layer_aux` | `HybridLayerAuxLosses` | Per-layer raw auxiliary loss scalars |
-
----
-
-## 6. Component Reference
-
-### 6.1 `model/core/`
-
-| Module | Key symbols | Purpose |
-|--------|-------------|---------|
-| `config.py` | `MixtralConfig`, `HybridMambaMoEConfig`, `MambaCache` | All hyperparameters; JSON serialize/deserialize |
-| `constants.py` | `MEMORY_NAN_FIX_ID` | Revision marker for memory-path NaN guards |
-| `dtype.py` | `_promote_fp32`, `_restore_dtype` | Numerically sensitive ops under AMP |
-| `builders.py` | `count_trainable_params`, `build_test3_null_baseline_config` | Param budgeting and Test 3 null baseline |
-
-`HybridMambaMoEConfig` extends `MixtralConfig` — all GQA and MoE fields are reused. Hybrid-specific fields are documented in §13.
-
-### 6.2 `model/layers/`
-
-Shared building blocks used by both model families:
-
-| Module | Class | Notes |
-|--------|-------|-------|
-| `norm.py` | `RMSNorm` | Pre-norm placement; eps from config |
-| `rope.py` | `RotaryEmbedding` | Fixed-size cache up to `max_position_embeddings`; fails loudly if exceeded |
-| `attention.py` | `SlidingWindowGQA` | SDPA-only; KV truncated to window; mask aligned with truncated KV |
-| `moe.py` | `MOERouter`, `SwiGLUExpert`, `DroplessMoELayer` | Top-k routing, optional capacity factor, grouped dispatch |
-| `fusion.py` | `TokenGatedFusion` | Sigmoid gate over `[attn_out; mamba_out]` per token |
-
-### 6.3 `model/mixtral/`
-
-| Class | Description |
-|-------|-------------|
-| `MixtralDecoderLayer` | Single transformer-MoE layer |
-| `MixtralModel` | Embedding + N layers + final RMSNorm |
-| `MixtralForCausalLM` | Adds `lm_head`; computes CE + router losses |
-| `MixtralTrainingOutput` | Dataclass with logits, losses, KV cache |
-
-### 6.4 `model/hybrid/`
-
-| Module | Key symbols |
-|--------|-------------|
-| `losses.py` | `HybridLayerAuxLosses`, eight loss functions, warmup schedules |
-| `memory.py` | `CompressiveMemoryBank`, `MemoryWriteBuffer`, batched read/write |
-| `mamba.py` | `MambaBlock`, fused scan, fallback tiers, `log_mamba_backend()` |
-| `layer.py` | `HybridDecoderLayer`, `_hybrid_layer_forward` |
-| `model.py` | `HybridModel`, `HybridForCausalLM`, `generate()` |
-
----
-
-## 7. Compressive Memory System
-
-### 7.1 `CompressiveMemoryBank`
-
-Each bank maintains **m fixed slots** of dimension d (config: `memory_size`, default 64). Core operations:
-
-**Read:** Multi-head scaled dot-product attention where chunk tokens are queries and memory slots are keys/values. Cost O(L·m·d).
-
-**Write:** A learned `summary_query` attends over the current chunk to produce a compressed summary. A single-sigmoid gate blends the summary into existing memory (an EMA-style convex blend, not a full GRU cell — no reset/forget pair):
+The `HybridDecoderLayer` processes hidden state $x \in \mathbb{R}^{B \times L \times d}$ through the following sequential tensor operations:
 
 ```
-gate = σ(W · [memory; summary])
-new_memory = gate ⊙ memory + (1 − gate) ⊙ update(summary)
+Step 1: Input Pre-Normalization
+  x_norm = RMSNorm(x) * M_pad
+
+Step 2: Dual Memory Cross-Attention Read
+  A_read = BatchedCrossAttn(query=x_norm, key=M_attn, val=M_attn) ∈ ℝ^(B × L × d)
+  S_read = BatchedCrossAttn(query=x_norm, key=M_state, val=M_state) ∈ ℝ^(B × L × d)
+  attn_in = W_c^a · [x_norm ; A_read]
+  mamba_in = W_c^s · [x_norm ; S_read]
+
+Step 3: Parallel Branch Evaluation
+  a_t, KV_cache = SlidingWindowGQA(attn_in, window=w, RoPE=fixed_cache)
+  s_t, Mamba_cache, h_ssm = MambaBlock(mamba_in, conv_kernel=k, state_dim=n)
+
+Step 4: Raw Output Accumulation & Gated Memory Write
+  Buffer.append(a_t, s_t, mask=M_pad)
+  S_a, S_s = CrossAttnSummarize(Q_summary, [a_t ; s_t])
+  g_w = σ(W_g · [M_old ; S] + b_g)
+  M_new = g_w ⊙ M_old + (1 - g_w) ⊙ W_u(S)
+
+Step 5: Linear Token-Gated Branch Fusion
+  g_t = σ(W_fusion · [a_t ; s_t] + b_fusion) ∈ ℝ^(B × L × d)
+  fused = g_t ⊙ a_t + (1 - g_t) ⊙ s_t
+  x_mid = x + fused * M_pad
+
+Step 6: Sparse Mixture-of-Experts Feed-Forward
+  moe_in = RMSNorm(x_mid) * M_pad
+  topk_weights, topk_indices = Router(moe_in, k=2, E=8)
+  moe_out = DroplessMoEDispatch(moe_in, topk_weights, topk_indices)
+  x_out = x_mid + moe_out
 ```
 
-Padding-safe: all-masked rows skip writes; gate/summary sanitized to finite values when no valid tokens exist.
-
-**Training-only aux modules** (omitted when `use_auxiliary_losses=False`):
-
-- `MemoryReconstructionDecoder` — cross-attention decoder for L_recon
-- `assoc_key`, `assoc_val` — linear projections for L_assoc
-
-### 7.2 Dual-bank design
-
-| Bank | Paired branch | Combine layer |
-|------|---------------|---------------|
-| `attn_memory_bank` | SlidingWindowGQA | `attn_memory_combine` |
-| `state_memory_bank` | MambaBlock | `state_memory_combine` |
-
-Banks are **independent** — separate parameters, separate states, separate write/read paths. `batched_dual_memory_read` and `batched_dual_memory_write` fuse both banks into single stacked attention passes for throughput.
-
-### 7.3 `MemoryWriteBuffer`
-
-During decode and chunked prefill, raw branch outputs accumulate in a pre-allocated buffer with a **per-token validity mask** (`mask_buf`). This ensures:
-
-- Multi-step decode appends do not reconstruct prior padding as valid tokens.
-- Write cadence matches training chunk semantics (`memory_write_interval` / `memory_chunk_size`).
-- `append_single_token()` fast path for single-token decode steps.
-
-When the buffer fills or a write interval elapses, `batched_dual_memory_write` flushes both banks atomically.
-
-### 7.4 Memory state threading
-
-`HybridMemoryState = tuple[Tensor, Tensor]` — one tensor per bank, shape `[B, m, d]`.
-
-States are threaded:
-
-- **Across layers** within one forward pass (each layer has its own banks).
-- **Across sequence chunks** during chunked training (truncated BPTT).
-- **Across decode steps** via `generate()` cache threading.
-
-`HybridModel.zero_memory_states()` returns zero tensors of the correct shape — Test 1 falsification hook.
-
----
-
-## 8. Mamba Selective-SSM Branch
-
-### 8.1 `MambaBlock` overview
-
-Implements the selective SSM (S6) from the Mamba literature:
-
-1. Input projection → split into `x` and `z` gates.
-2. Depthwise causal Conv1d over `x`.
-3. Low-rank projection to Δ, B, C SSM parameters.
-4. Selective scan: `h_t = exp(Δ·A) ⊙ h_{t-1} + Δ·B·u_t`, `y_t = C·h_t + D·u_t`.
-5. Output gate: `y = scan_out ⊙ silu(z)`.
-6. Output projection back to hidden size.
-
-`dt_proj.bias` is initialized to Mamba-standard softplus-uniform range and marked `_no_reinit` so `_init_weights` does not zero it.
-
-### 8.2 Four-tier scan dispatch
-
-When `mamba-ssm` fused CUDA kernels are unavailable, the block selects a PyTorch fallback by sequence length:
-
-| Tier | Condition | Method | Training memory |
-|------|-----------|--------|-----------------|
-| 1 | CUDA + `use_fused_mamba_scan` + no padding | `mamba-ssm` fused `selective_scan` | Lowest |
-| 1b | CUDA + padded batch | Per-row unpadded fused scan | Low |
-| 2 | `use_parallel_scan` or `L ≤ 4096` | Hillis-Steele parallel scan | O(L log L) |
-| 3 | `4096 < L ≤ 65536` | Blocked vectorized scan | O(L) work, moderate memory |
-| 4 | `L > 65536` | Sequential scan + optional checkpoint | O(L) work, lowest memory |
-
-`mamba_internal_checkpoint` enables gradient checkpointing on tiers 3–4 when layer checkpointing is off — avoids double-checkpointing when `gradient_checkpointing=True`.
-
-### 8.3 Incremental decode
-
-`MambaBlock.step()` runs a single-token update using in-place conv buffer shift and SSM state recurrence. Returns updated `(conv_state, ssm_state)` for `generate()`.
-
-`allocate_inference_cache()` pre-allocates zero states for batch prefill initialization.
-
-### 8.4 Diagnostics
-
-| Function | Purpose |
-|----------|---------|
-| `log_mamba_backend(config)` | Human-readable summary of active scan backend |
-| `probe_mamba_scan_timing(config)` | One-step fused vs fallback timing on CUDA |
-| `get_mamba_scan_stats()` | Counters: `fused_full_batch`, `fused_unpadded_batch`, `pytorch_fallback` |
-| `reset_mamba_scan_stats()` | Reset counters at training run start |
-| `fused_mamba_scan_available()` | Whether `mamba-ssm` is importable |
-
----
-
-## 9. Attention and MoE Subsystems
-
-### 9.1 `SlidingWindowGQA`
-
-Mistral-style grouped-query attention with a sliding causal window:
-
-- Queries: `num_heads` heads; keys/values: `num_kv_heads` heads with repeat-interleave expansion.
-- RoPE applied via `RotaryEmbedding` with configurable `rope_theta` and `max_position_embeddings`.
-- KV cache stores only the trailing `window_size` tokens (not full history).
-- **Critical fix:** When KV is truncated, `attention_mask` is truncated to match — prevents shape mismatch during `generate()` once `seq_len > window_size`.
-
-Uses `torch.nn.functional.scaled_dot_product_attention` exclusively. An experimental `flex_attention` path was removed (FSDP-unsafe global mask, incorrect indexing, unsupported on T4).
-
-### 9.2 `MOERouter`
-
-Top-k sparse routing (default k=2, E=8 experts):
-
-- Full softmax over all experts for Switch-Transformer load balancing (`f_i`, `p_i` statistics).
-- Top-k weights renormalized for dispatch.
-- Router logits clamped to [-30, 30] before softmax for FP16 stability.
-- Router matmul runs at native weight dtype; only logits are promoted to FP32 for stability.
-
-### 9.3 `DroplessMoELayer`
-
-Token dispatch to experts with three backends:
-
-1. **Grouped GEMM** (`use_grouped_gemm=True`) — `torch._grouped_mm` when available.
-2. **Grouped dispatch** (`use_grouped_moe_dispatch=True`) — sort tokens by expert, stacked weight tensors.
-3. **Loop dispatch** — per-expert `nn.ModuleList` fallback.
-
-Optional `capacity_factor` bounds tokens per expert (memory safety valve). Default `None` = fully dropless, batch-independent routing — preferred for research reproducibility.
-
----
-
-## 10. Training Objective
-
-### 10.1 Combined loss
-
-```
-L_total = ce_loss
-        + 0.02  · aux_loss          # MoE load balancing
-        + 0.005 · z_loss            # MoE router logit stability
-        + Σᵢ λᵢ · Lᵢ               # eight auxiliary terms (hybrid only)
-```
-
-Auxiliary terms are **training-only** (`use_auxiliary_losses=True` by default). Inference and `generate()` do not compute them. Training-only modules (`recon_decoder`, `assoc_key`, `assoc_val`) are excluded from param counts via `count_trainable_params(..., exclude_training_aux=True)`.
-
-### 10.2 Auxiliary loss catalog
-
-| # | Symbol | Default λ | Warmup | Purpose |
-|---|--------|-----------|--------|---------|
-| 1 | `L_recon` | 0.08 | — | Reconstruct chunk from write summary |
-| 2 | `L_assoc` | 1.2e-4 | 5% steps | Post-write key→value retrieval |
-| 3 | `L_gate` | 1e-3 | — | Write-gate entropy (anti-saturation) |
-| 4 | `L_read` | 5e-3 | — | Memory combine layer utilization floor |
-| 5 | `L_fusion` | 8e-3 | — | Fusion gate balance toward 0.5 |
-| 6 | `L_expert` | 2e-3 | 10% steps | Expert output orthogonality + routing variance |
-| 7 | `L_ssm` | 1e-5 | — | SSM state norm hinge (γ from calibration) |
-| 8 | `L_slot` | 3e-3 | — | Intra/cross-bank slot diversity |
-
-Full formulas and tuning signals: `research/loss-definitions.md`.
-
-### 10.3 The write-path gradient problem
-
-Even with truncated BPTT across `memory_chunk_size` chunks, write parameters receive **sparse** CE gradients:
-
-- Within a chunk, written memory is not re-read in the same chunk.
-- The last chunk's write receives no future CE signal.
-
-Auxiliary losses L_recon and L_assoc exist specifically to give the write path a **direct** training signal. `HybridForCausalLM` warns (or raises in `debug_state_checks` mode) if `use_dual_memory=True` with `use_auxiliary_losses=False`.
-
-### 10.4 Schedule functions
+### Complete Layer Forward Signature
 
 ```python
-_aux_loss_schedule(step, max_steps, warmup_fraction)  # linear 0→1 for L_assoc
-_expert_loss_schedule(step, max_steps, warmup_fraction)  # step-on at warmup_fraction
+def forward(
+    self,
+    x: Tensor,                                          # [B, L, d]
+    memory_state: tuple[Tensor, Tensor] | None = None,  # (M_attn, M_state): each [B, m, d]
+    attention_mask: Tensor | None = None,               # [B, L] or [B, 1, 1, L]
+    position_ids: Tensor | None = None,                 # [B, L]
+    past_key_value: tuple[Tensor, Tensor] | None = None,# (K, V): each [B, H_kv, w, d_k]
+    mamba_cache: tuple[Tensor, Tensor] | None = None,   # (conv_state, ssm_state)
+    use_cache: bool = False,
+    skip_memory_write: bool = False,
+    write_buffer: MemoryWriteBuffer | None = None,
+    active_batch_mask: Tensor | None = None,            # [B] bool
+    training_step: int | None = None,
+    max_training_steps: int | None = None,
+    batch_has_padding: bool | None = None,
+    layer_checkpointing_active: bool = False,
+    decode_accumulate_only: bool = False,
+) -> tuple[
+    Tensor,                                             # x_out: [B, L, d]
+    Tensor,                                             # router_aux_loss: scalar
+    Tensor,                                             # router_z_loss: scalar
+    tuple[Tensor, Tensor] | None,                       # present_key_value
+    tuple[Tensor, Tensor] | None,                       # new_memory_state
+    tuple[Tensor, Tensor] | None,                       # new_mamba_cache
+    dict[str, Tensor],                                  # gate_stats
+    MemoryWriteBuffer | None,                           # new_write_buffer
+    HybridLayerAuxLosses,                               # raw per-layer auxiliary losses
+]
 ```
 
 ---
 
-## 11. Chunked Long-Context Training
+## 5. Subsystem Deep-Dive: Compressive Memory (`model.hybrid.memory`)
 
-When `seq_len > memory_chunk_size` (default 512) and `use_dual_memory=True`, `HybridForCausalLM` routes to `_forward_chunked()`:
+### 1. Memory Bank Architecture (`CompressiveMemoryBank`)
+Each bank maintains $m$ fixed-size memory slots ($m=64$ default) of dimension $d$.
 
-1. Split sequence into chunks of size `memory_chunk_size`.
-2. Thread `memory_states` across chunks inside **one** backward pass (truncated BPTT).
-3. Accumulate router aux/z losses and auxiliary losses token-weighted across chunks.
-4. If `stream_chunked_ce_loss=True` (default): compute CE on valid label positions only — peak logits `[N_valid, V]` not `[B, L, V]`.
-5. If `return_logits=False`: skip materializing full `[B, L, V]` logits tensor entirely.
+* **Initialization:** Initial slot parameters $M_0 \in \mathbb{R}^{m \times d} \sim \mathcal{N}(0, 0.02^2)$ expanded to batch dimension $[B, m, d]$.
+* **Read Mechanism:** Evaluates multi-head scaled dot-product attention where queries are generated from normalized inputs $x \in \mathbb{R}^{B \times L \times d}$ and keys/values are memory slots $M \in \mathbb{R}^{B \times m \times d}$. Complexity is $\mathcal{O}(B \cdot L \cdot m \cdot d)$.
+* **Write Mechanism:** Learned summary queries $Q_{\text{summary}} \in \mathbb{R}^{m \times d}$ cross-attend over raw branch outputs to construct compressed chunk summary $S \in \mathbb{R}^{B \times m \times d}$. The memory update follows a convex EMA blend parameterized by a single-sigmoid gate:
+  $$g = \sigma\left(W_g [M; S] + b_g\right), \quad M_{\text{updated}} = g \odot M + (1 - g) \odot W_u(S)$$
+* **Padding Guard:** When all tokens in a row are padding, softmax scores are forced to $0.0$ and the memory state undergoes an identity transition ($M_{t} = M_{t-1}$).
 
-**VRAM impact:** For vocab V=32K, hidden d=4096, batch B=2, chunk L=512:
+### 2. Write Accumulator (`MemoryWriteBuffer`)
+Pre-allocated, fixed-capacity ring buffer designed to eliminate dynamic memory allocation overhead during chunked training and single-token decode:
 
-- Full logits per chunk: ~134 MB (fp16) per chunk materialized.
-- Streamed CE: proportional to valid tokens only — critical for cloud training at ~200M params.
+* **Validity Bitmask (`mask_buf`):** Stores a per-token boolean validity mask alongside accumulated branch outputs, preventing padded positions from being reconstructed as valid tokens across multi-step decode appends.
+* **Fast-Path Decode Append:** `append_single_token()` updates rolling buffers via in-place slice copies without tensor concatenation.
 
-`gradient_checkpointing=True` checkpoints each `HybridDecoderLayer` forward via `_hybrid_layer_forward`. Mamba internal scan checkpointing is automatically suppressed when layer checkpointing is active to avoid double checkpoint overhead.
-
----
-
-## 12. Inference and `generate()`
-
-### 12.1 Cache types
-
-| Cache | Type | Per | Purpose |
-|-------|------|-----|---------|
-| `past_key_values` | `list[tuple[K,V]]` | Layer | GQA sliding window KV |
-| `mamba_caches` | `list[MambaCache]` | Layer | `(conv_state, ssm_state)` |
-| `memory_states` | `list[HybridMemoryState]` | Layer | Dual bank tensors |
-| `write_buffers` | `list[MemoryWriteBuffer]` | Layer | Pending branch outputs |
-
-### 12.2 `generate()` pipeline
-
-1. **Chunked prefill** — processes prompt in `memory_write_interval` chunks; flushes memory writes at chunk boundaries.
-2. **Single-token decode loop** — appends one token per step; accumulates branch outputs in `MemoryWriteBuffer`.
-3. **Memory write cadence** — writes every `memory_write_interval` tokens (defaults to `memory_chunk_size`).
-4. **Finished rows** — `active_batch_mask` freezes KV/Mamba/memory updates for sequences that hit `eos_token_id`.
-5. **Final flush** — any partial write buffer is flushed via `_flush_memory_write_buffers()`.
-6. **CUDA graph decode (removed)** — the former `use_cuda_graph=True` fast path was removed: its capture/replay silently corrupted recurrent state (warm-up ran against live caches; replay froze KV/SSM/memory at capture-time addresses). The flag remains in the config as a documented no-op that warns and decodes eagerly.
-
-### 12.3 Sampling
-
-Supports `temperature`, `top_k`, `top_p`, `do_sample`, and `eos_token_id` (defaults to `config.eos_token_id`). Greedy decoding uses `argmax`; sampling uses filtered softmax + multinomial.
+### 3. Fused Dual-Bank Tensor Operations
+* **`batched_dual_memory_read`:** Stacks projection weights across both `attn_memory_bank` and `state_memory_bank`, executing both memory reads in a single batched `torch.bmm` + attention pass.
+* **`batched_dual_memory_write`:** Stacks summary query projections, write gates, and update projections across both banks, executing atomic dual-bank updates.
 
 ---
 
-## 13. Configuration Reference
+## 6. Subsystem Deep-Dive: Selective State-Space Branch (`model.hybrid.mamba`)
 
-### 13.1 Shared fields (`MixtralConfig`)
+### 1. Mathematical Formulation (Mamba S6)
+The selective state-space model maps input sequence $u \in \mathbb{R}^{B \times L \times d_{\text{inner}}}$ to output $y \in \mathbb{R}^{B \times L \times d_{\text{inner}}}$ via continuous-time latent state $h(t) \in \mathbb{R}^{n}$:
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `vocab_size` | 32000 | Embedding / lm_head rows |
-| `hidden_size` | 4096 | Model dimension d |
-| `num_layers` | 32 | Decoder depth |
-| `num_heads` | 32 | GQA query heads |
-| `num_kv_heads` | 8 | GQA key/value heads |
-| `head_dim` | 128 | Per-head dimension |
-| `intermediate_size` | 14336 | MoE expert inner dim |
-| `window_size` | 4096 | Sliding attention window w |
-| `num_experts` | 8 | MoE expert count E |
-| `top_k` | 2 | Experts per token |
-| `capacity_factor` | `None` | MoE capacity limit; None = dropless |
-| `max_position_embeddings` | 32768 | RoPE cache upper bound |
-| `rope_theta` | 10000.0 | RoPE base frequency |
-| `router_aux_loss_coef` | 0.02 | Load balancing weight |
-| `router_z_loss_coef` | 0.005 | Router z-loss weight |
-| `label_ignore_index` | -100 | CE ignore index for padding |
-| `tie_word_embeddings` | False | Share embed and lm_head weights |
+$$\Delta = \text{Softplus}\left(\text{Linear}_{\Delta}(\text{Conv1D}(u)) + b_{\Delta}\right)$$
+$$A = -\exp(A_{\text{log}}), \quad \bar{A} = \exp(\Delta A), \quad \bar{B} = \Delta \cdot \text{Linear}_B(\text{Conv1D}(u))$$
+$$h_t = \bar{A}_t h_{t-1} + \bar{B}_t u_t, \quad y_t = \text{Linear}_C(\text{Conv1D}(u)) h_t + D u_t$$
+$$\text{output} = \text{Linear}_{\text{out}}(y \odot \text{SiLU}(z))$$
 
-### 13.2 Hybrid-specific fields (`HybridMambaMoEConfig`)
+* **Initialization Safeguards:** `dt_proj.bias` is initialized to the official Mamba softplus-uniform distribution and tagged with `_no_reinit = True` to prevent model-wide reinitialization routines from zeroing it out. $A_{\text{log}}$ and $D$ are tagged with `_no_weight_decay = True`.
 
-| Field | Default | Description |
-|-------|---------|-------------|
-| `mamba_state_size` | 16 | SSM state dimension n |
-| `mamba_conv_kernel` | 4 | Depthwise conv kernel size |
-| `mamba_expand` | 2 | Mamba inner dim multiplier |
-| `use_dual_memory` | True | Enable memory banks; False = Jamba-like |
-| `memory_size` | 64 | Slots per bank m |
-| `memory_num_heads` | 8 | Memory attention heads |
-| `memory_chunk_size` | 512 | Training BPTT chunk; None disables |
-| `memory_write_interval` | None | Decode write cadence; None → chunk size |
-| `use_fused_mamba_scan` | True | Prefer mamba-ssm CUDA kernels |
-| `use_parallel_scan` | False | Force Hillis-Steele scan |
-| `parallel_scan_fallback_max_len` | 4096 | Tier 2 upper bound |
-| `blocked_scan_min_len` | 4096 | Tier 3 lower bound |
-| `sequential_scan_min_len` | 65536 | Tier 4 lower bound |
-| `gradient_checkpointing` | False | Per-layer activation checkpointing |
-| `mamba_internal_checkpoint` | True | Scan-level checkpoint when layer ckpt off |
-| `stream_chunked_ce_loss` | True | VRAM-efficient chunked CE |
-| `return_logits` | True | Return full logits tensor |
-| `use_grouped_moe_dispatch` | True | Sort-by-expert MoE dispatch |
-| `use_cuda_graph` | False | No-op (CUDA-graph decode removed; warns if enabled) |
-| `use_torch_compile` | False | `torch.compile` per layer |
-| `use_auxiliary_losses` | True | Eight training aux losses |
-| `debug_state_checks` | False | Assert cache/mask invariants |
+### 2. Multi-Tier Scan Dispatch Architecture
 
-All `lambda_*` auxiliary coefficients are on `HybridMambaMoEConfig` — see `model/core/config.py` for complete list.
+```
+                                MAMBA SCAN DISPATCH
+                                         │
+                 ┌───────────────────────┴───────────────────────┐
+                 │                                               │
+                 ▼ (CUDA Available & No Padding)                 ▼ (PyTorch Fallback)
+         [Tier 1: Fused CUDA]                           Sequence Length L?
+         mamba_ssm.selective_scan                                │
+                 │                               ┌───────────────┼───────────────┐
+                 ▼ (CUDA + Padded Batch)         ▼ (L <= 4096)   ▼ (4096<L<=64K) ▼ (L > 64K)
+         [Tier 1b: Unpadded Fused]          [Tier 2: Parallel] [Tier 3: Blocked] [Tier 4: Sequential]
+         Per-row unpadded fused scan         Hillis-Steele     Vectorized Chunks  Checkpointed Recurrent
+```
+
+* **Tier 1 (Fused CUDA):** Direct C++/CUDA kernel via `mamba_ssm.ops.selective_scan_interface.selective_scan_fn`.
+* **Tier 1b (Unpadded Fused Scan):** Dispatches unpadded valid prefixes per batch row through the fused kernel, reconstructing output tensors via `torch.stack` to preserve autograd gradient graphs.
+* **Tier 2 (Parallel Associative Scan):** Hillis–Steele scan evaluating all prefix products in $\mathcal{O}(L \log L)$ work for sequences $L \le 4096$.
+* **Tier 3 (Blocked Scan):** Divides sequence into 256-token blocks, evaluates parallel scans within blocks, and propagates state sequentially across block boundaries.
+* **Tier 4 (Sequential Checkpointed Scan):** Evaluates an $\mathcal{O}(L)$ work sequential loop wrapped in `torch.utils.checkpoint.checkpoint` to maintain minimal activation memory over ultra-long sequences.
 
 ---
 
-## 14. Falsification Hooks
+## 7. Subsystem Deep-Dive: Attention & MoE Primitives (`model.layers`)
 
-Built-in ablation and test infrastructure (`research/research.md` §6):
+### 1. Sliding-Window Grouped-Query Attention (`SlidingWindowGQA`)
+* **Grouped-Query Projection:** Queries are projected into $H_q$ heads of dimension $d_k$; keys and values are projected into $H_{kv}$ heads and expanded via `repeat_interleave(H_q // H_{kv})`.
+* **Sliding Window Caching:** The KV cache stores strictly the trailing $w$ tokens. When sequence length exceeds $w$, key/value tensors and `attention_mask` are truncated in lockstep, guaranteeing exact mask-tensor alignment.
+* **Rotary Position Embeddings:** Uses `RotaryEmbedding` with fixed-capacity buffers up to `max_position_embeddings`, eliminating FSDP race conditions on buffer reallocations.
+* **Attention Sinks:** Supports keeping the initial $K$ tokens (`num_sink_tokens`) permanently cached alongside the sliding window $w-K$ (StreamingLLM).
 
-| Hook | API | Test |
-|------|-----|------|
-| Memory off (architectural) | `config.use_dual_memory = False` | Jamba-like baseline |
-| Memory zeroed at inference | `model.model.zero_memory_states(B, device, dtype)` | Test 1: rare-fact recall |
-| Param-matched SSM-only null | `build_test3_null_baseline_config(hybrid_cfg)` | Test 3: bigger state, no banks |
-| Write without read | `skip_memory_write=True` in forward/generate | Write-path ablation |
-| Gate monitoring | `output.gate_stats` in `HybridTrainingOutput` | Test 2: saturation check |
-
-`build_test3_null_baseline_config()` binary-searches `mamba_state_size` then `mamba_expand` to match parameter count within 2% tolerance.
-
----
-
-## 15. Numerical Stability and Correctness
-
-### 15.1 `MEMORY_NAN_FIX_ID`
-
-Current value: `all_masked_softmax+write_buffer_mask+masked_recon_gate-v2`
-
-Logged by `scripts/test_cloud_train.py` at startup so cloud runs can confirm the correct code revision. Bump this constant whenever memory-path NaN guards change.
-
-### 15.2 Known fixes (implementation history)
-
-| Issue | Fix |
-|-------|-----|
-| GQA mask/KV length mismatch past `window_size` | Truncate mask with KV |
-| All-padding rows → NaN softmax in memory attend | Zero-score fallback for all-masked rows |
-| RotaryEmbedding growing buffers under FSDP | Fixed-size cache; loud failure if exceeded |
-| Write-buffer padding reconstructed as valid | Per-token `mask_buf` with append |
-| Fused unpadded scan in-place buffer breaks autograd | Cat/pad/stack restore path preserves gradients |
-| Router FP16 matmul dtype mismatch without outer autocast | Logits promoted to FP32 after matmul at native dtype |
-
-### 15.3 Padding contract
-
-- Training and prefill expect **right-padded** `attention_mask` (valid tokens form a left prefix).
-- `_assert_right_padded_attention_mask()` validates this when `debug_state_checks=True`.
-- Mamba scan applies identity transition on pad positions so SSM state does not decay through padding.
+### 2. Mixture-of-Experts Subsystem (`MOERouter` & `DroplessMoELayer`)
+* **Router Stabilization:** Router logits are evaluated at native parameter precision, clamped to $[-30.0, 30.0]$, and promoted to FP32 for softmax computation:
+  $$p_t = \text{Softmax}\left(\text{clamp}(x_t W_g, -30, 30)\right)$$
+* **Switch Load Balancing & Z-Loss:** Full softmax probabilities across all $E$ experts are used to compute $\mathcal{L}_{\text{router\_aux}} = E \sum f_i p_i$, while $\mathcal{L}_{\text{router\_z}} = \frac{1}{N}\sum (\log \sum \exp(z_i))^2$ stabilizes logit growth.
+* **SwiGLU Experts:** 8 independent feed-forward experts computing $\text{SwiGLU}(x) = (\text{SiLU}(x W_{\text{gate}}) \odot x W_{\text{up}}) W_{\text{down}}$.
+* **Dispatch Backends:** Supports Grouped GEMM (`torch._grouped_mm`), Grouped Dispatch (sorting tokens by expert index), and Loop Dispatch.
 
 ---
 
-## 16. Performance and Backends
+## 8. Subsystem Deep-Dive: Multi-Task Objectives (`model.hybrid.losses`)
 
-### 16.1 Parameter overhead vs Jamba-like baseline
+The memory write path receives direct supervisory signals through eight dedicated auxiliary loss terms implemented in `model/hybrid/losses.py`:
 
-Extra parameters per hybrid layer (dual memory + combine layers): approximately **6d²**, comparable to the O(L²) cross-attention fusion module that was removed during design review. Net parameter increase is small relative to MoE FFN parameters.
+```
+┌────────────────────────────────────────────────────────────────────────────────────────┐
+│                                AUXILIARY LOSS CATALOG                                  │
+├───────────────────┬─────────────┬──────────────┬───────────────────────────────────────┤
+│ Loss Function     │ Weight λ    │ Schedule     │ Mathematical Target                   │
+├───────────────────┼─────────────┼──────────────┼───────────────────────────────────────┤
+│ L_recon           │ 0.08        │ Constant     │ ‖x - g_dec(s)‖² / (B·L·d)             │
+│ L_assoc           │ 1.2e-4      │ 0->1 over 5% │ (1/T) Σ clip(s_t,0,3σ) ‖v̂_t - v_t‖²  │
+│ L_gate            │ 1.0e-3      │ Constant     │ -mean(g·log(g+ε) + (1-g)·log(1-g+ε))  │
+│ L_read            │ 5.0e-3      │ Constant     │ max(0, r_min - r_combine)²            │
+│ L_fusion          │ 8.0e-3      │ Constant     │ ‖mean(g_fusion) - 0.5‖² / d           │
+│ L_expert          │ 2.0e-3      │ On at 10%    │ L_ortho + β · L_variance              │
+│ L_ssm             │ 1.0e-5      │ Constant     │ max(0, mean‖h_t‖² - γ_calibrated)     │
+│ L_slot            │ 3.0e-3      │ Constant     │ L_slot_intra + α · L_slot_cross       │
+└───────────────────┴─────────────┴──────────────┴───────────────────────────────────────┘
+```
 
-### 16.2 Production recommendations
-
-| Concern | Recommendation |
-|---------|----------------|
-| Mamba scan speed | Install `mamba-ssm` on CUDA training hosts |
-| Long-context training VRAM | `return_logits=False`, `stream_chunked_ce_loss=True` |
-| Decode latency | eager incremental decode (`MambaBlock.step()`); no CUDA-graph path |
-| MoE memory spikes | `capacity_factor=1.25` only on memory-constrained hardware |
-| Layer compile | `use_torch_compile=True` (disables gradient checkpointing) |
-
-### 16.3 Batched memory ops
-
-`batched_dual_memory_read` and `batched_dual_memory_write` stack projections across both banks into one batched attention pass — reduces kernel launch overhead vs two independent bank calls.
-
----
-
-## 17. Testing Infrastructure
-
-| Suite | Location | Coverage |
-|-------|----------|----------|
-| Unit tests | `tests/test_model.py` | 66 tests — forward/backward, chunked training, incremental vs full-forward parity, memory persistence, padding/NaN edges, fused Mamba parity, aux loss gradients, MoE dispatch, CUDA-graph decode, falsification hooks |
-| Toy train smoke | `tests/test_toy_train_smoke.py` | 10-step training loop, param budget |
-| Cloud smoke | `scripts/test_cloud_train.py` | ~200M param IMDB one-epoch run |
-
-**Caching correctness test:** incremental `generate()` vs full-forward last-logit cosine similarity — re-run before latency-sensitive deployment at larger scales.
+### Schedule Functions
+* **Associative Retrieval Warmup (`_aux_loss_schedule`):** Ramps $\mathcal{L}_{\text{assoc}}$ linearly from $0.0 \to 1.0$ across the first 5% of training steps, allowing memory slots to stabilize before enforcing retrieval error.
+* **Expert Specialization Warmup (`_expert_loss_schedule`):** Activates $\mathcal{L}_{\text{expert}}$ at step $0.10 \times \text{max\_steps}$, allowing standard router load-balancing to establish initial routing stability before enforcing expert orthogonality.
 
 ---
 
-## 18. Usage Guide
+## 9. Subsystem Deep-Dive: Full Model Stacking & Long-Context Execution (`model.hybrid.model`)
 
-### 18.1 Minimal forward pass
+### 1. `HybridModel` Architecture
+* Stacks $N$ `HybridDecoderLayer` modules with pre-layer RMS normalization.
+* **Shared RoPE Table:** A single non-persistent `RotaryEmbedding` instance is shared across all $N$ layers, eliminating redundant cos/sin table storage.
+* **SSM Calibration:** `calibrate_ssm_norm_thresholds()` executes a short forward pass at initialization to compute the 90th percentile state norm $\gamma_i$ per layer, stored as persistent buffers for $\mathcal{L}_{\text{ssm}}$.
+
+### 2. Chunked Long-Context Training (`_forward_chunked`)
+When $L > \text{memory\_chunk\_size}$ (default 512) and `use_dual_memory=True`, `HybridForCausalLM` automatically routes execution through `_forward_chunked()`:
+
+1. Splits sequence into chunks of length `memory_chunk_size`.
+2. Threads `memory_states` across chunks inside **one single autograd backward pass** (truncated BPTT).
+3. Evaluates streamed cross-entropy per chunk on valid label tokens (`_stream_chunk_ce_loss`), avoiding the materialization of a global $[B, L, V]$ logits tensor.
+4. Aggregates auxiliary losses and router metrics token-weighted across chunks.
+
+### 3. Autoregressive Generation Pipeline (`generate()`)
+1. **Chunked Prefill:** Prompt is evaluated in chunks of `memory_write_interval`, flushing memory writes at chunk boundaries.
+2. **Single-Token Decode Loop:** Decodes step-by-step with `MambaBlock.step()` and sliding KV cache updates.
+3. **Active Batch Masking:** Sequences that encounter `eos_token_id` are masked out, freezing their KV, Mamba, and memory states.
+4. **Buffer Flushing:** Any remaining branch outputs in `MemoryWriteBuffer` are flushed to memory banks at sequence completion.
+
+---
+
+## 10. Subsystem Deep-Dive: Core Utilities & Configuration (`model.core`)
+
+### 1. Configuration Dataclasses (`model/core/config.py`)
+* **`MixtralConfig`:** Base configuration defining vocabulary size, hidden dimension, layer count, GQA heads, sliding window size, MoE expert counts, RoPE base theta, and router loss weights.
+* **`HybridMambaMoEConfig`:** Inherits from `MixtralConfig` and adds Mamba SSM state dimension, conv kernel size, expansion factor, dual memory slot counts, chunking sizes, scan dispatch options, and all auxiliary loss coefficients.
+
+### 2. Precision & Optimization Builders (`model/core/`)
+* **`_promote_fp32` / `_restore_dtype` (`dtype.py`):** Explicit dtype conversion utilities ensuring numerical stability under AMP.
+* **`count_trainable_params` (`builders.py`):** Calculates total model parameters, supporting `exclude_training_aux=True` to exclude training-only decoders from inference parameter accounting.
+* **`build_test3_null_baseline_config` (`builders.py`):** Executes binary search over `mamba_state_size` and `mamba_expand` to construct an SSM-only control model matching the hybrid parameter budget within 2% tolerance.
+* **`split_muon_adam_params` (`optim.py`):** Classifies model parameters into 2D weight matrices (for Muon Newton–Schulz optimization) vs. 1D vectors, biases, and embeddings (for AdamW).
+
+---
+
+## 11. Numerical Stability, Padding Contracts & Defensive Engineering
+
+### 1. Revision Tag: `MEMORY_NAN_FIX_ID`
+Current constant: `all_masked_softmax+write_buffer_mask+masked_recon_gate-v2`  
+Logged at startup by training scripts to guarantee that cloud training nodes execute code containing all critical numerical stability patches.
+
+### 2. Critical Engineering Safeguards
+
+| Component | Potential Instability | Architectural Remedy |
+| :--- | :--- | :--- |
+| **Memory Cross-Attention** | All-padding rows yield $\text{Softmax}(-\infty) = \text{NaN}$. | Explicit finite guard zeroing attention weights when all keys are masked. |
+| **Memory Write Buffer** | Multi-step decode appends reconstruct prior padding as valid tokens. | Per-token `mask_buf` stored directly with buffered activations. |
+| **Router Softmax** | Large router dot products overflow FP16 exponentials. | Router logits clamped to $[-30.0, 30.0]$ prior to softmax. |
+| **GQA Window Truncation** | Mask shape mismatch during cached decode past window size $w$. | Truncates `attention_mask` in lockstep with key-value cache eviction. |
+| **Selective Scan autograd** | In-place tensor slicing breaks gradient tracking on padded rows. | Vectorized cat/pad/stack reconstruction path preserving autograd graphs. |
+| **SSM Padding Transition** | State decays exponentially through padding tokens. | Pad-token identity transition: $\bar{A}_{\text{pad}} = I, \bar{B}_{\text{pad}} = 0 \implies h_t = h_{t-1}$. |
+
+---
+
+## 12. Falsification & Ablation API Reference
+
+The package exposes programmatic hooks to execute the empirical falsification plan established in `research/research.md` §6:
+
+```python
+# 1. Structural Memory Ablation (Jamba-like control)
+config = HybridMambaMoEConfig(use_dual_memory=False)
+model_jamba = HybridForCausalLM(config)
+
+# 2. Test 1 Hook: Inference Memory Zeroing
+# Zeroes all memory banks while preserving module parameters
+zero_states = model.model.zero_memory_states(batch_size=2, device=device, dtype=dtype)
+out_ablated = model(input_ids=ids, memory_states=zero_states)
+
+# 3. Test 2 Hook: Write-Gate Telemetry Monitoring
+out = model(input_ids=ids, labels=labels)
+attn_gate_mean = out.gate_stats["layer_0_attn_write_gate_mean"].item()
+state_gate_mean = out.gate_stats["layer_0_state_write_gate_mean"].item()
+print(f"Layer 0 Write Gates: Attn={attn_gate_mean:.4f}, State={state_gate_mean:.4f}")
+
+# 4. Test 3 Hook: Parameter-Matched Null Baseline Generation
+hybrid_cfg = HybridMambaMoEConfig(hidden_size=512, num_layers=8, use_dual_memory=True)
+null_cfg = build_test3_null_baseline_config(hybrid_cfg, tolerance=0.02)
+assert null_cfg.use_dual_memory is False
+model_null = HybridForCausalLM(null_cfg)
+```
+
+---
+
+## 13. Developer Guide & Code Recipes
+
+### Recipe 1: Initializing and Training a Hybrid Model
 
 ```python
 import torch
 from model import HybridForCausalLM, HybridMambaMoEConfig
 
-cfg = HybridMambaMoEConfig(
-    vocab_size=3200,
-    hidden_size=256,
-    num_layers=2,
-    num_heads=4,
-    num_kv_heads=2,
+config = HybridMambaMoEConfig(
+    vocab_size=32000,
+    hidden_size=512,
+    num_layers=4,
+    num_heads=8,
+    num_kv_heads=4,
     head_dim=64,
-    intermediate_size=512,
-    window_size=16,
-    num_experts=4,
-    memory_size=16,
+    intermediate_size=1024,
+    window_size=512,
+    num_experts=8,
+    top_k=2,
+    mamba_state_size=16,
     use_dual_memory=True,
+    memory_size=48,
+    memory_chunk_size=256,
+    use_auxiliary_losses=True,
 )
 
-model = HybridForCausalLM(cfg).train()
-ids = torch.randint(0, cfg.vocab_size, (2, 128))
-labels = ids.roll(shifts=-1, dims=1)
+model = HybridForCausalLM(config).cuda().train()
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-out = model(input_ids=ids, labels=labels, training_step=0, max_training_steps=1000)
-out.loss.backward()
+input_ids = torch.randint(0, config.vocab_size, (2, 512), device="cuda")
+labels = input_ids.roll(shifts=-1, dims=1)
+
+optimizer.zero_grad()
+output = model(
+    input_ids=input_ids, labels=labels, training_step=0, max_training_steps=1000
+)
+output.loss.backward()
+optimizer.step()
+
+print(
+    f"Loss: {output.loss.item():.4f} | CE: {output.ce_loss.item():.4f} | Router Aux: {output.router_aux_loss.item():.4f}"
+)
 ```
 
-### 18.2 Baseline comparison
+### Recipe 2: Autoregressive Generation with Incremental Caching
 
 ```python
-from model import MixtralForCausalLM, MixtralConfig
+model.eval()
+prompt = torch.randint(0, config.vocab_size, (1, 64), device="cuda")
 
-cfg = MixtralConfig(hidden_size=256, num_layers=2, num_experts=4)
-baseline = MixtralForCausalLM(cfg)
-```
+with torch.no_grad():
+    generated_tokens = model.generate(
+        prompt,
+        max_new_tokens=128,
+        temperature=0.8,
+        top_k=50,
+        top_p=0.95,
+        do_sample=True,
+    )
 
-### 18.3 Param-matched null baseline (Test 3)
-
-```python
-from model import build_test3_null_baseline_config, HybridMambaMoEConfig
-
-hybrid_cfg = HybridMambaMoEConfig(hidden_size=512, num_layers=8)
-null_cfg = build_test3_null_baseline_config(hybrid_cfg, tolerance=0.02)
-# null_cfg.use_dual_memory == False, mamba_state_size expanded to match param count
-```
-
-### 18.4 Mamba backend diagnostics
-
-```python
-from model import log_mamba_backend, probe_mamba_scan_timing, HybridMambaMoEConfig
-
-cfg = HybridMambaMoEConfig()
-print(log_mamba_backend(cfg))
-print(probe_mamba_scan_timing(cfg))
-```
-
-### 18.5 Generation
-
-```python
-model = HybridForCausalLM(cfg).eval()
-prompt = torch.randint(0, cfg.vocab_size, (1, 32))
-generated = model.generate(prompt, max_new_tokens=50, do_sample=False)
+print(f"Generated sequence shape: {generated_tokens.shape}")
 ```
 
 ---
 
-## 19. Comparison to Prior Architectures
+## 14. Comprehensive Symbol Index
 
-| Feature | Transformer | Mamba | Jamba | Mixtral (baseline) | Hybrid (this) |
-|---------|-------------|-------|-------|-------------------|---------------|
-| Local attention | Full O(L²) | None | GQA | Sliding GQA | Sliding GQA |
-| SSM branch | No | Yes | Yes | No | Yes |
-| Explicit memory | No | No | No | No | Dual gated banks |
-| Sparse MoE | No | No | Yes | Yes | Yes |
-| Time complexity | O(L²) | O(L) | O(L) | O(L) | O(L) |
-| Long-range rare-fact recall | Window-limited | Recency bias | Recency bias | Window-limited | **Targeted — unproven** |
-
----
-
-## 20. Related Work
-
-- **Mamba** (Gu & Dao, 2023) — selective state spaces for linear-time modeling.
-- **Jamba** (Lieber et al., 2024) — hybrid Mamba-Transformer-MoE; closest architectural prior without explicit memory.
-- **Mixtral** (Jiang et al., 2024) — Top-2 sparse MoE; router losses reused here.
-- **Compressive Transformer** (Rae et al., ICLR 2020) — gated compressive memory; basis for `CompressiveMemoryBank` and L_recon.
-- **Titans** (Behrouz et al., NeurIPS 2025) — associative memory loss; basis for L_assoc surprise weighting.
-- **Perceiver / Perceiver IO** — linear attention via small latent set; same trick as O(L·m) memory read.
-
----
-
-## 21. Open Questions and Roadmap
-
-### 21.1 Central open question
-
-**Is explicit dual memory indispensable?** Mamba's hidden state is already a compressed summary of all prior tokens. The falsification tests in `research/research.md` §6 must pass before scaling:
-
-1. Rare-fact recall degrades when memory is zeroed at inference.
-2. Write gates show non-degenerate activity during training.
-3. Hybrid beats a parameter-matched larger-SSM null baseline on recall tasks.
-
-### 21.2 Engineering roadmap
-
-1. Run falsification tests at small scale (hooks are ready).
-2. Cloud smoke → short training runs via `scripts/test_cloud_train.py`.
-3. Build needle/rare-fact eval harness with fixed seeds.
-4. If memory is redundant: simplify to `use_dual_memory=False` and redirect effort.
-5. Benchmark wall-clock and memory vs Mixtral baseline at matched param count on progressively longer contexts.
-
-### 21.3 Tuning gaps
-
-Eight λ coefficients with warmup schedules — defaults are starting points from `loss-definitions.md`. No large-scale hyperparameter sweep has been completed.
+| Module | Exported Symbol | Type | Description |
+| :--- | :--- | :--- | :--- |
+| `model.core` | `MixtralConfig` | Dataclass | Baseline GQA + MoE model configuration. |
+| `model.core` | `HybridMambaMoEConfig` | Dataclass | Full hybrid architecture configuration. |
+| `model.core` | `MambaCache` | Type Alias | `tuple[Tensor, Tensor]` representing `(conv_state, ssm_state)`. |
+| `model.core` | `MEMORY_NAN_FIX_ID` | Constant | Revision string tracking numerical stability patches. |
+| `model.core` | `count_trainable_params` | Function | Computes total trainable parameter count. |
+| `model.core` | `build_test3_null_baseline_config` | Function | Binary search builder for parameter-matched SSM null baselines. |
+| `model.core` | `split_muon_adam_params` | Function | Partitions parameters for Muon + AdamW hybrid optimizers. |
+| `model.layers` | `RMSNorm` | Module | Root Mean Square layer normalization. |
+| `model.layers` | `RotaryEmbedding` | Module | Fixed-capacity Rotary Position Embedding table. |
+| `model.layers` | `SlidingWindowGQA` | Module | Grouped-query attention with sliding causal window. |
+| `model.layers` | `MOERouter` | Module | Top-$k$ gating router with load-balancing and z-loss. |
+| `model.layers` | `SwiGLUExpert` | Module | SwiGLU feed-forward network expert. |
+| `model.layers` | `DroplessMoELayer` | Module | Multi-expert dispatch with Grouped GEMM support. |
+| `model.layers` | `TokenGatedFusion` | Module | Linear-time elementwise branch fusion gating. |
+| `model.hybrid` | `CompressiveMemoryBank` | Module | Bounded-size gated read/write compressive memory. |
+| `model.hybrid` | `MemoryWriteBuffer` | Class | Fixed-capacity accumulator for chunk-aligned writes. |
+| `model.hybrid` | `MambaBlock` | Module | Selective state-space model with 4-tier scan dispatch. |
+| `model.hybrid` | `HybridDecoderLayer` | Module | Full hybrid layer composing memory, GQA, SSM, and MoE. |
+| `model.hybrid` | `HybridModel` | Module | Stacks hybrid layers with shared RoPE and SSM calibration. |
+| `model.hybrid` | `HybridForCausalLM` | Module | Top-level causal LM with chunked BPTT and loss computation. |
+| `model.hybrid` | `HybridTrainingOutput` | Dataclass | Encapsulates logits, losses, caches, and gate telemetry. |
+| `model.mixtral` | `MixtralForCausalLM` | Module | Baseline control causal LM for ablation experiments. |
 
 ---
 
-## Appendix A — Per-Layer Data Flow
-
-Step-by-step through `HybridDecoderLayer.forward()`:
-
-```
-1.  residual = x
-2.  x_norm = RMSNorm(x)
-3.  Apply padding mask to x_norm if attention_mask present
-
-4.  IF use_dual_memory:
-      a. Read attn_bank and state_bank via batched_dual_memory_read(x_norm)
-      b. attn_input = attn_memory_combine([x_norm; attn_read])
-      c. mamba_input = state_memory_combine([x_norm; state_read])
-    ELSE:
-      attn_input = mamba_input = x_norm
-
-5.  attn_out, kv_cache = SlidingWindowGQA(attn_input, ...)
-6.  mamba_out, mamba_cache, ssm_state = MambaBlock(mamba_input, ...)
-
-7.  IF use_dual_memory:
-      a. Append attn_out, mamba_out to MemoryWriteBuffer (with validity mask)
-      b. IF not skip_memory_write and buffer full/interval reached:
-           batched_dual_memory_write → update both banks
-           compute L_recon, L_assoc, L_gate, L_slot (if training + aux on)
-      c. ELSE: carry buffer forward
-
-8.  fused, fusion_gate = TokenGatedFusion(attn_out, mamba_out)
-9.  x = residual + fused
-
-10. moe_out, aux, z, expert_loss = MoE(RMSNorm(x))
-11. x_out = x + moe_out
-
-12. IF training + aux on:
-      L_read from combine layer weight norms
-      L_fusion from fusion_gate mean
-      L_ssm from ssm_state vs calibrated gamma
-      L_expert from MoE (if expert schedule active)
-
-13. Return x_out, aux, z, caches, gate_stats, buffer, layer_aux
-```
-
----
-
-## Appendix B — File Map
-
-| Path | Primary exports |
-|------|-----------------|
-| `model/__init__.py` | Full public API |
-| `model/core/config.py` | `MixtralConfig`, `HybridMambaMoEConfig` |
-| `model/core/builders.py` | `count_trainable_params`, `build_test3_null_baseline_config` |
-| `model/core/constants.py` | `MEMORY_NAN_FIX_ID` |
-| `model/layers/attention.py` | `SlidingWindowGQA` |
-| `model/layers/moe.py` | `MOERouter`, `DroplessMoELayer`, `SwiGLUExpert` |
-| `model/layers/fusion.py` | `TokenGatedFusion` |
-| `model/mixtral/model.py` | `MixtralForCausalLM` |
-| `model/hybrid/memory.py` | `CompressiveMemoryBank`, `MemoryWriteBuffer` |
-| `model/hybrid/mamba.py` | `MambaBlock` |
-| `model/hybrid/losses.py` | Auxiliary loss functions |
-| `model/hybrid/layer.py` | `HybridDecoderLayer` |
-| `model/hybrid/model.py` | `HybridForCausalLM`, `generate()` |
-
----
-
-## Appendix C — Glossary
-
-| Term | Definition |
-|------|------------|
-| **BPTT** | Backpropagation Through Time; here, truncated across `memory_chunk_size` chunks |
-| **GQA** | Grouped-Query Attention; fewer KV heads than Q heads |
-| **SSM** | State Space Model; recurrent hidden state updated per token |
-| **MoE** | Mixture of Experts; sparse routing to subset of FFN experts |
-| **m** | Memory bank slot count (`memory_size`, default 64) |
-| **w** | Attention sliding window size (`window_size`, default 4096) |
-| **n** | Mamba SSM state dimension (`mamba_state_size`, default 16) |
-| **d** | Hidden dimension (`hidden_size`) |
-| **L** | Sequence length |
-| **Dropless MoE** | No token dropped from expert dispatch (`capacity_factor=None`) |
-| **Write buffer** | Decode-time accumulator for chunk-aligned memory writes |
-| **Falsification test** | Experiment designed to disprove a hypothesis (§14) |
-
----
-
-*For the full research proposal, evaluation plan, and scientific motivation, see [`research/research.md`](../research/research.md). For loss formulas and hyperparameter tuning guidance, see [`research/loss-definitions.md`](../research/loss-definitions.md).*
+*For theoretical research framing, consult [`research/research.md`](../research/research.md). For formula-level loss derivations, consult [`research/loss-definitions.md`](../research/loss-definitions.md).*
