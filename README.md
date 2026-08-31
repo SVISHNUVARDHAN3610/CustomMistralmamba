@@ -626,7 +626,7 @@ If you utilize this architecture, codebase, or research methodology in your work
 ```bibtex
 @article{vardhan2026custommistralmamba,
   title   = {CustomMistralMamba: Sub-Quadratic Hybrid Mamba--MoE with Dual Compressive Memory for Long-Context Language Modeling},
-  author  = {Vardhan, Vishnu},
+  author  = {Senapathi Vishnu Vardhan},
   journal = {GitHub Reference Repository},
   year    = {2026},
   url     = {https://github.com/SVISHNUVARDHAN3610/CustomMistralmamba}
