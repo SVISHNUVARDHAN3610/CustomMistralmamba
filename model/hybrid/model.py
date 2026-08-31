@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 import warnings
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 import torch.nn.functional as F
@@ -33,6 +35,40 @@ from model.layers.norm import RMSNorm
 from model.layers.rope import RotaryEmbedding
 from model.layers.sampling import top_k_filter as _top_k_filter
 from model.layers.sampling import top_p_filter as _top_p_filter
+
+
+def _checkpoint_autocast_contexts(
+    device_type: str,
+) -> tuple[AbstractContextManager[None], AbstractContextManager[None]]:
+    """Make checkpoint forward/replay independent of AMP's weight cache.
+
+    Chunked training invokes the same decoder layer in sibling checkpoint
+    regions. With the autocast weight cache enabled, a later sibling can reuse
+    a cast parameter created by an earlier sibling, while its backward replay
+    starts from a cold cache. Non-reentrant checkpointing then observes a
+    different saved-tensor sequence and raises ``CheckpointError``.
+
+    Both contexts retain the active autocast dtype but disable only its weight
+    cache, so the original invocation and recomputation execute the same casts.
+    """
+    if not torch.is_autocast_enabled(device_type):
+        return nullcontext(), nullcontext()
+
+    dtype = torch.get_autocast_dtype(device_type)
+    return (
+        torch.autocast(
+            device_type=device_type,
+            dtype=dtype,
+            enabled=True,
+            cache_enabled=False,
+        ),
+        torch.autocast(
+            device_type=device_type,
+            dtype=dtype,
+            enabled=True,
+            cache_enabled=False,
+        ),
+    )
 
 
 @dataclass
@@ -289,6 +325,10 @@ class HybridModel(nn.Module):
                     layer_checkpointing_active,
                     decode_accumulate_only,
                     use_reentrant=False,
+                    context_fn=partial(
+                        _checkpoint_autocast_contexts,
+                        hidden_states.device.type,
+                    ),
                 )
             else:
                 (
@@ -451,8 +491,8 @@ class HybridForCausalLM(nn.Module):
         def _require_grads(_module: nn.Module, _inputs: tuple, output: Tensor) -> None:
             output.requires_grad_(True)
 
-        self._input_require_grads_hook = self.get_input_embeddings().register_forward_hook(
-            _require_grads
+        self._input_require_grads_hook = (
+            self.get_input_embeddings().register_forward_hook(_require_grads)
         )
 
     def disable_input_require_grads(self) -> None:

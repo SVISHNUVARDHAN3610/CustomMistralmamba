@@ -582,11 +582,12 @@ def configure_gradient_checkpointing(
         model.gradient_checkpointing_disable()
     logger.info(
         "gradient_checkpointing=%s use_reentrant=%s train_use_cache=%s "
-        "input_require_grads_hook=%s",
+        "input_require_grads_hook=%s autocast_weight_cache=%s",
         model.is_gradient_checkpointing,
         model.config.gradient_checkpointing_use_reentrant,
         model.config.use_cache,
         model._input_require_grads_hook is not None,
+        not model.is_gradient_checkpointing,
     )
 
 
@@ -608,9 +609,9 @@ def checkpoint_runtime_contract(
         "gradient_checkpointing_use_reentrant": False,
         # Always serialize the TRAINING preference. eval() intentionally flips
         # the live config to True, but a checkpointed training graph must not.
-        "use_cache": False if model.is_gradient_checkpointing else bool(
-            model.config.use_cache
-        ),
+        "use_cache": False
+        if model.is_gradient_checkpointing
+        else bool(model.config.use_cache),
         "distributed_strategy": distributed_strategy,
         "ddp_find_unused_parameters": ddp_find_unused,
         "ddp_static_graph": ddp_static_graph,
@@ -759,9 +760,7 @@ def _load_rng_state_dict(state: dict[str, Any] | None) -> bool:
         if isinstance(cuda_state, torch.Tensor):
             torch.cuda.set_rng_state(_as_torch_rng_state(cuda_state))
         else:
-            torch.cuda.set_rng_state_all(
-                [_as_torch_rng_state(s) for s in cuda_state]
-            )
+            torch.cuda.set_rng_state_all([_as_torch_rng_state(s) for s in cuda_state])
     return "torch" in state and "python" in state
 
 
@@ -1354,6 +1353,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     device_type=device.type,
                     dtype=amp_dtype,
                     enabled=use_amp,
+                    # Checkpoint replay must not depend on casts cached by a
+                    # sibling internal sequence chunk.
+                    cache_enabled=not args.gradient_checkpointing,
                 ):
                     outputs = model(
                         input_ids=input_ids,
@@ -1569,9 +1571,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     ce_smooth.update(metrics["ce_loss"])
                     window = max(metric_count, 1)
                     assert step_window_started is not None
-                    step_time_s = (
-                        time.perf_counter() - step_window_started
-                    ) / window
+                    step_time_s = (time.perf_counter() - step_window_started) / window
                     record: dict[str, Any] = {
                         "step": global_step,
                         "shard_idx": current_shard_idx,
@@ -1979,9 +1979,7 @@ def parse_args() -> argparse.Namespace:
     if args.step_watchdog_seconds < 0:
         parser.error("--step-watchdog-seconds must be >= 0")
     if args.compile and args.gradient_checkpointing:
-        parser.error(
-            "--compile and --gradient-checkpointing are mutually exclusive"
-        )
+        parser.error("--compile and --gradient-checkpointing are mutually exclusive")
     if not args.log_jsonl:
         args.log_jsonl = str(Path(args.run_dir) / "metrics.jsonl")
     return args

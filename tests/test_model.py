@@ -1526,6 +1526,47 @@ class TestHybridModel(unittest.TestCase):
         self.assertTrue(
             all(call.kwargs.get("use_reentrant") is False for call in layer_ckpts)
         )
+        self.assertTrue(all(call.kwargs.get("context_fn") for call in layer_ckpts))
+
+    def test_checkpointed_chunks_disable_autocast_weight_cache(self) -> None:
+        cfg = _small_hybrid_config(
+            vocab_size=512,
+            hidden_size=128,
+            head_dim=32,
+            intermediate_size=256,
+            memory_size=8,
+            memory_chunk_size=8,
+            return_logits=False,
+            use_fused_mamba_scan=False,
+        )
+        model = HybridForCausalLM(cfg).train()
+        model.gradient_checkpointing_enable()
+        cache_states: list[bool] = []
+
+        def _record_cache_state(_module, _args) -> None:
+            cache_states.append(torch.is_autocast_cache_enabled())
+
+        handles = [
+            layer.register_forward_pre_hook(_record_cache_state)
+            for layer in model.model.layers
+        ]
+        ids = torch.randint(0, cfg.vocab_size, (1, 16))
+        try:
+            with torch.autocast(
+                device_type="cpu",
+                dtype=torch.bfloat16,
+                cache_enabled=True,
+            ):
+                self.assertTrue(torch.is_autocast_cache_enabled())
+                out = model(input_ids=ids, labels=ids)
+            assert out.loss is not None
+            out.loss.backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertGreaterEqual(len(cache_states), cfg.num_layers * 2)
+        self.assertTrue(all(state is False for state in cache_states))
 
     def test_gradient_checkpointing_lifecycle_with_frozen_embeddings(self) -> None:
         cfg = _small_hybrid_config(memory_chunk_size=None)

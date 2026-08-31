@@ -1,9 +1,10 @@
 """Standalone gradient-checkpointing and resume-contract smoke check.
 
 Runs the repository's representative ~5M-parameter hybrid architecture with
-checkpointing off and on. CUDA runs assert an actual reduction in peak allocated
-activation memory; CPU runs report that memory assertion as SKIP while still
-checking gradients, finiteness, cache lifecycle, and checkpoint/resume state.
+checkpointing off and on. CUDA runs use AMP plus two internal sequence chunks
+and assert an actual reduction in peak allocated activation memory; CPU runs
+report that memory assertion as SKIP while still checking gradients, finiteness,
+cache lifecycle, and checkpoint/resume state.
 """
 
 from __future__ import annotations
@@ -41,13 +42,17 @@ class CaseResult:
     scheduler: torch.optim.lr_scheduler.LRScheduler
 
 
-def _configure_model(enabled: bool, device: torch.device) -> HybridForCausalLM:
+def _configure_model(
+    enabled: bool,
+    device: torch.device,
+    seq_len: int,
+) -> HybridForCausalLM:
     torch.manual_seed(1234)
     cfg = build_toy_config()
-    # Exercise whole-layer checkpointing without introducing a second chunked
-    # BPTT axis into this focused comparison.
-    cfg.memory_chunk_size = None
-    cfg.use_fused_mamba_scan = False
+    # Production reuses every decoder layer across multiple internal chunks.
+    # Keep that sibling-checkpoint pattern here because it is what exposes AMP
+    # weight-cache/recomputation mismatches on CUDA.
+    cfg.memory_chunk_size = max(1, seq_len // 2)
     model = HybridForCausalLM(cfg).to(device)
     model.get_input_embeddings().weight.requires_grad_(False)
     if enabled:
@@ -87,12 +92,26 @@ def _one_step(
     max_steps: int,
 ) -> tuple[float, float, bool]:
     optimizer.zero_grad(set_to_none=True)
-    out = model(
-        input_ids=ids,
-        labels=labels,
-        training_step=step,
-        max_training_steps=max_steps,
+    amp_enabled = ids.device.type == "cuda"
+    amp_dtype = (
+        torch.bfloat16
+        if not amp_enabled or torch.cuda.is_bf16_supported()
+        else torch.float16
     )
+    with torch.autocast(
+        device_type=ids.device.type,
+        dtype=amp_dtype,
+        enabled=amp_enabled,
+        # Deliberately leave the outer cache enabled: the model's checkpoint
+        # context must make sibling reuse safe by itself.
+        cache_enabled=True,
+    ):
+        out = model(
+            input_ids=ids,
+            labels=labels,
+            training_step=step,
+            max_training_steps=max_steps,
+        )
     assert out.loss is not None
     out.loss.backward()
 
@@ -119,7 +138,7 @@ def _run_case(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    model = _configure_model(enabled, device)
+    model = _configure_model(enabled, device, seq_len)
     parameter_count = count_trainable_params(model)
     if not 4_000_000 <= parameter_count <= 6_000_000:
         raise AssertionError(
@@ -241,7 +260,9 @@ def _check_resume_round_trip(result: CaseResult, device: torch.device) -> None:
         assert runtime["ddp_find_unused_parameters"] is None
         assert runtime["ddp_static_graph"] is None
 
-        resumed = _configure_model(True, device)
+        chunk_size = result.model.config.memory_chunk_size
+        assert chunk_size is not None
+        resumed = _configure_model(True, device, chunk_size * 2)
         resumed_optimizer = torch.optim.AdamW(
             [p for p in resumed.parameters() if p.requires_grad], lr=3e-4
         )
@@ -262,9 +283,7 @@ def _check_resume_round_trip(result: CaseResult, device: torch.device) -> None:
         assert (step, shard) == (len(result.losses) + 1, 7)
         assert len(resumed_optimizer.state) == len(result.optimizer.state)
         assert resumed_scheduler.last_epoch == result.scheduler.last_epoch
-        assert torch.equal(
-            resumed_dl_generator.get_state(), dl_generator.get_state()
-        )
+        assert torch.equal(resumed_dl_generator.get_state(), dl_generator.get_state())
         assert torch.equal(torch.get_rng_state(), payload["rng_state"]["torch"])
 
         stale_cache = copy.deepcopy(payload)
@@ -279,9 +298,7 @@ def _check_resume_round_trip(result: CaseResult, device: torch.device) -> None:
         assert resumed.config.use_cache is False
 
         bad_reentrant = copy.deepcopy(payload)
-        bad_reentrant["training_runtime"][
-            "gradient_checkpointing_use_reentrant"
-        ] = True
+        bad_reentrant["training_runtime"]["gradient_checkpointing_use_reentrant"] = True
         try:
             train.validate_resume_runtime_contract(
                 bad_reentrant,
@@ -376,10 +393,7 @@ def main() -> None:
     print(f"peak GPU memory off: {_format_mib(off_peak)}")
     print(f"peak GPU memory on : {_format_mib(on.peak_bytes)}")
     print(f"memory reduction   : {memory_status}")
-    print(
-        "frozen-input gradient: PASS "
-        f"(adjacent grad L1={on.adjacent_grad_l1:.6g})"
-    )
+    print(f"frozen-input gradient: PASS (adjacent grad L1={on.adjacent_grad_l1:.6g})")
     print("finite loss/gradients: PASS")
     print("use_cache train/eval lifecycle: PASS")
     print("stale saved use_cache=True repair: PASS")

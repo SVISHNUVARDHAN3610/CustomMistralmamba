@@ -1147,12 +1147,16 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     if accum > 1 and micro_idx == len(micro_inputs) - 1:
                         model.set_requires_gradient_sync(True, recurse=True)
                     watchdog.progress(
-                        global_step, f"forward_micro_{micro_idx + 1}/{len(micro_inputs)}"
+                        global_step,
+                        f"forward_micro_{micro_idx + 1}/{len(micro_inputs)}",
                     )
                     with torch.autocast(
                         device_type=device.type,
                         dtype=amp_dtype,
                         enabled=use_amp,
+                        # Keep sibling checkpoint regions and their independent
+                        # backward replays on the same parameter-cast path.
+                        cache_enabled=not args.gradient_checkpointing,
                     ):
                         outputs = model(
                             input_ids=m_ids,
@@ -1344,9 +1348,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     ce_smooth.update(metrics["ce_loss"])
                     window = max(metric_count, 1)
                     assert step_window_started is not None
-                    step_time_s = (
-                        time.perf_counter() - step_window_started
-                    ) / window
+                    step_time_s = (time.perf_counter() - step_window_started) / window
                     record: dict[str, Any] = {
                         "step": global_step,
                         "shard_idx": current_shard_idx,
