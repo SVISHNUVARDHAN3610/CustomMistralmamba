@@ -7,6 +7,7 @@ reviews/
 *.log
 Improvments/
 .claude/
+.codex/
 claude.md
 
 # Training artifacts (multi-GB binaries; never commit)

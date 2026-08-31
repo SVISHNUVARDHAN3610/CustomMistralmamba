@@ -380,6 +380,85 @@ class RollingAverage:
         return sum(self._values) / len(self._values)
 
 
+class StepProgressWatchdog:
+    """Warn from a daemon thread when a training phase stops making progress."""
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        timeout_seconds: float,
+        *,
+        rank: int | None = None,
+    ) -> None:
+        self.logger = logger
+        self.timeout_seconds = float(timeout_seconds)
+        self.rank = rank
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._active = False
+        self._step = -1
+        self._phase = "idle"
+        self._last_progress = time.monotonic()
+        self._last_warning = 0.0
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.timeout_seconds <= 0 or self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._monitor,
+            name="training-step-watchdog",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def progress(self, step: int, phase: str, *, active: bool = True) -> None:
+        with self._lock:
+            self._step = int(step)
+            self._phase = phase
+            self._active = active
+            self._last_progress = time.monotonic()
+            self._last_warning = 0.0
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def _monitor(self) -> None:
+        poll_seconds = max(0.25, min(5.0, self.timeout_seconds / 4.0))
+        while not self._stop.wait(poll_seconds):
+            now = time.monotonic()
+            with self._lock:
+                active = self._active
+                elapsed = now - self._last_progress
+                since_warning = now - self._last_warning
+                step = self._step
+                phase = self._phase
+                should_warn = (
+                    active
+                    and elapsed >= self.timeout_seconds
+                    and (
+                        self._last_warning == 0.0
+                        or since_warning >= self.timeout_seconds
+                    )
+                )
+                if should_warn:
+                    self._last_warning = now
+            if should_warn:
+                rank_text = "" if self.rank is None else f" rank={self.rank}"
+                self.logger.warning(
+                    "Training watchdog: no progress for %.1fs at step=%d "
+                    "phase=%s%s. Inspect the first stuck rank and NCCL logs; "
+                    "common resume causes are checkpointing-contract drift or "
+                    "incomplete optimizer/scheduler/RNG restoration.",
+                    elapsed,
+                    step,
+                    phase,
+                    rank_text,
+                )
+
+
 def _weighted_term_tensors(
     model: HybridForCausalLM, out: Any, step: int, max_steps: int
 ) -> dict[str, Any]:
@@ -489,6 +568,153 @@ def _non_finite_diagnosis(
 # ---------------------------------------------------------------------------
 
 
+def configure_gradient_checkpointing(
+    model: HybridForCausalLM,
+    enabled: bool,
+    logger: logging.Logger,
+) -> None:
+    """Apply the model-level checkpointing lifecycle used by both trainers."""
+    if enabled:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+    else:
+        model.gradient_checkpointing_disable()
+    logger.info(
+        "gradient_checkpointing=%s use_reentrant=%s train_use_cache=%s "
+        "input_require_grads_hook=%s",
+        model.is_gradient_checkpointing,
+        model.config.gradient_checkpointing_use_reentrant,
+        model.config.use_cache,
+        model._input_require_grads_hook is not None,
+    )
+
+
+def checkpoint_runtime_contract(
+    model: HybridForCausalLM,
+    *,
+    distributed_strategy: str,
+) -> dict[str, Any]:
+    """Persist autograd/distributed choices that can change collective graphs."""
+    ddp_find_unused: bool | None = None
+    ddp_static_graph: bool | None = None
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        distributed_strategy = "ddp"
+        ddp_find_unused = bool(model.find_unused_parameters)
+        ddp_static_graph = bool(model.static_graph)
+    return {
+        "version": 1,
+        "gradient_checkpointing": model.is_gradient_checkpointing,
+        "gradient_checkpointing_use_reentrant": False,
+        # Always serialize the TRAINING preference. eval() intentionally flips
+        # the live config to True, but a checkpointed training graph must not.
+        "use_cache": False if model.is_gradient_checkpointing else bool(
+            model.config.use_cache
+        ),
+        "distributed_strategy": distributed_strategy,
+        "ddp_find_unused_parameters": ddp_find_unused,
+        "ddp_static_graph": ddp_static_graph,
+    }
+
+
+def normalized_checkpoint_config(model: HybridForCausalLM) -> dict[str, Any]:
+    config = asdict(model.config)
+    if model.is_gradient_checkpointing:
+        config["use_cache"] = False
+        config["gradient_checkpointing_use_reentrant"] = False
+    return config
+
+
+def validate_resume_runtime_contract(
+    checkpoint: dict[str, Any],
+    model: HybridForCausalLM,
+    logger: logging.Logger,
+    *,
+    distributed_strategy: str,
+) -> None:
+    """Fail fast on graph-changing resume drift; repair stale use_cache."""
+    runtime = checkpoint.get("training_runtime")
+    saved_cfg = checkpoint.get("config")
+    if not isinstance(saved_cfg, dict):
+        saved_cfg = {}
+    if not isinstance(runtime, dict):
+        runtime = {}
+        logger.warning(
+            "Checkpoint predates training_runtime metadata; deriving gradient "
+            "checkpointing settings from its config."
+        )
+
+    saved_gc = bool(
+        runtime.get(
+            "gradient_checkpointing",
+            saved_cfg.get("gradient_checkpointing", False),
+        )
+    )
+    current_gc = model.is_gradient_checkpointing
+    if saved_gc != current_gc:
+        raise RuntimeError(
+            "Gradient-checkpointing mismatch on resume: checkpoint="
+            f"{saved_gc}, current={current_gc}. Resume with the matching "
+            "--gradient-checkpointing/--no-gradient-checkpointing flag."
+        )
+
+    saved_reentrant = runtime.get(
+        "gradient_checkpointing_use_reentrant",
+        saved_cfg.get("gradient_checkpointing_use_reentrant", False),
+    )
+    if saved_gc and saved_reentrant is not False:
+        raise RuntimeError(
+            "Checkpoint used reentrant gradient checkpointing, but this trainer "
+            "requires use_reentrant=False. Start a fresh run or migrate the "
+            "checkpoint with a verified non-reentrant continuation."
+        )
+    if model.config.gradient_checkpointing_use_reentrant:
+        raise RuntimeError("Current model unexpectedly requests use_reentrant=True.")
+
+    saved_use_cache = bool(
+        runtime.get("use_cache", saved_cfg.get("use_cache", not saved_gc))
+    )
+    if saved_gc and saved_use_cache:
+        logger.warning(
+            "Checkpoint recorded use_cache=True with gradient checkpointing; "
+            "correcting the training config to use_cache=False before resume."
+        )
+    model.config.use_cache = not (model.training and current_gc)
+
+    current = checkpoint_runtime_contract(
+        model, distributed_strategy=distributed_strategy
+    )
+    saved_strategy = runtime.get("distributed_strategy")
+    if saved_strategy == "ddp" or current["distributed_strategy"] == "ddp":
+        for key in ("ddp_find_unused_parameters", "ddp_static_graph"):
+            if runtime.get(key) != current[key]:
+                raise RuntimeError(
+                    f"DDP {key} mismatch on resume: checkpoint={runtime.get(key)!r}, "
+                    f"current={current[key]!r}. This changes reducer graph semantics "
+                    "and can deadlock NCCL."
+                )
+
+    logger.info(
+        "Resume runtime diagnostics PASS | gradient_checkpointing=%s "
+        "use_reentrant=False use_cache=%s strategy=%s "
+        "ddp_find_unused_parameters=%s ddp_static_graph=%s",
+        current_gc,
+        model.config.use_cache,
+        current["distributed_strategy"],
+        current["ddp_find_unused_parameters"],
+        current["ddp_static_graph"],
+    )
+
+
+def _require_resume_keys(checkpoint: dict[str, Any], keys: list[str]) -> None:
+    missing = [key for key in keys if key not in checkpoint]
+    if missing:
+        raise RuntimeError(
+            "Checkpoint is incomplete and cannot safely resume training; "
+            f"missing state: {missing}."
+        )
+
+
 def _rng_state_dict() -> dict[str, Any]:
     """RNG states serialized weights_only-safely (primitives + tensors only).
 
@@ -512,9 +738,16 @@ def _rng_state_dict() -> dict[str, Any]:
     return state
 
 
-def _load_rng_state_dict(state: dict[str, Any] | None) -> None:
+def _load_rng_state_dict(state: dict[str, Any] | None) -> bool:
     if not state:
-        return
+        return False
+    # A world-of-one FSDP2 checkpoint is fully interchangeable with the root
+    # trainer; unwrap its per-rank payload before applying the ordinary state.
+    if state.get("format") == "fsdp2_per_rank_v1":
+        ranks = state.get("ranks") or []
+        if len(ranks) != 1 or not isinstance(ranks[0], dict):
+            return False
+        state = ranks[0]
     if "python" in state:
         random.setstate(_as_python_rng_state(state["python"]))
     if "numpy" in state:
@@ -522,7 +755,14 @@ def _load_rng_state_dict(state: dict[str, Any] | None) -> None:
     if "torch" in state:
         torch.set_rng_state(_as_torch_rng_state(state["torch"]))
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all([_as_torch_rng_state(s) for s in state["cuda"]])
+        cuda_state = state["cuda"]
+        if isinstance(cuda_state, torch.Tensor):
+            torch.cuda.set_rng_state(_as_torch_rng_state(cuda_state))
+        else:
+            torch.cuda.set_rng_state_all(
+                [_as_torch_rng_state(s) for s in cuda_state]
+            )
+    return "torch" in state and "python" in state
 
 
 def _as_python_rng_state(value: Any) -> Any:
@@ -576,14 +816,18 @@ def save_checkpoint(
     # In Muon mode optimizers=[muon, adam]; AdamW-only mode stores its single
     # optimizer ONLY under the adam_* keys (previously the same state was
     # duplicated under muon_* too, making cross-mode resume fail opaquely).
+    config = normalized_checkpoint_config(model)
     payload: dict[str, Any] = {
         "model_state_dict": model.state_dict(),
-        "config": asdict(model.config),
+        "config": config,
         "global_step": global_step,
         "current_shard_idx": current_shard_idx,
         "rng_state": _rng_state_dict(),
         "memory_nan_fix_id": MEMORY_NAN_FIX_ID,
         "use_muon": use_muon,
+        "training_runtime": checkpoint_runtime_contract(
+            model, distributed_strategy="single_process"
+        ),
     }
     if validator is not None:
         payload["validator_state_dict"] = validator.state_dict
@@ -603,7 +847,7 @@ def save_checkpoint(
 
     config_path = checkpoint_dir / CONFIG_FILENAME
     with config_path.open("w", encoding="utf-8") as f:
-        json.dump(asdict(model.config), f, indent=2)
+        json.dump(config, f, indent=2)
 
     logger.info(
         "Checkpoint saved step=%d shard=%d path=%s",
@@ -642,6 +886,12 @@ def load_checkpoint(
             exc,
         )
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    validate_resume_runtime_contract(
+        checkpoint,
+        model,
+        logger,
+        distributed_strategy="single_process",
+    )
     model.load_state_dict(checkpoint["model_state_dict"])
 
     # Optimizer-mode consistency: a clear error beats an opaque param-group
@@ -657,6 +907,13 @@ def load_checkpoint(
             f"Start fresh or rerun with the matching --no-muon setting."
         )
 
+    required_state = ["adam_optimizer_state_dict", "adam_scheduler_state_dict"]
+    if ckpt_use_muon:
+        required_state.extend(
+            ["muon_optimizer_state_dict", "muon_scheduler_state_dict"]
+        )
+    _require_resume_keys(checkpoint, required_state)
+
     if ckpt_use_muon and "muon_optimizer_state_dict" in checkpoint:
         optimizers[0].load_state_dict(checkpoint["muon_optimizer_state_dict"])
         optimizers[-1].load_state_dict(checkpoint["adam_optimizer_state_dict"])
@@ -666,12 +923,59 @@ def load_checkpoint(
         optimizers[0].load_state_dict(checkpoint["adam_optimizer_state_dict"])
         schedulers[0].load_state_dict(checkpoint["adam_scheduler_state_dict"])
 
-    _load_rng_state_dict(checkpoint.get("rng_state"))
+    optimizer_state_counts = [len(opt.state) for opt in optimizers]
+    if ckpt_use_muon:
+        saved_optimizer_counts = [
+            len(checkpoint["muon_optimizer_state_dict"].get("state", {})),
+            len(checkpoint["adam_optimizer_state_dict"].get("state", {})),
+        ]
+        saved_scheduler_epochs = [
+            checkpoint["muon_scheduler_state_dict"].get("last_epoch"),
+            checkpoint["adam_scheduler_state_dict"].get("last_epoch"),
+        ]
+    else:
+        saved_optimizer_counts = [
+            len(checkpoint["adam_optimizer_state_dict"].get("state", {}))
+        ]
+        saved_scheduler_epochs = [
+            checkpoint["adam_scheduler_state_dict"].get("last_epoch")
+        ]
+    scheduler_epochs = [sched.last_epoch for sched in schedulers]
+    if optimizer_state_counts != saved_optimizer_counts:
+        raise RuntimeError(
+            "Optimizer state restore count mismatch: "
+            f"checkpoint={saved_optimizer_counts}, loaded={optimizer_state_counts}."
+        )
+    if scheduler_epochs != saved_scheduler_epochs:
+        raise RuntimeError(
+            "Scheduler state restore mismatch: "
+            f"checkpoint={saved_scheduler_epochs}, loaded={scheduler_epochs}."
+        )
+    rng_restored = _load_rng_state_dict(checkpoint.get("rng_state"))
+    if not rng_restored:
+        logger.warning(
+            "Resume RNG diagnostic FAIL: checkpoint RNG state is missing or "
+            "incompatible; stochastic replay will diverge."
+        )
 
     if dl_generator is not None:
         gen_state = checkpoint.get("dl_generator_state")
         if gen_state is not None:
             dl_generator.set_state(_as_torch_rng_state(gen_state))
+        else:
+            logger.warning(
+                "Resume DataLoader RNG diagnostic FAIL: dl_generator_state missing."
+            )
+
+    logger.info(
+        "Resume state diagnostics %s | optimizer_entries=%s "
+        "scheduler_last_epoch=%s rng_restored=%s dataloader_rng_restored=%s",
+        "PASS" if rng_restored else "WARN",
+        optimizer_state_counts,
+        scheduler_epochs,
+        rng_restored,
+        dl_generator is None or checkpoint.get("dl_generator_state") is not None,
+    )
 
     if validator is not None and "validator_state_dict" in checkpoint:
         validator.load_state_dict(checkpoint["validator_state_dict"])
@@ -738,6 +1042,7 @@ def _format_log_line(step: int, max_steps: int, record: dict[str, Any]) -> str:
         f"recon={record['recon']:.6f} assoc={record['assoc']:.6f}({assoc_tag}) "
         f"expert={record['expert']:.6f}({expert_tag}) "
         f"grad_norm={record['grad_norm']:.4f} "
+        f"step_time={record.get('step_time_s', float('nan')):.3f}s "
         f"muon_lr={record['muon_lr']:.2e} adam_lr={record['adam_lr']:.2e}"
     )
 
@@ -809,6 +1114,10 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     if args.compile:
         cfg.use_torch_compile = True
         cfg.torch_compile_mode = args.compile_mode
+    if args.compile and args.gradient_checkpointing:
+        raise ValueError(
+            "--compile and --gradient-checkpointing are mutually exclusive."
+        )
 
     logger.info(log_mamba_backend(cfg))
     logger.info(
@@ -821,6 +1130,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     )
 
     model = HybridForCausalLM(cfg).to(device)
+    configure_gradient_checkpointing(model, args.gradient_checkpointing, logger)
     n_params = count_trainable_params(model)
     logger.info("trainable_params=%s (%.3fB)", f"{n_params:,}", n_params / 1e9)
 
@@ -901,8 +1211,14 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         # param_group['lr'], and opt.step() precedes sched.step() — without
         # this sync the first post-resume step would run at constructor LR.
         for opt, sched in zip(optimizers, schedulers):
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * lr_lambda(max(sched.last_epoch, 0))
+            saved_lrs = sched.get_last_lr()
+            if len(saved_lrs) != len(opt.param_groups):
+                raise RuntimeError(
+                    "Scheduler/optimizer param-group mismatch after resume: "
+                    f"scheduler_lrs={len(saved_lrs)} groups={len(opt.param_groups)}."
+                )
+            for group, saved_lr in zip(opt.param_groups, saved_lrs):
+                group["lr"] = saved_lr
 
     stop_event = threading.Event()
     producer_thread: threading.Thread | None = None
@@ -917,9 +1233,12 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     metric_count = 0
     assoc_scale_sum = 0.0
     expert_scale_sum = 0.0
+    step_window_started: float | None = None
     metric_main_names: list[str] | None = None
     metric_gate_names: list[str] | None = None
     reset_mamba_scan_stats()
+    watchdog = StepProgressWatchdog(logger, args.step_watchdog_seconds)
+    watchdog.start()
 
     try:
         # NOTE: the trainer's *consume* cursor (`current_shard_idx`, restored
@@ -1006,6 +1325,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     shard_fully_consumed = False
                     break
 
+                if step_window_started is None:
+                    step_window_started = time.perf_counter()
+                watchdog.progress(global_step, "input_transfer")
                 input_ids = input_ids.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
                 # The min/max reductions force a device sync each; shards are
@@ -1027,6 +1349,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 for opt in optimizers:
                     opt.zero_grad(set_to_none=True)
 
+                watchdog.progress(global_step, "forward")
                 with torch.autocast(
                     device_type=device.type,
                     dtype=amp_dtype,
@@ -1047,11 +1370,13 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 # scalar (.item() / __bool__ / error_if_nonfinite=True) would
                 # force a stream-syncing D2H copy EVERY step. The cost is a
                 # wasted backward pass on an already-failed step.
+                watchdog.progress(global_step, "backward")
                 if use_fp16_scaler:
                     scaler.scale(outputs.loss).backward()
                 else:
                     outputs.loss.backward()
 
+                watchdog.progress(global_step, "optimizer")
                 # Unscale before clipping so max_grad_norm applies to true
                 # gradient magnitudes, not scaled ones.
                 if use_fp16_scaler:
@@ -1124,6 +1449,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         scaler.update()
                     for sched in schedulers:
                         sched.step()
+                watchdog.progress(global_step, "metrics")
                 # When strict skipped the update, the NaN grads are freed by
                 # the zero_grad(set_to_none=True) at the top of the next
                 # iteration — they never reach an optimizer or accumulate.
@@ -1242,6 +1568,10 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     metrics = dict(zip(metric_main_names, values[:n_main]))
                     ce_smooth.update(metrics["ce_loss"])
                     window = max(metric_count, 1)
+                    assert step_window_started is not None
+                    step_time_s = (
+                        time.perf_counter() - step_window_started
+                    ) / window
                     record: dict[str, Any] = {
                         "step": global_step,
                         "shard_idx": current_shard_idx,
@@ -1251,6 +1581,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         "ce_smooth": ce_smooth.mean,
                         "muon_lr": float(schedulers[0].get_last_lr()[0]),
                         "adam_lr": float(schedulers[-1].get_last_lr()[0]),
+                        "step_time_s": step_time_s,
                         "gate_stats": dict(zip(metric_gate_names, values[n_main:])),
                     }
                     bad_names = {
@@ -1295,6 +1626,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     metric_count = 0
                     assoc_scale_sum = 0.0
                     expert_scale_sum = 0.0
+                    step_window_started = None
 
                     # JSONL records and console lines are emitted per flush
                     # window (means over --log-interval steps), matching the
@@ -1304,6 +1636,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         and args.val_interval > 0
                         and global_step % args.val_interval == 0
                     ):
+                        watchdog.progress(global_step, "validation")
                         val_record = validator.evaluate(
                             model,
                             device=device,
@@ -1325,6 +1658,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                                 f.write(json.dumps(val_record) + "\n")
 
                         logger.info(_format_val_log_line(val_record))
+                        watchdog.progress(global_step, "metrics")
 
                     if jsonl_path is not None:
                         with jsonl_path.open("a", encoding="utf-8") as f:
@@ -1333,6 +1667,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     logger.info(_format_log_line(global_step, args.max_steps, record))
 
                 if global_step % args.save_interval == 0 and global_step > 0:
+                    watchdog.progress(global_step, "checkpoint_save")
                     save_checkpoint(
                         model=model,
                         optimizers=optimizers,
@@ -1349,6 +1684,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         },
                     )
                     producer.save_checkpoint(args.dataset_ckpt_path)
+                watchdog.progress(global_step, "complete", active=False)
 
                 # Convention: global_step counts iterations ENTERED, so the
                 # first completed update logs as step=0 ("updates completed
@@ -1371,6 +1707,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
             current_shard_idx += 1
 
         if global_step > 0 and global_step % args.save_interval != 0:
+            watchdog.progress(global_step, "final_checkpoint_save")
             save_checkpoint(
                 model=model,
                 optimizers=optimizers,
@@ -1398,6 +1735,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     except KeyboardInterrupt:
         logger.warning("KeyboardInterrupt — saving checkpoint before exit")
         if global_step > 0:
+            watchdog.progress(global_step, "interrupt_checkpoint_save")
             save_checkpoint(
                 model=model,
                 optimizers=optimizers,
@@ -1421,6 +1759,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         raise
 
     finally:
+        watchdog.close()
         stop_event.set()
         if producer_thread is not None:
             producer_thread.join(timeout=30.0)
@@ -1460,6 +1799,20 @@ def parse_args() -> argparse.Namespace:
         "--compile", action="store_true", help="torch.compile decoder layers."
     )
     parser.add_argument("--compile-mode", type=str, default="default")
+    checkpointing = parser.add_mutually_exclusive_group()
+    checkpointing.add_argument(
+        "--gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_true",
+        help="Checkpoint decoder layers with use_reentrant=False to reduce VRAM.",
+    )
+    checkpointing.add_argument(
+        "--no-gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_false",
+        help="Disable decoder-layer gradient checkpointing (default).",
+    )
+    parser.set_defaults(gradient_checkpointing=False)
 
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument(
@@ -1501,7 +1854,7 @@ def parse_args() -> argparse.Namespace:
         "--muon-momentum",
         type=float,
         default=0.95,
-        help="Muon momentum μ (paper / Keller default: 0.95).",
+        help="Muon momentum mu (paper / Keller default: 0.95).",
     )
     parser.add_argument(
         "--no-muon-nesterov",
@@ -1533,6 +1886,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--save-interval", type=int, default=1000)
+    parser.add_argument(
+        "--step-watchdog-seconds",
+        type=float,
+        default=300.0,
+        help="Warn when a forward/backward/optimizer/checkpoint phase makes no "
+        "progress for this many seconds; 0 disables the watchdog.",
+    )
     parser.add_argument(
         "--validate-token-interval",
         type=int,
@@ -1616,6 +1976,12 @@ def parse_args() -> argparse.Namespace:
         help="Salesforce/wikitext config name (e.g. wikitext-2-raw-v1, wikitext-103-raw-v1).",
     )
     args = parser.parse_args()
+    if args.step_watchdog_seconds < 0:
+        parser.error("--step-watchdog-seconds must be >= 0")
+    if args.compile and args.gradient_checkpointing:
+        parser.error(
+            "--compile and --gradient-checkpointing are mutually exclusive"
+        )
     if not args.log_jsonl:
         args.log_jsonl = str(Path(args.run_dir) / "metrics.jsonl")
     return args

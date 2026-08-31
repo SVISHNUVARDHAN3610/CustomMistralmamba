@@ -236,19 +236,31 @@ def _gather_rng_payload(rank: int, world_size: int) -> dict[str, Any]:
 
 def _restore_rng_payload(state: Any, rank: int, world: int) -> bool:
     """Restore THIS rank's RNG entry; False when the payload mismatches."""
-    if not isinstance(state, dict) or state.get("format") != "fsdp2_per_rank_v1":
+    if not isinstance(state, dict):
         return False
-    ranks = state.get("ranks") or []
-    if world == 1 and len(ranks) == 1 and isinstance(ranks[0], dict):
-        entry = ranks[0]
-    elif len(ranks) == world and isinstance(ranks[rank], dict):
-        entry = ranks[rank]
+    if state.get("format") == "fsdp2_per_rank_v1":
+        ranks = state.get("ranks") or []
+        if world == 1 and len(ranks) == 1 and isinstance(ranks[0], dict):
+            entry = ranks[0]
+        elif len(ranks) == world and isinstance(ranks[rank], dict):
+            entry = ranks[rank]
+        else:
+            return False
+    elif world == 1 and "python" in state and "torch" in state:
+        # Root-trainer checkpoint resumed by a world-of-one FSDP2 smoke run.
+        entry = state
     else:
         return False
     random.setstate(entry["python"])
     torch.set_rng_state(entry["torch"].to(dtype=torch.uint8))
     if "cuda" in entry and torch.cuda.is_available():
-        torch.cuda.set_rng_state(entry["cuda"].to(dtype=torch.uint8))
+        cuda_state = entry["cuda"]
+        if isinstance(cuda_state, torch.Tensor):
+            torch.cuda.set_rng_state(cuda_state.to(dtype=torch.uint8))
+        elif len(cuda_state) == 1:
+            torch.cuda.set_rng_state(cuda_state[0].to(dtype=torch.uint8))
+        else:
+            return False
     return True
 
 
@@ -297,11 +309,17 @@ def _reshard_optimizer_state(
         p = index_to_param[int(idx)]
         restored: dict[str, Any] = {}
         for key, value in entries.items():
-            if isinstance(value, torch.Tensor):
+            if isinstance(value, torch.Tensor) and tuple(value.shape) == tuple(p.shape):
                 value = value.to(device=device, dtype=p.dtype)
                 restored[key] = distribute_tensor(
                     value, p.device_mesh, list(p.placements)
                 )
+            elif isinstance(value, torch.Tensor):
+                # Optimizer counters such as AdamW's scalar ``step`` are
+                # replicated local state, not parameter-shaped DTensors. The
+                # previous code attempted to Shard(0) these scalars and could
+                # fail or stall every rank during resume.
+                restored[key] = value.to(device=device)
             else:
                 restored[key] = value
         state[int(idx)] = restored
@@ -328,16 +346,16 @@ def save_checkpoint_fsdp2(
     file atomically. At <=~200M params consolidation is sub-second; the
     sharded DCP format is the >1B-scale follow-up.
     """
-    from train import CHECKPOINT_FILENAME, CONFIG_FILENAME  # lazy: heavy module
+    import train as train_mod  # lazy: heavy module
 
     api = _require_fsdp2()
     rank = torch.distributed.get_rank()
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = checkpoint_dir / CHECKPOINT_FILENAME
+    ckpt_path = checkpoint_dir / train_mod.CHECKPOINT_FILENAME
     tmp_path = ckpt_path.with_suffix(".pth.tmp")
 
-    config = dataclasses.asdict(model.config)
+    config = train_mod.normalized_checkpoint_config(model)
     model_sd = api["get_model_state_dict"](
         model,
         options=api["StateDictOptions"](full_state_dict=True, cpu_offload=True),
@@ -353,6 +371,9 @@ def save_checkpoint_fsdp2(
         "rng_state": _gather_rng_payload(rank, torch.distributed.get_world_size()),
         "memory_nan_fix_id": MEMORY_NAN_FIX_ID,
         "use_muon": use_muon,
+        "training_runtime": train_mod.checkpoint_runtime_contract(
+            model, distributed_strategy="fsdp2"
+        ),
     }
     if validator is not None:
         # The cyclic cursor advances identically on every rank (replicated
@@ -378,7 +399,9 @@ def save_checkpoint_fsdp2(
     if rank == 0:
         torch.save(payload, tmp_path)
         os.replace(tmp_path, ckpt_path)
-        with (checkpoint_dir / CONFIG_FILENAME).open("w", encoding="utf-8") as f:
+        with (checkpoint_dir / train_mod.CONFIG_FILENAME).open(
+            "w", encoding="utf-8"
+        ) as f:
             json.dump(config, f, indent=2)
         logger.info(
             "Checkpoint saved step=%d shard=%d path=%s",
@@ -409,6 +432,8 @@ def load_checkpoint_fsdp2(
     public state-dict APIs. weights_only-first loading mirrors train.py;
     the fallback warning below carries the same pickle caveat.
     """
+    import train as train_mod
+
     api = _require_fsdp2()
     rank = torch.distributed.get_rank()
     world = torch.distributed.get_world_size()
@@ -428,6 +453,13 @@ def load_checkpoint_fsdp2(
         )
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
+    train_mod.validate_resume_runtime_contract(
+        checkpoint,
+        model,
+        logger,
+        distributed_strategy="fsdp2",
+    )
+
     api["set_model_state_dict"](
         model,
         checkpoint["model_state_dict"],
@@ -444,6 +476,13 @@ def load_checkpoint_fsdp2(
             f"uses use_muon={use_muon}; optimizer states are incompatible. "
             f"Start fresh or rerun with the matching --no-muon setting."
         )
+
+    required_state = ["adam_optimizer_state_dict", "adam_scheduler_state_dict"]
+    if ckpt_use_muon:
+        required_state.extend(
+            ["muon_optimizer_state_dict", "muon_scheduler_state_dict"]
+        )
+    train_mod._require_resume_keys(checkpoint, required_state)
 
     if ckpt_use_muon and "muon_optimizer_state_dict" in checkpoint:
         optimizers[0].load_state_dict(
@@ -475,7 +514,37 @@ def load_checkpoint_fsdp2(
         )
         schedulers[0].load_state_dict(checkpoint["adam_scheduler_state_dict"])
 
-    if not _restore_rng_payload(checkpoint.get("rng_state"), rank, world):
+    optimizer_state_counts = [len(opt.state) for opt in optimizers]
+    if ckpt_use_muon:
+        saved_optimizer_counts = [
+            len(checkpoint["muon_optimizer_state_dict"].get("state", {})),
+            len(checkpoint["adam_optimizer_state_dict"].get("state", {})),
+        ]
+        saved_scheduler_epochs = [
+            checkpoint["muon_scheduler_state_dict"].get("last_epoch"),
+            checkpoint["adam_scheduler_state_dict"].get("last_epoch"),
+        ]
+    else:
+        saved_optimizer_counts = [
+            len(checkpoint["adam_optimizer_state_dict"].get("state", {}))
+        ]
+        saved_scheduler_epochs = [
+            checkpoint["adam_scheduler_state_dict"].get("last_epoch")
+        ]
+    scheduler_epochs = [sched.last_epoch for sched in schedulers]
+    if optimizer_state_counts != saved_optimizer_counts:
+        raise RuntimeError(
+            "FSDP2 optimizer state restore count mismatch: "
+            f"checkpoint={saved_optimizer_counts}, loaded={optimizer_state_counts}."
+        )
+    if scheduler_epochs != saved_scheduler_epochs:
+        raise RuntimeError(
+            "FSDP2 scheduler state restore mismatch: "
+            f"checkpoint={saved_scheduler_epochs}, loaded={scheduler_epochs}."
+        )
+
+    rng_restored = _restore_rng_payload(checkpoint.get("rng_state"), rank, world)
+    if not rng_restored:
         saved_ws = (checkpoint.get("rng_state") or {}).get("world_size", "unknown")
         logger.warning(
             "RNG state missing or saved under a different layout/world size "
@@ -488,6 +557,21 @@ def load_checkpoint_fsdp2(
         gen_state = checkpoint.get("dl_generator_state")
         if gen_state is not None:
             dl_generator.set_state(gen_state.to(dtype=torch.uint8))
+        else:
+            logger.warning(
+                "Resume DataLoader RNG diagnostic FAIL: dl_generator_state missing."
+            )
+
+    logger.info(
+        "Resume state diagnostics %s | rank=%d optimizer_entries=%s "
+        "scheduler_last_epoch=%s rng_restored=%s dataloader_rng_restored=%s",
+        "PASS" if rng_restored else "WARN",
+        rank,
+        optimizer_state_counts,
+        scheduler_epochs,
+        rng_restored,
+        dl_generator is None or checkpoint.get("dl_generator_state") is not None,
+    )
 
     if validator is not None and "validator_state_dict" in checkpoint:
         validator.load_state_dict(checkpoint["validator_state_dict"])
@@ -723,6 +807,35 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     )
 
     model = train_mod.HybridForCausalLM(cfg).to(device)
+    train_mod.configure_gradient_checkpointing(
+        model, args.gradient_checkpointing, logger
+    )
+    # All ranks must construct the same autograd graph. Catch launcher/CLI
+    # drift before fully_shard collectives turn it into an opaque NCCL hang.
+    local_gc_contract = torch.tensor(
+        [
+            int(model.is_gradient_checkpointing),
+            int(model.config.gradient_checkpointing_use_reentrant),
+            int(model.config.use_cache),
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    contract_min = local_gc_contract.clone()
+    contract_max = local_gc_contract.clone()
+    if world_size > 1:
+        torch.distributed.all_reduce(contract_min, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(contract_max, op=torch.distributed.ReduceOp.MAX)
+    if not torch.equal(contract_min, contract_max):
+        raise RuntimeError(
+            "Gradient-checkpointing/use_cache settings differ across ranks; "
+            "refusing to enter FSDP2 training because collective graphs can deadlock."
+        )
+    logger.info(
+        "Distributed checkpointing diagnostics PASS | strategy=fsdp2 (not DDP; "
+        "find_unused_parameters/static_graph=N/A) rank_contract=%s",
+        local_gc_contract.tolist(),
+    )
     # Calibration AFTER process-group init (its rank0 broadcast engages) and
     # BEFORE fully_shard (plain params/buffers, no DTensor plumbing yet). It
     # lives on the inner HybridModel, not the HybridForCausalLM wrapper.
@@ -828,8 +941,14 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         # param_group['lr'], and opt.step() precedes sched.step() — without
         # this sync the first post-resume step runs at constructor LR.
         for opt, sched in zip(optimizers, schedulers):
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * lr_lambda(max(sched.last_epoch, 0))
+            saved_lrs = sched.get_last_lr()
+            if len(saved_lrs) != len(opt.param_groups):
+                raise RuntimeError(
+                    "Scheduler/optimizer param-group mismatch after resume: "
+                    f"scheduler_lrs={len(saved_lrs)} groups={len(opt.param_groups)}."
+                )
+            for group, saved_lr in zip(opt.param_groups, saved_lrs):
+                group["lr"] = saved_lr
 
     stop_event = threading.Event()
     producer_thread: threading.Thread | None = None
@@ -845,6 +964,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     # — identical on every rank, so host-side averaging needs no reduction.
     assoc_scale_sum = 0.0
     expert_scale_sum = 0.0
+    step_window_started: float | None = None
     metric_main_names: list[str] | None = None
     metric_gate_names: list[str] | None = None
 
@@ -857,7 +977,13 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
             args.batch_size * world_size * accum,
         )
 
+    watchdog = train_mod.StepProgressWatchdog(
+        logger, args.step_watchdog_seconds, rank=rank
+    )
+    watchdog.start()
+
     def _save_checkpoint() -> None:
+        watchdog.progress(global_step, "checkpoint_save")
         save_checkpoint_fsdp2(
             model=model,
             optimizers=optimizers,
@@ -1008,6 +1134,8 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
                 for opt in optimizers:
                     opt.zero_grad(set_to_none=True)
+                if step_window_started is None:
+                    step_window_started = time.perf_counter()
 
                 # Micro-steps run with gradient sync OFF; the last micro-step
                 # re-enables it so the WHOLE accumulated gradient is
@@ -1018,6 +1146,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 for micro_idx, (m_ids, m_labels) in enumerate(micro_inputs):
                     if accum > 1 and micro_idx == len(micro_inputs) - 1:
                         model.set_requires_gradient_sync(True, recurse=True)
+                    watchdog.progress(
+                        global_step, f"forward_micro_{micro_idx + 1}/{len(micro_inputs)}"
+                    )
                     with torch.autocast(
                         device_type=device.type,
                         dtype=amp_dtype,
@@ -1032,6 +1163,10 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     assert outputs.loss is not None
                     # Mean-of-means: equal-size micro-batches (drop_last), so
                     # dividing by count averages correctly.
+                    watchdog.progress(
+                        global_step,
+                        f"backward_micro_{micro_idx + 1}/{len(micro_inputs)}",
+                    )
                     (outputs.loss / len(micro_inputs)).backward()
                     if micro_idx == len(micro_inputs) - 1:
                         loss_for_metrics = outputs.loss.detach()
@@ -1039,6 +1174,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 assert loss_for_metrics is not None
                 outputs.loss = loss_for_metrics
 
+                watchdog.progress(global_step, "optimizer_and_collectives")
                 # Params are fp32 masters (see the mp_policy note above), so
                 # gradients arrive fp32 and clip sees TRUE magnitudes — no
                 # scaler unscale step exists on this bf16-autocast path.
@@ -1093,6 +1229,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         opt.step()
                     for sched in schedulers:
                         sched.step()
+                watchdog.progress(global_step, "metrics_and_collectives")
                 # When strict skipped, the NaN grads die via zero_grad(
                 # set_to_none=True) at the top of the next iteration.
 
@@ -1206,6 +1343,10 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     metrics = dict(zip(metric_main_names, values[:n_main]))
                     ce_smooth.update(metrics["ce_loss"])
                     window = max(metric_count, 1)
+                    assert step_window_started is not None
+                    step_time_s = (
+                        time.perf_counter() - step_window_started
+                    ) / window
                     record: dict[str, Any] = {
                         "step": global_step,
                         "shard_idx": current_shard_idx,
@@ -1215,6 +1356,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         "ce_smooth": ce_smooth.mean,
                         "muon_lr": float(schedulers[0].get_last_lr()[0]),
                         "adam_lr": float(schedulers[-1].get_last_lr()[0]),
+                        "step_time_s": step_time_s,
                         "gate_stats": dict(zip(metric_gate_names, values[n_main:])),
                     }
                     bad_names = {
@@ -1255,12 +1397,14 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     metric_count = 0
                     assoc_scale_sum = 0.0
                     expert_scale_sum = 0.0
+                    step_window_started = None
 
                     if (
                         validator is not None
                         and args.val_interval > 0
                         and global_step % args.val_interval == 0
                     ):
+                        watchdog.progress(global_step, "validation_collectives")
                         # Every rank evaluates the SAME replicated buffers +
                         # sharded params on the SAME cyclic rows; average the
                         # four totals for one canonical number.
@@ -1301,6 +1445,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         _write_jsonl(val_record)
                         if is_rank0:
                             logger.info(train_mod._format_val_log_line(val_record))
+                        watchdog.progress(global_step, "metrics_and_collectives")
 
                     _write_jsonl(record)
                     if is_rank0:
@@ -1312,6 +1457,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
                 if global_step % args.save_interval == 0 and global_step > 0:
                     _save_checkpoint()
+                watchdog.progress(global_step, "complete", active=False)
 
                 # Convention: global_step counts iterations ENTERED, so the
                 # first completed update logs as step=0 — identical to
@@ -1348,6 +1494,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         raise
 
     finally:
+        watchdog.close()
         stop_event.set()
         if producer_thread is not None:
             producer_thread.join(timeout=30.0)
@@ -1411,6 +1558,20 @@ def parse_args() -> argparse.Namespace:
         "runtime (torch.compile x FSDP2 wrap-order pitfalls).",
     )
     parser.add_argument("--compile-mode", type=str, default="default")
+    checkpointing = parser.add_mutually_exclusive_group()
+    checkpointing.add_argument(
+        "--gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_true",
+        help="Checkpoint decoder layers with use_reentrant=False to reduce VRAM.",
+    )
+    checkpointing.add_argument(
+        "--no-gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_false",
+        help="Disable decoder-layer gradient checkpointing (default).",
+    )
+    parser.set_defaults(gradient_checkpointing=False)
 
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument(
@@ -1492,6 +1653,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--save-interval", type=int, default=1000)
     parser.add_argument(
+        "--step-watchdog-seconds",
+        type=float,
+        default=300.0,
+        help="Warn per rank when a forward/backward/collective/checkpoint phase "
+        "makes no progress for this many seconds; 0 disables the watchdog.",
+    )
+    parser.add_argument(
         "--validate-token-interval",
         type=int,
         default=256,
@@ -1572,6 +1740,8 @@ def parse_args() -> argparse.Namespace:
         "process group, no dataset imports).",
     )
     args = parser.parse_args()
+    if args.step_watchdog_seconds < 0:
+        parser.error("--step-watchdog-seconds must be >= 0")
     if not args.log_jsonl:
         args.log_jsonl = str(Path(args.run_dir) / "metrics.jsonl")
     return args

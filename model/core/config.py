@@ -64,6 +64,12 @@ class MixtralConfig:
     # If True, lm_head.weight shares storage with embed_tokens.weight.
     tie_word_embeddings: bool = False
 
+    # Runtime cache preference. Training forwards in this repository pass
+    # ``use_cache`` explicitly, but persisting this bit makes the intended
+    # train/eval lifecycle unambiguous in checkpoints. Gradient checkpointing
+    # forces it off while training and restores it for eval/generation.
+    use_cache: bool = True
+
     def to_dict(self) -> dict[str, Any]:
         """Serializes configuration parameters to a dictionary layout."""
         return asdict(self)
@@ -116,6 +122,10 @@ class HybridMambaMoEConfig(MixtralConfig):
     blocked_scan_min_len: int = 4096
     sequential_scan_min_len: int = 65536
     gradient_checkpointing: bool = False
+    # This implementation deliberately supports only non-reentrant checkpointing.
+    # Persist the choice so resume can reject incompatible historical runs
+    # instead of hanging in a differently constructed autograd/collective graph.
+    gradient_checkpointing_use_reentrant: bool = False
     mamba_internal_checkpoint: bool = True
     debug_state_checks: bool = False
     use_grouped_moe_dispatch: bool = True

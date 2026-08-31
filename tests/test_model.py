@@ -1523,6 +1523,42 @@ class TestHybridModel(unittest.TestCase):
         ]
         self.assertEqual(len(layer_ckpts), cfg.num_layers)
         self.assertEqual(len(scan_ckpts), 0)
+        self.assertTrue(
+            all(call.kwargs.get("use_reentrant") is False for call in layer_ckpts)
+        )
+
+    def test_gradient_checkpointing_lifecycle_with_frozen_embeddings(self) -> None:
+        cfg = _small_hybrid_config(memory_chunk_size=None)
+        model = HybridForCausalLM(cfg)
+        model.get_input_embeddings().weight.requires_grad_(False)
+
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        model.train()
+        self.assertTrue(model.is_gradient_checkpointing)
+        self.assertFalse(model.config.gradient_checkpointing_use_reentrant)
+        self.assertFalse(model.config.use_cache)
+        ids = torch.randint(0, cfg.vocab_size, (1, 12))
+        embedding_output = model.get_input_embeddings()(ids)
+        self.assertTrue(embedding_output.requires_grad)
+
+        labels = torch.randint(0, cfg.vocab_size, (1, 12))
+        out = model(input_ids=ids, labels=labels)
+        assert out.loss is not None
+        out.loss.backward()
+        adjacent_grad = model.model.layers[0].attention_block.q_proj.weight.grad
+        self.assertIsNotNone(adjacent_grad)
+        assert adjacent_grad is not None
+        self.assertGreater(adjacent_grad.abs().sum().item(), 0.0)
+
+        model.eval()
+        self.assertTrue(model.config.use_cache)
+        model.train()
+        self.assertFalse(model.config.use_cache)
+        model.gradient_checkpointing_disable()
+        self.assertFalse(model.is_gradient_checkpointing)
+        self.assertTrue(model.config.use_cache)
 
     def test_torch_compile_forward_parity(self) -> None:
         if not hasattr(torch, "compile"):

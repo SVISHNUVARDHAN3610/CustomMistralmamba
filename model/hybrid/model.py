@@ -70,12 +70,10 @@ class HybridModel(nn.Module):
             layers.append(layer)
         if config.use_torch_compile:
             if config.gradient_checkpointing:
-                warnings.warn(
+                raise ValueError(
                     "use_torch_compile and gradient_checkpointing are mutually "
-                    "exclusive; disabling gradient_checkpointing for compile.",
-                    stacklevel=2,
+                    "exclusive."
                 )
-                config.gradient_checkpointing = False
             compile_backend = "inductor" if torch.cuda.is_available() else "aot_eager"
             layers = [
                 torch.compile(
@@ -402,6 +400,12 @@ class HybridForCausalLM(nn.Module):
     def __init__(self, config: HybridMambaMoEConfig) -> None:
         super().__init__()
         self.config = config
+        self._input_require_grads_hook: torch.utils.hooks.RemovableHandle | None = None
+        if config.gradient_checkpointing_use_reentrant:
+            raise ValueError(
+                "HybridForCausalLM supports only non-reentrant gradient "
+                "checkpointing; set gradient_checkpointing_use_reentrant=False."
+            )
         if config.use_dual_memory and not config.use_auxiliary_losses:
             msg = (
                 "use_dual_memory=True with use_auxiliary_losses=False leaves memory "
@@ -421,6 +425,73 @@ class HybridForCausalLM(nn.Module):
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        if config.gradient_checkpointing:
+            self.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        return bool(self.config.gradient_checkpointing)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
+
+    def enable_input_require_grads(self) -> None:
+        """Require gradients on embedding *outputs* without unfreezing weights.
+
+        This mirrors the Hugging Face checkpointing contract: if input embedding
+        weights are frozen, the first checkpointed layer still receives an input
+        participating in autograd. The hook is harmless when embeddings are
+        already trainable and is installed at most once.
+        """
+        if self._input_require_grads_hook is not None:
+            return
+
+        def _require_grads(_module: nn.Module, _inputs: tuple, output: Tensor) -> None:
+            output.requires_grad_(True)
+
+        self._input_require_grads_hook = self.get_input_embeddings().register_forward_hook(
+            _require_grads
+        )
+
+    def disable_input_require_grads(self) -> None:
+        if self._input_require_grads_hook is not None:
+            self._input_require_grads_hook.remove()
+            self._input_require_grads_hook = None
+
+    def gradient_checkpointing_enable(
+        self,
+        gradient_checkpointing_kwargs: dict[str, object] | None = None,
+    ) -> None:
+        """Enable layer recomputation with the required non-reentrant engine."""
+        kwargs = gradient_checkpointing_kwargs or {"use_reentrant": False}
+        if kwargs.get("use_reentrant", False) is not False:
+            raise ValueError(
+                "Only use_reentrant=False is supported for gradient checkpointing."
+            )
+        if self.config.use_torch_compile:
+            raise ValueError(
+                "torch.compile and gradient checkpointing are mutually exclusive."
+            )
+        self.config.gradient_checkpointing = True
+        self.config.gradient_checkpointing_use_reentrant = False
+        self.config.use_cache = False
+        self.enable_input_require_grads()
+
+    def gradient_checkpointing_disable(self) -> None:
+        self.config.gradient_checkpointing = False
+        self.config.gradient_checkpointing_use_reentrant = False
+        self.config.use_cache = True
+        self.disable_input_require_grads()
+
+    def train(self, mode: bool = True) -> HybridForCausalLM:
+        super().train(mode)
+        # Cache materialization and layer recomputation are incompatible during
+        # training. Eval/generation explicitly re-enable the config preference;
+        # forward still accepts an explicit use_cache argument as before.
+        self.config.use_cache = not (mode and self.is_gradient_checkpointing)
+        return self
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -594,6 +665,11 @@ class HybridForCausalLM(nn.Module):
         max_training_steps: int | None = None,
         decode_accumulate_only: bool = False,
     ) -> HybridTrainingOutput:
+        if self.training and self.is_gradient_checkpointing and use_cache:
+            raise ValueError(
+                "use_cache=True is incompatible with gradient-checkpointed "
+                "training. Call eval() for cached inference or omit use_cache."
+            )
         seq_len = input_ids.size(1)
         if self._should_chunk_training(seq_len, use_cache, memory_states):
             return self._forward_chunked(
