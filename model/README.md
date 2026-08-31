@@ -443,11 +443,15 @@ input_ids = torch.randint(0, config.vocab_size, (2, 512), device="cuda")
 labels = input_ids.roll(shifts=-1, dims=1)
 
 optimizer.zero_grad()
-output = model(input_ids=input_ids, labels=labels, training_step=0, max_training_steps=1000)
+output = model(
+    input_ids=input_ids, labels=labels, training_step=0, max_training_steps=1000
+)
 output.loss.backward()
 optimizer.step()
 
-print(f"Loss: {output.loss.item():.4f} | CE: {output.ce_loss.item():.4f} | Router Aux: {output.router_aux_loss.item():.4f}")
+print(
+    f"Loss: {output.loss.item():.4f} | CE: {output.ce_loss.item():.4f} | Router Aux: {output.router_aux_loss.item():.4f}"
+)
 ```
 
 ### Recipe 2: Autoregressive Generation with Incremental Caching

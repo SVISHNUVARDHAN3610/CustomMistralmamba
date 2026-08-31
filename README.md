@@ -554,7 +554,9 @@ model = HybridForCausalLM(config).train()
 input_ids = torch.randint(0, config.vocab_size, (2, 512))
 labels = input_ids.roll(shifts=-1, dims=1)
 
-output = model(input_ids=input_ids, labels=labels, training_step=0, max_training_steps=1000)
+output = model(
+    input_ids=input_ids, labels=labels, training_step=0, max_training_steps=1000
+)
 print(f"Total Loss: {output.loss.item():.4f} | CE Loss: {output.ce_loss.item():.4f}")
 
 # 4. Backward pass
