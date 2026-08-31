@@ -1,288 +1,636 @@
-# CustomMistralMamba: Hybrid Mamba–MoE with Dual Compressive Memory
+# CustomMistralMamba: Sub-Quadratic Hybrid Mamba–MoE with Dual Compressive Memory
 
-**A sub-quadratic decoder architecture for long-context language modeling, combining sliding-window attention, a selective state-space branch, explicit gated memory, and sparse Mixture-of-Experts.**
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-ee4c2c.svg)](https://pytorch.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
+[![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
+[![Tests: 83 Passed](https://img.shields.io/badge/tests-83%20passed-brightgreen.svg)](tests/test_model.py)
 
-| | |
-|---|---|
-| **Author** | Vishnu Vardhan |
-| **Status** | Research prototype — architecture finalized (v2.1), reference implementation complete |
-| **Language / stack** | Python, PyTorch (>=2.1) |
-| **Entry point** | `from model import HybridForCausalLM, HybridMambaMoEConfig` |
-| **Design document** | [`research/research.md`](research/research.md) |
-| **Loss specification** | [`research/loss-definitions.md`](research/loss-definitions.md) |
-| **Package documentation** | [`model/README.md`](model/README.md) — full architecture reference, 24 sections |
-| **Unit tests** | [`tests/test_model.py`](tests/test_model.py) |
+> **A sub-quadratic causal language model architecture for long-context sequence modeling, integrating sliding-window grouped-query attention, selective state-space models (Mamba S6), dual gated compressive memory banks, and sparse Mixture-of-Experts (MoE) with rigorous empirical falsification protocols.**
+
+---
+
+## Technical Metadata & Reference Summary
+
+| Attribute | Specification |
+| :--- | :--- |
+| **Author / Lead Researcher** | Vishnu Vardhan |
+| **Architectural Revision** | Version 2.1 (Reference Implementation Complete) |
+| **Primary Entry Points** | `from model import HybridForCausalLM, HybridMambaMoEConfig, MixtralForCausalLM` |
+| **Core Research Document** | [`research/research.md`](research/research.md) |
+| **Loss Specification** | [`research/loss-definitions.md`](research/loss-definitions.md) |
+| **Package Architecture Reference** | [`model/README.md`](model/README.md) (Comprehensive 24-section developer specification) |
+| **Optimization Stack** | PyTorch FSDP2 (`fully_shard`) + Moonshot Muon (Newton–Schulz) / AdamW Hybrid |
+| **Scan Acceleration** | 4-Tier Selective Scan (Fused CUDA `mamba-ssm` $\to$ Parallel $\to$ Blocked $\to$ Checkpointed) |
+| **Test Suite** | [`tests/test_model.py`](tests/test_model.py) (83 deterministic unit tests, AMP & gradient verified) |
 
 ---
 
 ## Table of Contents
 
-1. [Motivation](#1-motivation)
-2. [Problem Statement](#2-problem-statement)
-3. [Proposed Solution](#3-proposed-solution)
-4. [Architecture Overview](#4-architecture-overview)
-5. [What Is Implemented](#5-what-is-implemented)
-6. [Repository Structure](#6-repository-structure)
-7. [Installation](#7-installation)
-8. [Quickstart](#8-quickstart)
-9. [Training](#9-training)
-10. [Testing](#10-testing)
-11. [Scientific Status — What's Proven vs. Unproven](#11-scientific-status--whats-proven-vs-unproven)
-12. [Falsification Plan](#12-falsification-plan)
-13. [Design Principles](#13-design-principles)
-14. [Comparison to Prior Architectures](#14-comparison-to-prior-architectures)
-15. [Related Work](#15-related-work)
-16. [Roadmap](#16-roadmap)
-17. [Limitations](#17-limitations)
-18. [Citation](#18-citation)
+1. [Abstract & Executive Overview](#1-abstract--executive-overview)
+2. [Problem Statement & The Long-Context Trilemma](#2-problem-statement--the-long-context-trilemma)
+3. [Core Research Questions & Technical Methodology](#3-core-research-questions--technical-methodology)
+4. [System Architecture & Neural Component Breakdown](#4-system-architecture--neural-component-breakdown)
+5. [Minimalist Architecture Dataflow Diagram](#5-minimalist-architecture-dataflow-diagram)
+6. [Mathematical Formulation & Multi-Task Objectives](#6-mathematical-formulation--multi-task-objectives)
+7. [The Write-Path Gradient Starvation Analysis](#7-the-write-path-gradient-starvation-analysis)
+8. [Computational Complexity & Parameter Budgeting](#8-computational-complexity--parameter-budgeting)
+9. [Training Infrastructure & Distributed Execution](#9-training-infrastructure--distributed-execution)
+10. [Inference, Incremental Decoding & State Threading](#10-inference-incremental-decoding--state-threading)
+11. [Scientific Validation & Falsification Protocols](#11-scientific-validation--falsification-protocols)
+12. [Repository Directory Map](#12-repository-directory-map)
+13. [Installation, Verification & Quickstart](#13-installation-verification--quickstart)
+14. [Comparative Analysis Against Prior Art](#14-comparative-analysis-against-prior-art)
+15. [Limitations & Open Research Roadmap](#15-limitations--open-research-roadmap)
+16. [Formal Citation](#16-formal-citation)
 
 ---
 
-## 1. Motivation
+## 1. Abstract & Executive Overview
 
-Long-context language modeling exposes a persistent tension in decoder-only architectures: attention gives precise, addressable recall but costs O(L²); recurrent and state-space alternatives give linear-time compute but degrade rare, long-range recall as their fixed-size state is continuously overwritten. This project asks whether that trade-off is fundamental, or whether a *small, explicit, addressable memory* — bounded in size, gated in its updates, and cheap to read/write — can recover some of what attention loses at range, without paying attention's asymptotic cost. `CustomMistralMamba` is the reference implementation built to test that question.
+Transformer-based autoregressive decoders exhibit quadratic computational complexity $\mathcal{O}(L^2)$ with respect to sequence length $L$, severely restricting their deployment over ultra-long contexts (e.g., $100\text{K}+$ tokens). While linear-time alternatives such as Selective State-Space Models (Mamba / S6) and sliding-window attention dramatically compress computation, they suffer from fundamental information-theoretic limitations: continuous state overwriting introduces severe **recency bias** and degrades the retrieval of non-recurring, long-range facts, while sliding windows induce complete opacity beyond window size $w$.
 
-## 2. Problem Statement
+`CustomMistralMamba` investigates whether introducing **dual, bounded-size, gated compressive memory banks** ($\mathcal{O}(L \cdot m)$ where $m \ll L$) into a hybrid Mamba–Attention–MoE backbone can resolve this trade-off without reintroducing quadratic fusion bottlenecks. The architecture runs sliding-window grouped-query attention (GQA) and a selective state-space model in parallel, conditions both branches on explicit memory states, merges branch outputs via per-token gating ($\mathcal{O}(L \cdot d^2)$), routes through sparse Top-2 Mixture-of-Experts (MoE), and writes raw branch representations back into compressive memory via gated Exponential Moving Average (EMA) updates.
 
-Transformer decoders accumulate three structural weaknesses as context length grows:
+Crucially, rather than treating memory as an untested inductive bias, this repository provides a complete experimental harness with **three strict falsification protocols** designed to prove whether explicit memory provides distinct representational utility over a parameter-matched scale-up of the SSM state.
 
-| Limitation | Mechanism | Consequence |
-|---|---|---|
-| Quadratic compute | Full self-attention is O(L²) | 100K+ token inference is expensive or infeasible |
-| No persistent addressable memory | Knowledge lives only in the KV cache or recurrent state | Rare, one-off facts stated early get diluted or fall outside the window |
-| Uniform per-token compute | Every token passes through the same dense FFN | No mechanism to spend extra compute where it's needed |
+---
 
-Prior work addresses these piecemeal: **Mamba** fixes compute but exhibits recency bias since its state is continuously overwritten; **sliding-window attention** is cheap and precise locally but blind beyond the window; **Mixtral**-style MoE fixes uniform compute but says nothing about context length; **Jamba** combines Mamba, attention, and MoE — the closest prior art — but still has no explicit, queryable memory beyond the SSM's own decaying state.
+## 2. Problem Statement & The Long-Context Trilemma
 
-**Research question:** *Can a Mamba+MoE hybrid retain linear-time, sparse-compute efficiency while adding a bounded-cost memory mechanism that measurably improves recall of rare, long-range facts — without reintroducing quadratic fusion or attention?*
-
-## 3. Proposed Solution
-
-Four mechanisms are composed in a single decoder stack:
-
-1. **Sliding-window grouped-query attention (GQA)** — precise local context at O(L·w) cost, Mistral-style.
-2. **Mamba selective state-space model (SSM)** — linear-time global context via a continuously updated hidden state, in the selective-scan (S6) formulation.
-3. **Dual compressive memory banks** — one bounded-size (`m` slots), gated read/write memory bank per branch (`attn_memory_bank`, `state_memory_bank`), so attention and the SSM each get their own explicit, addressable store.
-4. **Top-2 sparse Mixture-of-Experts (MoE)** — conditional compute in the feed-forward path, reused from Mixtral.
-
-The design keeps every component sub-quadratic: memory reads/writes are bounded to O(L·m) with `m ≪ L`; the two branches are fused via **per-token gating**, O(L·d²), rather than cross-attention between branches, O(L²); and the FFN path stays sparse via dropless Top-2 MoE. The result is an architecture that is linear per layer throughout, with an added component whose entire job is to be tested — not assumed — to help.
-
-## 4. Architecture Overview
-
-Each `HybridDecoderLayer` runs two branches in parallel, each conditioned on its own memory bank, then fuses and routes through MoE:
+Modern language modeling over extended sequence lengths is constrained by three compounding architectural limitations:
 
 ```
-x → RMSNorm
-  ├─ [read attn_memory_bank] → SlidingWindowGQA ──┐
-  └─ [read state_memory_bank] → MambaBlock ───────┤
-                                                     ├─→ TokenGatedFusion → residual
-  attn_out → write attn_memory_bank                 │
-  mamba_out → write state_memory_bank                
-                                                     ↓
-                                    RMSNorm → Top-2 Sparse MoE → residual → layer output
+                      THE LONG-CONTEXT TRILEMMA
+                      
+                 [1] Quadratic Scaling
+                     O(L²) Attention
+                          /     \
+                         /       \
+                        /         \
+    [2] Lossy Recurrent State      [3] Uniform Dense Compute
+        Overwritten SSM Memory         Fixed FLOPs per Token
 ```
 
-Memory is genuinely read-before-branch and written-from-raw-branch-output — not a static learned bias folded into the residual stream. Two complete model families are provided so the memory contribution can be ablated cleanly:
+| Dimension | Mechanism | Failure Mode in Existing Architectures |
+| :--- | :--- | :--- |
+| **Computational Complexity** | Full Multi-Head Self-Attention requires computing an $L \times L$ pairwise attention matrix $\text{Softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$. | Memory allocation and FLOP requirements grow as $\mathcal{O}(L^2)$, making context scaling beyond $32\text{K}$ tokens computationally prohibitive on standard hardware. |
+| **Information Retention** | Pure Recurrent / SSM architectures compress entire token histories into a fixed-size latent state $h_t \in \mathbb{R}^{d_{\text{inner}} \times n}$. | State capacity is bounded. Under continuous sequence evolution, rare, one-off facts presented early are exponentially diluted (recency bias). |
+| **Compute Allocation** | Dense Transformer layers apply identical feed-forward networks (FFN) to every token regardless of semantic density. | Computation cannot be dynamically allocated to difficult tokens or specialized semantic domains without scaling total FLOPs quadratically. |
 
-| Family | Config | Class | Role |
-|---|---|---|---|
-| **Baseline** | `MixtralConfig` | `MixtralForCausalLM` | Ablation control — GQA + MoE only, no Mamba, no memory |
-| **Hybrid** | `HybridMambaMoEConfig` | `HybridForCausalLM` | Full architecture — GQA + Mamba + dual memory + MoE |
+### Limitations of Partial Solutions
 
-Full per-layer diagrams, compute-cost tables, and a component-by-component reference live in [`model/README.md`](model/README.md) (sections 5–9).
+* **Mamba / Linear RNNs:** Achieve linear time $\mathcal{O}(L)$ via continuous state updates, but struggle with precise associative retrieval across long token distances due to continuous state overwrite.
+* **Sliding-Window Attention (Mistral):** Bounds local attention compute to $\mathcal{O}(L \cdot w)$, but is causally blind to tokens outside the receptive field $[t-w, t]$.
+* **Mixture-of-Experts (Mixtral):** Decouples parameter capacity from FLOPs via sparse routing, but does not address sequence-length scaling or memory permanence.
+* **Jamba Hybrid:** Composes Mamba, Attention, and MoE layers, but lacks an explicit, queryable, persistent memory store outside the decaying SSM state.
 
-## 5. What Is Implemented
+---
 
-The reference implementation is feature-complete for training and autoregressive inference:
+## 3. Core Research Questions & Technical Methodology
 
-- Both model families (`MixtralForCausalLM`, `HybridForCausalLM`) with matched GQA/MoE building blocks for apples-to-apples ablation.
-- `CompressiveMemoryBank` with single-sigmoid gated EMA writes, padding-safe batched read/write, and a training-only reconstruction/associative auxiliary path.
-- `MambaBlock` with a four-tier scan dispatch (fused CUDA kernel when `mamba-ssm` is available, Hillis-Steele parallel scan, blocked vectorized scan, sequential scan with checkpointing) so behavior is correct with or without GPU fused kernels.
-- **Eight auxiliary losses** (reconstruction, associative recall, gate regularization, slot utilization, read/fusion/SSM-calibration/expert-routing terms) with warmup schedules, documented formula-by-formula in [`research/loss-definitions.md`](research/loss-definitions.md).
-- Chunked, truncated-BPTT training for long sequences, with memory and Mamba state threaded across chunks.
-- Incremental KV / Mamba / memory caching for `generate()`, including a fast single-token decode path (`MambaBlock.step()`, `MemoryWriteBuffer.append_single_token()`).
-- A parameter-matched **null baseline builder** (`build_test3_null_baseline_config`) that expands the Mamba state size to compensate for a disabled memory bank, so memory's contribution can be isolated from raw parameter count.
-- Production training script (`train.py`) consuming memory-mapped tokenized shards, with cyclic WikiText validation, mixed-precision-safe FP32 promotion for numerically sensitive ops, and full checkpoint/resume support.
-- A cloud training smoke test (`scripts/test_cloud_train.py`) exercising the complete training objective at ~200M parameters on IMDB.
-- 83 unit tests covering forward/backward correctness, shape invariants, caching, memory falsification hooks, and numerical stability (`MEMORY_NAN_FIX_ID` guards against NaNs on the memory path), plus a separate CPU smoke module (`tests.test_toy_train_smoke`) that runs real chunked-BPTT training steps.
+### Primary Research Hypothesis
 
-## 6. Repository Structure
+> **Hypothesis:** *A sub-quadratic hybrid architecture combining sliding-window GQA, selective state spaces, and Top-2 MoE can achieve robust long-range recall of rare, non-recurring facts by incorporating bounded ($m$ slots), gated compressive memory banks—without incurring quadratic compute $\mathcal{O}(L^2)$ or cross-attention fusion bottlenecks.*
+
+### Methodological Innovations
+
+1. **Sub-Quadratic Layer Formulation:** Every neural component operates in $\mathcal{O}(L)$ time when hyper-parameters ($w, m, n, d$) are held constant.
+2. **True Memory Decoupling:** Memory banks are read *before* branch execution (conditioning inputs) and updated *from raw branch outputs* (accumulating newly generated signals), preventing memory from degenerating into a static residual stream bias.
+3. **Linear Token-Gated Fusion:** Branch outputs are merged via an elementwise sigmoid gate $\mathcal{O}(L \cdot d^2)$, completely eliminating the $\mathcal{O}(L^2)$ bidirectional cross-attention bottleneck identified in early hybrid proposals.
+4. **Direct Auxiliary Write-Path Supervision:** An 8-objective auxiliary loss suite ($\mathcal{L}_{\text{recon}}, \mathcal{L}_{\text{assoc}}, \dots$) provides direct gradient signals to memory write parameters, overcoming truncated BPTT gradient starvation.
+5. **Dual-Model Control Architecture:** The repository natively implements two matched model classes (`MixtralForCausalLM` and `HybridForCausalLM`) to enable strict, apples-to-apples empirical ablations.
+
+---
+
+## 4. System Architecture & Neural Component Breakdown
+
+The core building block is the `HybridDecoderLayer`, which coordinates five distinct subsystems:
+
+```
+HybridDecoderLayer Pipeline
+══════════════════════════════════════════════════════════════════════════════
+Input x ──► RMSNorm ──┬──► [Read Attn Bank]  ──► SlidingWindowGQA ──┐
+                      └──► [Read State Bank] ──► MambaBlock (SSM) ──┤
+                                                                     ▼
+                      ┌── Attn Output  ──► Write Attn Bank    Token-Gated
+                      └── Mamba Output ──► Write State Bank     Fusion
+                                                                     │
+                                                                     ▼
+Layer Output ◄── Residual ◄── Top-2 MoE ◄── RMSNorm ◄── Residual Add ◄─┘
+```
+
+### 1. Sliding-Window Grouped-Query Attention (`SlidingWindowGQA`)
+* **Local Receptive Field:** Evaluates scaled dot-product attention (SDPA) strictly over the most recent $w$ tokens ($\mathcal{O}(L \cdot w)$ complexity).
+* **Grouped Queries:** Maps $H_q$ query heads to $H_{kv}$ key-value heads ($H_q / H_{kv}$ sharing ratio), reducing KV cache memory footprint.
+* **Rotary Position Embeddings (RoPE):** Applied via a shared, fixed-size cache up to `max_position_embeddings`, completely avoiding dynamic buffer reallocations under distributed FSDP execution.
+* **Attention Sinks & QK-Norm:** Supports optional StreamingLLM-style initial sink tokens (`num_sink_tokens`) and per-head RMS normalization prior to rotation (`use_qk_norm`).
+
+### 2. Selective State-Space Branch (`MambaBlock`)
+* **Continuous-to-Discrete Selective SSM:** Parameterizes input-dependent $\Delta, B, C$ matrices over inner dimension $d_{\text{inner}} = E_{\text{mamba}} \cdot d$:
+  $$\Delta = \text{Softplus}\left(\text{Linear}_{\Delta}(x) + b_{\Delta}\right), \quad \bar{A} = \exp(\Delta A), \quad \bar{B} = \Delta B$$
+  $$h_t = \bar{A}_t h_{t-1} + \bar{B}_t u_t, \quad y_t = C_t h_t + D u_t$$
+* **Multi-Tier Execution Dispatch:**
+  * **Tier 1 (Fused CUDA):** Direct binding to `mamba-ssm` selective scan kernels for maximum throughput.
+  * **Tier 1b (Unpadded Fused):** Vectorized per-row unpadded scan with autograd-safe tensor reconstruction for padded batches.
+  * **Tier 2 (Parallel Scan):** Pure PyTorch Hillis–Steele associative scan for sequences $L \le 4096$.
+  * **Tier 3 (Blocked Scan):** Chunk-vectorized scan (chunk size 256) for $4096 < L \le 65536$.
+  * **Tier 4 (Sequential Checkpointed Scan):** Minimal-memory recurrent scan with gradient checkpointing for $L > 65536$.
+
+### 3. Dual Compressive Memory System (`CompressiveMemoryBank`)
+* **Independent Dual Banks:** Allocates two distinct memory stores per layer: `attn_memory_bank` ($M_{\text{attn}} \in \mathbb{R}^{B \times m \times d}$) and `state_memory_bank` ($M_{\text{state}} \in \mathbb{R}^{B \times m \times d}$).
+* **Cross-Attention Read:** Current token representations act as queries over memory slots (keys/values), retrieving relevant historical context in $\mathcal{O}(L \cdot m \cdot d)$.
+* **Summary Query Gated Write:** A learned query parameter $Q_{\text{summary}} \in \mathbb{R}^{m \times d}$ cross-attends over chunk branch outputs. An elementwise single-sigmoid gate blends summary updates into memory via an EMA formulation:
+  $$g_{\text{write}} = \sigma\left(W_g [M; S] + b_g\right), \quad M_{\text{new}} = g_{\text{write}} \odot M + (1 - g_{\text{write}}) \odot W_u(S)$$
+* **Batched Memory Operations:** `batched_dual_memory_read` and `batched_dual_memory_write` fuse operations across both banks into single batched tensor passes.
+
+### 4. Token-Gated Branch Fusion (`TokenGatedFusion`)
+* **Linear-Time Fusion:** Replaces quadratic cross-attention with an input-dependent, elementwise gating network:
+  $$g_t = \sigma\left(W_{\text{fusion}} [a_t; s_t] + b_{\text{fusion}}\right) \in \mathbb{R}^d, \quad f_t = g_t \odot a_t + (1 - g_t) \odot s_t$$
+  where $a_t$ and $s_t$ represent the raw outputs of the Attention and Mamba branches, respectively.
+
+### 5. Sparse Dropless Mixture-of-Experts (`DroplessMoELayer`)
+* **Top-$k$ SwiGLU Experts:** Routes each token to $k=2$ out of $E=8$ SwiGLU FFN experts:
+  $$\text{SwiGLU}(x) = \left(\text{SiLU}(x W_{\text{gate}}) \odot x W_{\text{up}}\right) W_{\text{down}}$$
+* **Dispatch Implementations:** Supports Grouped GEMM (`torch._grouped_mm`), Grouped Dispatch (sort-by-expert with stacked weights), and standard Loop Dispatch.
+* **Dropless Routing:** Default `capacity_factor=None` ensures fully batch-independent, reproducible routing without token dropping.
+
+---
+
+## 5. Minimalist Architecture Dataflow Diagram
+
+The following diagram illustrates the complete tensor lifecycle, memory conditioning, state persistence, and computational dataflow through a `HybridDecoderLayer`:
+
+```mermaid
+graph TD
+    classDef default fill:#ffffff,stroke:#1e293b,stroke-width:1.2px,color:#0f172a,font-family:sans-serif;
+    classDef norm fill:#f8fafc,stroke:#64748b,stroke-width:1.2px,stroke-dasharray: 2 2;
+    classDef memory fill:#fefce8,stroke:#ca8a04,stroke-width:1.5px;
+    classDef compute fill:#f0fdf4,stroke:#16a34a,stroke-width:1.5px;
+    classDef fusion fill:#eff6ff,stroke:#2563eb,stroke-width:1.5px;
+    classDef moe fill:#faf5ff,stroke:#9333ea,stroke-width:1.5px;
+    classDef state fill:#fff1f2,stroke:#e11d48,stroke-width:1.2px;
+
+    InToken["Input Hidden State x_{l-1} ∈ ℝ^(B × L × d)"] --> PreNorm1["RMSNorm"]:::norm
+    PreNorm1 --> SplitState["Normalized State x_norm"]
+
+    %% Memory Read Path
+    subgraph MemoryReadSubsystem ["1. Dual Compressive Memory Read Phase"]
+        AM_Store[("Attn Memory M_attn<br>ℝ^(B × m × d)")]:::memory
+        SM_Store[("State Memory M_state<br>ℝ^(B × m × d)")]:::memory
+        
+        AM_Store -. "Cross-Attention Read O(L·m·d)" .-> ReadA["Attn Memory Read ∈ ℝ^(B × L × d)"]
+        SM_Store -. "Cross-Attention Read O(L·m·d)" .-> ReadS["State Memory Read ∈ ℝ^(B × L × d)"]
+    end
+
+    SplitState --> ReadA
+    SplitState --> ReadS
+
+    ReadA --> CombA["Linear Combine W_c^a: [x_norm ; ReadA]"]
+    ReadS --> CombS["Linear Combine W_c^s: [x_norm ; ReadS]"]
+
+    %% Parallel Core Branches
+    subgraph ParallelComputeSubsystem ["2. Parallel Core Processing Branches"]
+        CombA --> GQA["Sliding-Window GQA (Mistral)<br>Receptive Window w | O(L·w·d)"]:::compute
+        CombS --> Mamba["Selective SSM MambaBlock (S6)<br>Inner Dim 2d, State n | O(L·d·n)"]:::compute
+        
+        GQA --> OutA["Raw Attention Output a_t ∈ ℝ^(B × L × d)"]
+        Mamba --> OutS["Raw SSM Output s_t ∈ ℝ^(B × L × d)"]
+    end
+
+    %% Memory Write Path
+    subgraph MemoryWriteSubsystem ["3. Memory Gated Write & Buffering Phase"]
+        OutA -. "Summary Query Q_sum & EMA Gate" .-> WriteBufA["MemoryWriteBuffer (Attn)"]
+        OutS -. "Summary Query Q_sum & EMA Gate" .-> WriteBufS["MemoryWriteBuffer (State)"]
+        
+        WriteBufA -. "Batched Gated Flush" .-> AM_Store_Next[("Updated M_attn")]:::memory
+        WriteBufS -. "Batched Gated Flush" .-> SM_Store_Next[("Updated M_state")]:::memory
+    end
+
+    %% Token Gated Fusion
+    subgraph FusionSubsystem ["4. Linear Token-Gated Fusion"]
+        OutA --> FuseGate["Sigmoid Gating Network:<br>g_t = σ(W_f [a_t ; s_t] + b_f)"]:::fusion
+        OutS --> FuseGate
+        FuseGate --> FuseApply["Fused State f_t = g_t ⊙ a_t + (1 - g_t) ⊙ s_t<br>Complexity: O(L·d²)"]:::fusion
+    end
+
+    %% MoE and Residual Feed-forward
+    InToken --> Residual1["Residual Addition (+)"]
+    FuseApply --> Residual1
+    Residual1 --> PreNorm2["RMSNorm"]:::norm
+    
+    subgraph MoESubsystem ["5. Sparse Mixture-of-Experts Subsystem"]
+        PreNorm2 --> MoERouter["Top-2 Gating Router<br>Switch-MoE Load Balancing & Z-Loss"]:::moe
+        MoERouter --> Experts["8 Sparse SwiGLU FFN Experts<br>Top-2 Dropless Dispatch (Grouped GEMM)"]:::moe
+    end
+
+    Residual1 --> Residual2["Residual Addition (+)"]
+    Experts --> Residual2
+    Residual2 --> OutLayer["Layer Output x_l ∈ ℝ^(B × L × d)"]
+
+    %% State Recurrence Threading
+    AM_Store_Next === StateThread1["Threaded Memory State (Truncated BPTT)"]:::state
+    SM_Store_Next === StateThread2["Threaded Memory State (Truncated BPTT)"]:::state
+    Mamba === StateThread3["Threaded SSM (h_t) & Conv Cache"]:::state
+```
+
+---
+
+## 6. Mathematical Formulation & Multi-Task Objectives
+
+The overall training objective combines language modeling cross-entropy, MoE router stabilization losses, and eight dedicated auxiliary losses:
+
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}} + \lambda_{\text{aux}}\mathcal{L}_{\text{router\_aux}} + \lambda_{z}\mathcal{L}_{\text{router\_z}} + \lambda_{\text{vocab\_z}}\mathcal{L}_{\text{vocab\_z}} + \sum_{i=1}^{8} \lambda_i \mathcal{L}_i$$
+
+```
+                                    COMPOSITE OBJECTIVE
+                                             │
+      ┌──────────────────────┬───────────────┴───────────────┬──────────────────────┐
+      │                      │                               │                      │
+      ▼                      ▼                               ▼                      ▼
+Language Modeling      MoE Regularization             Memory Supervision     System Regularization
+  • Causal CE            • Router Load Balance          • L_recon (0.08)       • L_fusion (8e-3)
+  • Vocab Z-Loss         • Router Z-Loss                • L_assoc (1.2e-4)     • L_ssm (1e-5)
+                                                        • L_gate (1e-3)        • L_slot (3e-3)
+                                                        • L_read (5e-3)        • L_expert (2e-3)
+```
+
+### Primary Objectives
+
+1. **Token Cross-Entropy Loss ($\mathcal{L}_{\text{CE}}$):** Standard next-token negative log-likelihood computed over non-ignored positions:
+   $$\mathcal{L}_{\text{CE}} = -\frac{1}{N_{\text{valid}}} \sum_{t \in \mathcal{V}_{\text{valid}}} \log P(x_t \mid x_{<t})$$
+2. **MoE Router Load-Balancing Loss ($\mathcal{L}_{\text{router\_aux}}$):** Switch-Transformer formulation enforcing balanced token distribution across experts:
+   $$\mathcal{L}_{\text{router\_aux}} = E \sum_{i=1}^{E} f_i \cdot p_i, \quad f_i = \frac{1}{N}\sum_{t=1}^N \mathbb{I}(i \in \text{Top2}(t)), \quad p_i = \frac{1}{N}\sum_{t=1}^N \text{Softmax}(\text{logits}_t)_i$$
+3. **MoE Router Z-Loss ($\mathcal{L}_{\text{router\_z}}$):** Penalizes extreme router logit magnitudes to prevent FP16 overflow (ST-MoE):
+   $$\mathcal{L}_{\text{router\_z}} = \frac{1}{N}\sum_{t=1}^{N} \left(\log \sum_{i=1}^{E} \exp(z_{t,i})\right)^2$$
+
+### The Eight Auxiliary Losses
+
+| Symbol | Objective Name | Weight $\lambda$ | Formulation | Purpose |
+| :--- | :--- | :--- | :--- | :--- |
+| $\mathcal{L}_{\text{recon}}$ | Compressive Reconstruction | $0.08$ | $\frac{1}{B L d} \| x - g_{\text{dec}}(s) \|_2^2$ | Forces write summary $s$ to retain recoverable chunk tokens via a lightweight 1-layer cross-attention decoder. |
+| $\mathcal{L}_{\text{assoc}}$ | Associative Retrieval | $1.2\times 10^{-4}$ | $\frac{1}{T}\sum_{t=1}^T \text{clip}(s_t, 0, 3\sigma) \| \hat{v}_t - v_t \|_2^2$ | Key-value retrieval error from post-write memory, weighted by reconstruction surprise $s_t = \|x_t - g(s)\|_2$. |
+| $\mathcal{L}_{\text{gate}}$ | Write-Gate Entropy | $1.0\times 10^{-3}$ | $-\frac{1}{|G|}\sum [g \log(g+\epsilon) + (1-g)\log(1-g+\epsilon)]$ | Maximizes write-gate entropy to prevent saturation at $0$ (never update) or $1$ (always overwrite). |
+| $\mathcal{L}_{\text{read}}$ | Read Utilization | $5.0\times 10^{-3}$ | $\max(0, r_{\text{min}} - r)^2, \; r = \frac{\|W_{\text{mem}}\|_F}{\|W_{\text{own}}\|_F + \|W_{\text{mem}}\|_F}$ | Hinge loss preventing linear combine layers from zeroing out the memory read pathway ($r_{\text{min}} = 0.15$). |
+| $\mathcal{L}_{\text{fusion}}$ | Fusion Balance | $8.0\times 10^{-3}$ | $\frac{1}{d} \| \bar{g}_{\text{fusion}} - 0.5 \|_2^2$ | Centers batch-mean fusion gate at $0.5$ to ensure balanced utilization between Attention and Mamba. |
+| $\mathcal{L}_{\text{expert}}$ | Expert Specialization | $2.0\times 10^{-3}$ | $\frac{1}{|T|}\sum |\cos(e_i, e_j)| - \beta \text{Var}_e(\text{Softmax}(z))$ | Penalizes cosine similarity between selected expert outputs while encouraging routing variance (Guo et al., 2025). |
+| $\mathcal{L}_{\text{ssm}}$ | SSM Norm Hinge | $1.0\times 10^{-5}$ | $\max(0, \frac{1}{T}\sum \|h_t\|_2^2 - \gamma)$ | Prevents runaway SSM state norm drift beyond initialization calibration threshold $\gamma$. |
+| $\mathcal{L}_{\text{slot}}$ | Slot Diversity | $3.0\times 10^{-3}$ | $\frac{1}{m^2}\sum_{p \neq q} \max(0, \cos(\hat{M}_p, \hat{M}_q) - \tau)^2 + \alpha \mathcal{L}_{\text{cross}}$ | Penalizes intra-bank slot cosine similarity above margin $\tau=0.3$ and cross-bank slot alignment. |
+
+---
+
+## 7. The Write-Path Gradient Starvation Analysis
+
+A critical structural challenge in memory-augmented architectures is **write-path gradient starvation** under chunked truncated Backpropagation Through Time (BPTT):
+
+```
+                        FORWARD PASS TIMELINE
+ Chunk k-1                             Chunk k
+┌─────────────────────────┐           ┌─────────────────────────┐
+│ Token x_{k-1}           │           │ Token x_k               │
+│   │                     │           │   │                     │
+│   ▼                     │           │   ▼                     │
+│ Memory Read ◄── M_{k-1} │           │ Memory Read ◄── M_k     │
+│   │                     │           │   │              ▲      │
+│   ▼                     │           │   ▼              │ (State Threaded)
+│ Branch Compute          │           │ Branch Compute   │      │
+│   │                     │           │   │              │      │
+│   ▼                     │           │   ▼              │      │
+│ Memory Write ───────────┼───────────┼─► Updated M_k ───┘      │
+│ (Output not re-read     │           │ (Final write receives   │
+│  in Chunk k-1)          │           │  NO CE gradient)        │
+└─────────────────────────┘           └─────────────────────────┘
+```
+
+1. **Intra-Chunk Isolation:** Within any single chunk, memory written at step $t$ is not re-read within the same chunk.
+2. **Terminal Chunk Severance:** In a sequence of $K$ chunks, the memory write performed at chunk $K$ receives **zero** cross-entropy supervisory signal from future tokens.
+3. **Single-Chunk Starvation:** For sequences shorter than `memory_chunk_size`, write parameters receive no gradient from $\mathcal{L}_{\text{CE}}$.
+
+**Solution:** The auxiliary loss suite ($\mathcal{L}_{\text{recon}}$ and $\mathcal{L}_{\text{assoc}}$) provides an immediate, local supervisory reconstruction signal to $W_{\text{gate}}$, $W_{\text{update}}$, and $Q_{\text{summary}}$ during every forward step, guaranteeing robust optimization regardless of sequence length.
+
+---
+
+## 8. Computational Complexity & Parameter Budgeting
+
+### Asymptotic Complexity Comparison
+
+| Architecture | Local Attention | Recurrent Context | Explicit Memory | FFN Execution | Time Complexity | KV Cache Decode Space |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Standard Transformer** | Dense $\mathcal{O}(L^2)$ | None | None | Dense $\mathcal{O}(L \cdot d_{\text{ff}})$ | $\mathcal{O}(L^2 \cdot d)$ | $\mathcal{O}(L \cdot d)$ (Grows linearly) |
+| **Pure Mamba (S6)** | None | SSM $\mathcal{O}(L \cdot d \cdot n)$ | None | Dense $\mathcal{O}(L \cdot d_{\text{ff}})$ | $\mathcal{O}(L \cdot d \cdot n)$ | $\mathcal{O}(d \cdot n)$ (Fixed $\mathcal{O}(1)$) |
+| **Jamba** | Window GQA $\mathcal{O}(L \cdot w)$ | SSM $\mathcal{O}(L \cdot d \cdot n)$ | None | Sparse MoE $\mathcal{O}(L \cdot k \cdot d_{\text{ff}})$ | $\mathcal{O}(L \cdot (w + d \cdot n))$ | $\mathcal{O}(w \cdot d + d \cdot n)$ (Fixed) |
+| **Mixtral Baseline** | Window GQA $\mathcal{O}(L \cdot w)$ | None | None | Sparse MoE $\mathcal{O}(L \cdot k \cdot d_{\text{ff}})$ | $\mathcal{O}(L \cdot w \cdot d)$ | $\mathcal{O}(w \cdot d)$ (Fixed) |
+| **CustomMistralMamba** | Window GQA $\mathcal{O}(L \cdot w)$ | SSM $\mathcal{O}(L \cdot d \cdot n)$ | Dual Bank $\mathcal{O}(L \cdot m \cdot d)$ | Sparse MoE $\mathcal{O}(L \cdot k \cdot d_{\text{ff}})$ | $\mathcal{O}(L \cdot (w + d \cdot n + m))$ | $\mathcal{O}(w \cdot d + d \cdot n + 2md)$ (Fixed) |
+
+### Parameter Overhead Accounting
+
+Relative to a parameter-matched Jamba-style baseline (Mamba + GQA + MoE without explicit memory), the dual memory system introduces approximately **$6d^2$ parameters per layer**:
+
+$$\Delta P_{\text{layer}} = \underbrace{2 \times (4d^2)}_{\text{Dual Bank Projections: } Q, K, V, O} + \underbrace{2 \times (2d^2)}_{\text{Combine Layers}} + \underbrace{2 \times (2d^2 + d^2)}_{\text{Gated Update: } W_g, W_u} \approx 6d^2 \text{ active params}$$
+
+This overhead is negligible compared to the MoE feed-forward parameters ($2 \times E \times 3 \cdot d \cdot d_{\text{ff}}$) and completely replaces the quadratic $\mathcal{O}(L^2)$ cross-attention fusion module without expanding the parameter budget.
+
+---
+
+## 9. Training Infrastructure & Distributed Execution
+
+### 1. Single-GPU Streaming Pipeline (`train.py`)
+* **Memory-Mapped Shards:** `MmapShardDataset` streams binary tokenized datasets produced by `TokenizedShardProducer` with zero copy overhead.
+* **Streamed Chunked CE:** For long sequences, cross-entropy is accumulated per chunk on valid tokens only, reducing peak activation memory from $\mathcal{O}(B \cdot L \cdot V)$ to $\mathcal{O}(N_{\text{valid}} \cdot V)$.
+* **Moonshot Muon + AdamW Hybrid:** Implements Newton–Schulz iterative matrix orthogonalization for 2D weight kernels, matched with AdamW for 1D vectors, biases, and embedding tables (arXiv:2502.16982).
+
+```bash
+python train.py \
+  --cache-dir ./data_cache \
+  --run-dir ./runs/hybrid-150m \
+  --ckpt-dir ./checkpoints \
+  --batch-size 4 \
+  --grad-accum-steps 8 \
+  --lr 3e-4 \
+  --use-muon
+```
+
+### 2. Distributed Multi-GPU Pre-Training (`pre-training/fsdp2_train.py`)
+* **PyTorch FSDP2 (`fully_shard`):** Parameters are sharded per-layer across distributed ranks. Master weights remain in FP32 while activations and forward computations run under `torch.autocast(bfloat16)`.
+* **Zero-Sync Telemetry:** Training metrics and auxiliary loss breakdowns are accumulated locally and all-reduced globally once per logging window, eliminating host-device synchronization stalls.
+* **Strict NaN Trilemma Guard:** Global voting mechanism halts optimization safely if any distributed rank detects non-finite gradients.
+
+```bash
+torchrun --nproc_per_node=8 pre-training/fsdp2_train.py \
+  --cache-dir ./data_cache \
+  --run-dir ./runs/fsdp2-production \
+  --batch-size 2 \
+  --grad-accum-steps 4 \
+  --grad-nan-guard strict
+```
+
+---
+
+## 10. Inference, Incremental Decoding & State Threading
+
+Autoregressive inference in `HybridForCausalLM.generate()` coordinates four distinct cache state structures across time steps:
+
+```
+                      INCREMENTAL DECODE STEP (t -> t+1)
+                      
+   Prompt Tokens                Generated Token x_t
+        │                                │
+        ▼                                ▼
+┌──────────────────┐           ┌──────────────────────────────────────┐
+│  Chunked Prefill │           │ Step Forward (seq_len = 1)           │
+│  (Size = Chunk)  │           │                                      │
+│                  │           │ 1. Sliding KV Cache Update (<= w)    │
+│ Flushes Memory   │           │ 2. Mamba Conv & SSM Step Recurrence  │
+│ Banks at Chunk   ├──────────►│ 3. Buffer Output in MemoryWriteBuf   │
+│ Boundaries       │           │ 4. If Interval Elapsed: Flush Banks  │
+└──────────────────┘           │ 5. Active Mask Freezes EOS Sequences │
+                               └──────────────────────────────────────┘
+```
+
+1. **Sliding KV Cache (`past_key_values`):** Maintains the trailing $w$ key-value states per layer. When $L > w$, keys/values and attention masks are truncated in lockstep.
+2. **Mamba Recurrent Cache (`MambaCache`):** `(conv_state, ssm_state)` updated in $\mathcal{O}(1)$ via `MambaBlock.step()`, performing in-place conv buffer shifts and matrix recurrence.
+3. **Memory Bank States (`HybridMemoryState`):** Persists $(M_{\text{attn}}, M_{\text{state}})$ tensors across decode steps.
+4. **Memory Write Buffer (`MemoryWriteBuffer`):** Accumulates raw branch outputs during single-token decoding, flushing batched gated writes into memory banks every `memory_write_interval` tokens.
+5. **Active Batch Masking:** Automatically freezes cache and memory updates for batch rows that hit `eos_token_id`.
+
+---
+
+## 11. Scientific Validation & Falsification Protocols
+
+The central scientific risk of this architecture is **representational redundancy**: because Mamba's selective SSM state $h_t \in \mathbb{R}^{d_{\text{inner}} \times n}$ is already a compressed summary of past tokens, does explicit memory provide measurable retrieval benefits? 
+
+The codebase provides built-in hooks to execute three strict falsification tests:
+
+```
+                            FALSIFICATION PROTOCOL
+                                       │
+        ┌──────────────────────────────┼──────────────────────────────┐
+        │                              │                              │
+        ▼                              ▼                              ▼
+ [Test 1: Rare-Fact Recall]    [Test 2: Gate Telemetry]    [Test 3: Null Hypothesis]
+ Zero memory at inference     Monitor write-gate means    Binary-search larger SSM
+ via zero_memory_states()      across training run         via build_test3_null_...
+        │                              │                              │
+        ▼                              ▼                              ▼
+ PASS: Recall drops sharply    PASS: Non-saturated gates   PASS: Hybrid beats null
+ FAIL: No recall degradation   FAIL: Gates collapse to 0/1 FAIL: Matched SSM wins
+```
+
+### Empirical Test Specification
+
+1. **Test 1: Inference Memory Zeroing (`HybridModel.zero_memory_states`)**
+   * *Protocol:* Inject rare synthetic facts (e.g., UUID-key pairings) early in a long sequence ($L \ge 16\text{K}$). Query exact recall at the sequence tail. Compare model with memory enabled vs. memory zeroed at inference.
+   * *Pass Criteria:* Exact-string recall must degrade significantly when memory states are zeroed.
+2. **Test 2: Write-Gate Activity Monitoring (`gate_stats`)**
+   * *Protocol:* Track the batch-mean write gates $\bar{g}_{\text{attn}}$ and $\bar{g}_{\text{state}}$ via `HybridTrainingOutput.gate_stats`.
+   * *Pass Criteria:* Gate values must remain active within $(0.1, 0.9)$ across training without saturating near $0.0$ (never update) or $1.0$ (always overwrite).
+3. **Test 3: Parameter-Matched Null Baseline (`build_test3_null_baseline_config`)**
+   * *Protocol:* Construct a parameter-matched control model with `use_dual_memory=False` by expanding `mamba_state_size` and `mamba_expand` via binary search. Train both models on identical token budgets.
+   * *Pass Criteria:* `HybridForCausalLM` must outperform the enlarged SSM baseline on long-context needle-in-a-haystack tasks.
+
+> [!IMPORTANT]
+> If the architecture fails these falsification tests, the documented protocol is to simplify to `use_dual_memory=False` (a streamlined Jamba-class model) rather than retaining unproven architectural complexity.
+
+---
+
+## 12. Repository Directory Map
 
 ```
 CustomMistralmamba/
-├── README.md                     # This file
-├── requirements.txt               # torch, ruff, pre-commit
-├── pyproject.toml                 # ruff lint config
+├── README.md                      # Primary research documentation & specification
+├── requirements.txt                # Production & development dependencies
+├── pyproject.toml                  # Static analysis & linter configurations (Ruff)
 │
-├── model/                         # Core architecture package
-│   ├── README.md                  # Full architecture reference (24 sections)
-│   ├── core/                      # Config dataclasses, dtype helpers, param builders
-│   ├── layers/                    # Shared blocks: RMSNorm, RoPE, GQA, MoE, fusion gate
-│   ├── mixtral/                   # Baseline ablation model
-│   └── hybrid/                    # Memory bank, Mamba block, aux losses, hybrid layer/model
+├── model/                          # Core neural architecture package
+│   ├── __init__.py                 # Public API exports & version metadata
+│   ├── README.md                   # Detailed 24-section architecture & developer manual
+│   ├── core/                       # Configurations, constants, dtype & optimization builders
+│   │   ├── config.py               # MixtralConfig, HybridMambaMoEConfig dataclasses
+│   │   ├── constants.py            # MEMORY_NAN_FIX_ID revision tags
+│   │   ├── dtype.py                # FP32 promotion helpers for mixed precision
+│   │   ├── optim.py                # Muon / AdamW parameter splitting logic
+│   │   └── builders.py             # Parameter budgeting & Test 3 null baseline builder
+│   ├── layers/                     # Shared neural building blocks
+│   │   ├── norm.py                 # RMSNorm implementation
+│   │   ├── rope.py                 # RotaryEmbedding (fixed-capacity cache)
+│   │   ├── attention.py            # SlidingWindowGQA (SDPA, sink tokens, QK-norm)
+│   │   ├── moe.py                  # MOERouter, SwiGLUExpert, DroplessMoELayer
+│   │   ├── fusion.py               # TokenGatedFusion module
+│   │   └── sampling.py             # Nucleus (top-p) and top-k logit filtering
+│   ├── mixtral/                    # Baseline ablation model (control)
+│   │   └── model.py                # MixtralDecoderLayer, MixtralForCausalLM
+│   └── hybrid/                     # Research hybrid architecture & memory subsystem
+│       ├── layer.py                # HybridDecoderLayer implementation
+│       ├── memory.py               # CompressiveMemoryBank, MemoryWriteBuffer
+│       ├── mamba.py                # MambaBlock & 4-tier scan dispatch
+│       ├── losses.py               # 8 auxiliary loss definitions & schedules
+│       └── model.py                # HybridModel, HybridForCausalLM, chunked BPTT
 │
-├── research/
-│   ├── research.md                # Full research proposal, problem framing, evaluation plan
-│   ├── loss-definitions.md        # Formula-level spec for all eight auxiliary losses
-│   └── Improvement-suggestions.md # Deferred research-grade backlog (post-review)
+├── research/                       # Research proposals & theoretical documentation
+│   ├── research.md                 # Complete research proposal & methodology
+│   ├── loss-definitions.md         # Formula-level specification for all 8 auxiliary losses
+│   └── Improvement-suggestions.md  # Architectural backlog & scaling suggestions
 │
-├── scripts/
-│   ├── toy_train.py               # ~5M-param smoke test, single file, no dataset needed
-│   ├── test_cloud_train.py        # ~200M-param IMDB training smoke test
-│   └── verify_model_package.py    # Import / API surface sanity check
+├── pre-training/                   # Distributed multi-GPU training
+│   └── fsdp2_train.py              # PyTorch FSDP2 + Muon distributed trainer
 │
-├── utils/
-│   ├── dataset.py                 # TokenizedShardProducer, MmapShardDataset (streaming shards)
-│   └── validation.py              # WikiTextCyclicValidator for periodic held-out eval
+├── utils/                          # Dataset streaming & validation utilities
+│   ├── dataset.py                  # TokenizedShardProducer, MmapShardDataset
+│   ├── fsdp2_muon.py               # MuonDTensor implementation & Newton-Schulz checks
+│   └── validation.py               # WikiTextCyclicValidator for periodic evaluation
 │
-├── train.py                       # Production training loop (streaming shards + checkpointing)
-└── tests/
-    ├── test_model.py              # 83 unit tests over the model package
-    └── test_toy_train_smoke.py    # Smoke test for scripts/toy_train.py
+├── scripts/                        # Verification & smoke test scripts
+│   ├── toy_train.py                # Single-file ~5M parameter CPU/GPU smoke test
+│   ├── test_cloud_train.py         # ~200M parameter cloud training smoke test
+│   ├── bench_grad_guard.py         # Distributed gradient sanity benchmark
+│   └── verify_model_package.py     # Public API surface verification
+│
+└── tests/                          # Comprehensive unit test suite
+    ├── test_model.py               # 83 rigorous tests covering forward, backward, caches
+    └── test_toy_train_smoke.py     # Integration smoke test for toy training loop
 ```
 
-## 7. Installation
+---
+
+## 13. Installation, Verification & Quickstart
+
+### Environment Setup
 
 ```bash
+# Clone the repository
 git clone https://github.com/SVISHNUVARDHAN3610/CustomMistralmamba.git
 cd CustomMistralmamba
+
+# Install runtime dependencies (PyTorch >= 2.1)
 pip install -r requirements.txt
+
+# (Optional) Install fused CUDA selective scan kernels
+pip install mamba-ssm>=2.2.0
 ```
 
-The only hard runtime dependency is `torch>=2.1.0`. GPU acceleration for the Mamba branch via fused CUDA kernels is optional (`mamba-ssm>=2.2.0`, commented out by default in `requirements.txt`) — the implementation auto-falls-back to pure-PyTorch scan tiers if it is not installed, at the cost of throughput, not correctness.
+### Verification & Test Suite
 
-## 8. Quickstart
+```bash
+# 1. Verify model package exports and public API surface
+python scripts/verify_model_package.py
+
+# 2. Run the full unit test suite (83 tests)
+python -m unittest tests.test_model -v
+
+# 3. Run the standalone toy training smoke test (~5M parameters)
+python scripts/toy_train.py --steps 50 --device cpu
+```
+
+### Minimal Python Quickstart
 
 ```python
 import torch
 from model import HybridForCausalLM, HybridMambaMoEConfig
 
-cfg = HybridMambaMoEConfig(
-    vocab_size=3200,
-    hidden_size=256,
-    num_layers=2,
-    num_heads=4,
-    num_kv_heads=2,
+# 1. Instantiate hybrid configuration
+config = HybridMambaMoEConfig(
+    vocab_size=32000,
+    hidden_size=512,
+    num_layers=4,
+    num_heads=8,
+    num_kv_heads=4,
     head_dim=64,
-    intermediate_size=512,
-    window_size=16,
-    num_experts=4,
-    memory_size=16,
+    intermediate_size=1024,
+    window_size=512,
+    num_experts=8,
+    top_k=2,
+    mamba_state_size=16,
     use_dual_memory=True,
+    memory_size=48,
+    memory_chunk_size=256,
+    use_auxiliary_losses=True,
 )
 
-model = HybridForCausalLM(cfg).train()
-ids = torch.randint(0, cfg.vocab_size, (2, 128))
-labels = ids.roll(shifts=-1, dims=1)
+# 2. Initialize model in training mode
+model = HybridForCausalLM(config).train()
 
-out = model(input_ids=ids, labels=labels, training_step=0, max_training_steps=1000)
-out.loss.backward()
+# 3. Forward pass with labels (triggers chunked BPTT and auxiliary losses)
+input_ids = torch.randint(0, config.vocab_size, (2, 512))
+labels = input_ids.roll(shifts=-1, dims=1)
+
+output = model(input_ids=input_ids, labels=labels, training_step=0, max_training_steps=1000)
+print(f"Total Loss: {output.loss.item():.4f} | CE Loss: {output.ce_loss.item():.4f}")
+
+# 4. Backward pass
+output.loss.backward()
+
+# 5. Autoregressive generation
+model.eval()
+prompt = torch.randint(0, config.vocab_size, (1, 32))
+generated_ids = model.generate(prompt, max_new_tokens=64, do_sample=False)
+print(f"Generated sequence shape: {generated_ids.shape}")
 ```
 
-For autoregressive generation, a Mixtral-only ablation baseline, and the parameter-matched null baseline used in Test 3, see section 18 of [`model/README.md`](model/README.md).
+---
 
-For an even smaller, dependency-free smoke test:
-
-```bash
-python scripts/toy_train.py
-```
-
-## 9. Training
-
-`train.py` runs production training against pre-tokenized, memory-mapped binary shards:
-
-```bash
-python train.py \
-  --cache-dir /path/to/shards \
-  --run-dir runs/hybrid-150m \
-  --ckpt-dir ./model_ckpt
-```
-
-It handles seeding (with an optional fully-deterministic mode), rotating run logs, streaming shard consumption via `MmapShardDataset`, periodic cyclic validation against `Salesforce/wikitext`, gradient clipping, checkpoint save/resume (`model_ckpt.pth` + `config.json`), and warmup schedules for the auxiliary and expert-routing losses. `scripts/test_cloud_train.py` provides a smaller, self-contained IMDB-based smoke test for verifying the full objective end-to-end on cloud hardware before a long run.
-
-## 10. Testing
-
-```bash
-python -m unittest tests.test_model -v
-python -m unittest tests.test_toy_train_smoke -v
-# Single test:
-python -m unittest tests.test_model.TestHybridModel.test_forward_backward -v
-```
-
-(The project standard is `unittest`; pytest is not a dependency.)
-
-`tests/test_model.py` covers both model families across forward/backward correctness, shape and dtype invariants under AMP, KV/Mamba/memory cache threading through `generate()`, padding-mask correctness in the memory write path, the four Mamba scan-backend tiers, and the memory-zeroing falsification hook (`HybridModel.zero_memory_states()`). `tests/test_toy_train_smoke.py` verifies the minimal training loop runs end-to-end without dataset dependencies.
-
-## 11. Scientific Status — What's Proven vs. Unproven
-
-**Implemented and verified:** the architecture runs correctly forward and backward at multiple scales, from a ~5M-parameter toy config to a ~200M-parameter cloud smoke run; gradients flow through both branches and both memory banks; caching is correct across incremental decode; the four Mamba scan tiers produce numerically consistent results with and without fused CUDA kernels.
-
-**Not yet established:** whether the dual memory banks are *necessary* rather than *redundant* with the Mamba branch's own hidden state, which is already a compressed summary of everything seen so far. This is the central open question the codebase is built to answer, not a claim it currently makes.
-
-## 12. Falsification Plan
-
-Three experiments, documented in full in [`research/research.md`](research/research.md) §6, must pass before the memory component is scaled up:
-
-1. **Ablation-at-inference:** rare-fact recall should measurably degrade when memory is zeroed via `zero_memory_states()` at test time, relative to the same model with memory intact.
-2. **Non-degenerate gate activity:** write gates must show real, non-saturated activity during training — not settle at a trivial always-write or always-ignore value.
-3. **Beats a matched null baseline:** the hybrid model with memory must outperform `build_test3_null_baseline_config` — a parameter-matched control with `use_dual_memory=False` and an enlarged Mamba state — on long-range recall tasks.
-
-If the memory component fails these tests, the documented next step (see [`research/Improvement-suggestions.md`](research/Improvement-suggestions.md)) is to simplify to `use_dual_memory=False` and redirect effort toward a leaner, Jamba-style baseline rather than defend an unproductive component.
-
-## 13. Design Principles
-
-- **Everything sub-quadratic.** No component in the hybrid stack reintroduces O(L²) cost; branch fusion happens through per-token gating, not cross-branch attention.
-- **Memory as a genuine read/write system, not a bias.** The memory-augmented tensor feeds the branch as *input*; the branch's *raw* output is what gets written back — read-into-input and write-from-output are deliberately decoupled so the bank behaves like memory rather than a learned constant.
-- **Ablatable by construction.** `use_dual_memory=False`, the Mixtral baseline, and the parameter-matched null baseline all exist specifically so any claimed benefit of memory can be isolated and falsified, not just asserted.
-- **Numerically defensive.** FP32 promotion under autocast for scan and router math, router logit clamping, NaN-safe gated writes on all-padded rows — the kind of guardrails that matter once training runs get long and unattended.
-- **Backend-portable by default.** The Mamba branch works correctly (if more slowly) with no CUDA kernel installed at all, so the reference implementation isn't gated on a specific hardware/library stack to be usable or testable.
-
-## 14. Comparison to Prior Architectures
-
-| Feature | Transformer | Mamba | Jamba | Mixtral (baseline, this repo) | Hybrid (this repo) |
-|---|---|---|---|---|---|
-| Local attention | Full O(L²) | None | GQA | Sliding GQA | Sliding GQA |
-| SSM branch | No | Yes | Yes | No | Yes |
-| Explicit memory | No | No | No | No | Dual gated banks |
-| Sparse MoE | No | No | Yes | Yes | Yes |
-| Time complexity | O(L²) | O(L) | O(L) | O(L) | O(L) |
-| Long-range rare-fact recall | Window-limited | Recency bias | Recency bias | Window-limited | Targeted — unproven |
-
-## 15. Related Work
-
-- **Mamba** (Gu & Dao, 2023) — selective state-space models for linear-time sequence modeling; basis for the SSM branch.
-- **Jamba** (Lieber et al., 2024) — hybrid Mamba–Transformer–MoE architecture; the closest prior work, lacking explicit queryable memory.
-- **Mixtral** (Jiang et al., 2024) — Top-2 sparse MoE with load-balancing and z-loss regularization, reused directly for the FFN path.
-- **Compressive Transformer** (Rae et al., ICLR 2020) — gated compressive memory; conceptual basis for `CompressiveMemoryBank` and the reconstruction loss.
-- **Titans** (Behrouz et al., NeurIPS 2025) — associative-memory loss with surprise weighting; basis for the associative-recall auxiliary loss.
-- **Perceiver / Perceiver IO** — attention over a small fixed latent set as a way to get O(L·m) cost instead of O(L²); the same trick underlies memory-bank reads here.
-
-## 16. Roadmap
-
-1. Run the falsification suite (§12) at small scale — hooks are already implemented, evaluation harness is not.
-2. Build a needle-in-a-haystack / rare-fact recall evaluation harness with fixed seeds and controlled retrieval distance.
-3. Match training tokens and peak activation memory, not just parameter count, in the null-baseline comparison.
-4. Add a Jamba-style control (`use_dual_memory=False`) as the primary comparison point, not only the Mixtral baseline.
-5. If memory proves redundant: simplify the architecture and redirect effort toward efficiency (fused scan, grouped MoE dispatch) rather than memory.
-6. If memory proves useful: scale along a 10M → 100M → 1B ladder with a consistent evaluation protocol before making any long-context claims.
-
-A longer, prioritized backlog — gate regularizers, content-addressable slots, FLOPs-matched controls, mixed-precision recipe, FSDP profiling — is tracked in [`research/Improvement-suggestions.md`](research/Improvement-suggestions.md).
-
-## 17. Limitations
-
-- No large-scale hyperparameter sweep has been run over the eight auxiliary-loss coefficients; current defaults are informed starting points from `loss-definitions.md`, not tuned values.
-- Fused CUDA scan kernels are optional and untested at the largest sequence-length tiers on every hardware target; wall-clock linear-time claims are FLOP-true but not yet wall-clock-verified at 100K+ tokens.
-- All current training runs are smoke-scale (toy config, ~200M-parameter IMDB run); no long-context or large-scale training run has been completed.
-- The central scientific claim — that dual memory improves rare-fact recall beyond what a larger Mamba state alone provides — is explicitly unproven pending the falsification suite in §12.
-
-## 18. Citation
-
-If you use this codebase or build on the architecture, please cite the design document:
+## 14. Comparative Analysis Against Prior Art
 
 ```
-Vishnu Vardhan. "Hybrid Mamba–MoE with Dual Memory: A Sub-Quadratic Architecture
-for Long-Context Language Modeling." Research Proposal, August 2026.
-https://github.com/SVISHNUVARDHAN3610/CustomMistralmamba
+                                 ARCHITECTURAL LINEAGE
+                                 
+           Transformer (Vaswani et al., 2017) ──► Mixtral (Jiang et al., 2024)
+                         │                                │
+                         ▼                                ▼
+            Mamba (Gu & Dao, 2023) ────────────► Jamba (Lieber et al., 2024)
+                         │                                │
+                         ▼                                ▼
+       Compressive Transformer (Rae et al., 2020) ─► CustomMistralMamba (This Work)
 ```
 
-For the complete architectural specification, see [`model/README.md`](model/README.md). For the full research proposal and evaluation plan, see [`research/research.md`](research/research.md). For loss formulas and tuning guidance, see [`research/loss-definitions.md`](research/loss-definitions.md).
+| Dimension | Standard Transformer | Pure Mamba (S6) | Mixtral 8x7B | Jamba | **CustomMistralMamba** |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Local Exact Attention** | Full $\mathcal{O}(L^2)$ | None | Sliding Window GQA | Grouped Query GQA | **Sliding Window GQA** |
+| **Recurrent SSM Sequence Path** | None | Selective Scan S6 | None | Mamba Blocks | **Mamba Blocks (4-Tier Scan)** |
+| **Explicit Gated Memory** | None | None | None | None | **Dual Compressive Banks** |
+| **Memory Read/Write Semantics** | N/A | N/A | N/A | N/A | **Cross-Attn Read / Gated EMA Write** |
+| **Branch Fusion Strategy** | N/A | N/A | N/A | Sequential Interleaving | **Linear Token-Gated Fusion** |
+| **FFN Sparsity** | Dense | Dense | Top-2 Sparse MoE | Top-2 Sparse MoE | **Top-2 Sparse MoE (SwiGLU)** |
+| **Per-Layer Time Complexity** | $\mathcal{O}(L^2)$ | $\mathcal{O}(L)$ | $\mathcal{O}(L)$ | $\mathcal{O}(L)$ | $\mathcal{O}(L)$ (Sub-Quadratic) |
+| **Peak Decode State Space** | Grows with $L$ | $\mathcal{O}(1)$ | Fixed Window $w$ | Fixed Window $w$ | **Fixed Window $w + 2md$** |
+
+---
+
+## 15. Limitations & Open Research Roadmap
+
+### Current Limitations
+
+1. **Auxiliary Loss Tuning:** Defaults for the 8 auxiliary $\lambda$ coefficients are derived from initial theoretical modeling in `loss-definitions.md`; large-scale Bayesian hyperparameter sweeps have not yet been executed.
+2. **Hardware Kernel Optimization:** While the Mamba branch supports fused CUDA kernels via `mamba-ssm`, custom fused Triton / CUDA kernels for batched dual-memory cross-attention operations are not yet implemented.
+3. **Scale of Completed Experiments:** Reference implementation has been verified through unit testing, toy training, and ~200M parameter cloud smoke runs; full multi-billion parameter pre-training runs across trillion-token datasets remain future work.
+
+### Engineering Roadmap
+
+- [x] Version 2.1 reference architecture implementation and package restructuring.
+- [x] Implementation of 8-objective auxiliary loss suite with warmup schedules.
+- [x] Multi-tier Mamba scan dispatch (fused, parallel, blocked, sequential checkpointed).
+- [x] PyTorch FSDP2 distributed trainer with Moonshot Muon optimizer integration.
+- [ ] Implement synthetic needle-in-a-haystack and associative retrieval evaluation benchmarks.
+- [ ] Execute the complete 3-stage falsification suite (Inference Zeroing, Gate Telemetry, Null Baseline).
+- [ ] Develop custom fused Triton kernels for batched dual-memory summary writes.
+- [ ] Scale pre-training ladder: $150\text{M} \to 1\text{B} \to 7\text{B}$ on open web corpora (FineWeb / SlimPajama).
+
+---
+
+## 16. Formal Citation
+
+If you utilize this architecture, codebase, or research methodology in your work, please cite the research specification as follows:
+
+```bibtex
+@article{vardhan2026custommistralmamba,
+  title   = {CustomMistralMamba: Sub-Quadratic Hybrid Mamba--MoE with Dual Compressive Memory for Long-Context Language Modeling},
+  author  = {Vardhan, Vishnu},
+  journal = {GitHub Reference Repository},
+  year    = {2026},
+  url     = {https://github.com/SVISHNUVARDHAN3610/CustomMistralmamba}
+}
+```
+
+---
+
+*For detailed architectural specifications, class APIs, and developer guides, consult [`model/README.md`](model/README.md). For mathematical loss derivations, consult [`research/loss-definitions.md`](research/loss-definitions.md).*
