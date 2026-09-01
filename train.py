@@ -47,7 +47,7 @@ from utils.dataset import (
     TokenizedShardProducer,
     verify_tokenizer_vocab,
 )
-from utils.validation import WikiTextCyclicValidator
+from utils.validation import PackedWindowValidator, WikiTextCyclicValidator
 
 torch.set_float32_matmul_precision("high")
 
@@ -227,6 +227,21 @@ def build_optimizers(
     logger.debug("AdamW params: %s", inventory["adamw"])
     logger.debug("Muon params: %s", inventory["muon"] if enable_muon else [])
 
+    # T-H2 advisory: when Muon is active, AdamW handles embeddings and the LM
+    # head. Running both at the same high LR (~1e-3) is risky — Muon's
+    # Newton-Schulz orthogonalisation implicitly scales updates while AdamW on
+    # token embeddings does not. The Gemini review recommends setting
+    # --adam-lr 3e-4 independently. Warn if the user did not override.
+    if enable_muon and adam_lr is None and resolved_adam_lr >= 5e-4:
+        logger.warning(
+            "T-H2: Muon and AdamW are both running at lr=%.3e. "
+            "AdamW on embeddings/LM-head at this LR with small batch sizes "
+            "can cause excessive gradient variance. Consider passing "
+            "--adam-lr 3e-4 to decouple AdamW from the Muon learning rate "
+            "(Gemini training review recommendation).",
+            resolved_adam_lr,
+        )
+
     fused_adam = device.type == "cuda"
     if enable_muon:
         muon_kwargs: dict[str, Any] = {
@@ -313,6 +328,150 @@ def build_optimizers(
     return [adam_optim], False, meta
 
 
+def audit_optimizer_lr(
+    optimizers: list[optim.Optimizer],
+    use_muon: bool,
+    logger: logging.Logger,
+) -> dict[str, Any]:
+    """T-6 fix: read back actual per-group LR from each optimizer after construction.
+
+    The *configured* ``--lr`` / ``--muon-lr`` / ``--adam-lr`` values are passed
+    to the optimizer constructor, but PyTorch's built-in Muon implementation
+    may apply version-specific adjustments (e.g. the ``adjust_lr_fn`` RMS-
+    matching path scales each matrix's effective update by
+    ``0.2 * sqrt(max(A, B))``, but the *stored* ``param_groups[i]['lr']``
+    reflects the base scalar, not the per-matrix product).
+
+    This function captures:
+    1. The actual ``param_groups[i]['lr']`` for every group in every optimizer
+       immediately after construction — before any scheduler step.
+    2. The Muon RMS-matching scale factor for each Muon parameter matrix
+       (``0.2 * sqrt(max(rows, cols))``), so the true effective per-matrix LR
+       can be derived.
+    3. The ratio of max-effective-Muon-LR to AdamW LR, which is the key number
+       that determines whether both optimizer branches are making comparably-
+       scaled updates.
+
+    Everything is returned as a dict (also logged at INFO level) and should be
+    written into the JSONL metrics file as an ``optimizer_audit`` event.
+    """
+    audit: dict[str, Any] = {"groups": []}
+
+    muon_base_lr: float | None = None
+    adam_base_lr: float | None = None
+    muon_scale_factors: list[float] = []
+
+    for opt_idx, opt in enumerate(optimizers):
+        opt_name = "muon" if (use_muon and opt_idx == 0) else "adamw"
+        for grp_idx, group in enumerate(opt.param_groups):
+            actual_lr = float(group["lr"])
+            wd = float(group.get("weight_decay", 0.0))
+            n_params = sum(p.numel() for p in group["params"])
+            n_tensors = len(group["params"])
+
+            group_info: dict[str, Any] = {
+                "optimizer": opt_name,
+                "group_idx": grp_idx,
+                "actual_lr": actual_lr,
+                "weight_decay": wd,
+                "n_tensors": n_tensors,
+                "n_params": n_params,
+            }
+
+            if opt_name == "muon":
+                muon_base_lr = actual_lr
+                # Compute per-matrix RMS-matching scale factors.
+                # adjust_lr_fn='match_rms_adamw' multiplies each matrix update
+                # by 0.2 * sqrt(max(rows, cols)) before applying it.
+                scales = []
+                for p in group["params"]:
+                    if p.ndim == 2:
+                        rows, cols = p.shape
+                        scale = 0.2 * math.sqrt(max(rows, cols))
+                        scales.append(scale)
+                        muon_scale_factors.append(scale)
+                if scales:
+                    group_info["muon_rms_scale_min"] = min(scales)
+                    group_info["muon_rms_scale_max"] = max(scales)
+                    group_info["muon_rms_scale_mean"] = sum(scales) / len(scales)
+                    group_info["muon_effective_lr_min"] = actual_lr * min(scales)
+                    group_info["muon_effective_lr_max"] = actual_lr * max(scales)
+            else:
+                if adam_base_lr is None:
+                    adam_base_lr = actual_lr
+
+            audit["groups"].append(group_info)
+
+    # Summary scalars: the numbers that matter for diagnosing LR balance.
+    audit["muon_base_lr"] = muon_base_lr
+    audit["adam_base_lr"] = adam_base_lr
+    if muon_base_lr is not None and adam_base_lr is not None and adam_base_lr > 0:
+        if muon_scale_factors:
+            mean_scale = sum(muon_scale_factors) / len(muon_scale_factors)
+            max_scale = max(muon_scale_factors)
+            audit["muon_mean_effective_lr"] = muon_base_lr * mean_scale
+            audit["muon_max_effective_lr"] = muon_base_lr * max_scale
+            audit["effective_lr_ratio_mean"] = (muon_base_lr * mean_scale) / adam_base_lr
+            audit["effective_lr_ratio_max"] = (muon_base_lr * max_scale) / adam_base_lr
+            logger.info(
+                "T-6 optimizer LR audit:\n"
+                "  Muon base lr=%.3e | RMS-match scale mean=%.2f max=%.2f\n"
+                "  Muon effective lr: mean=%.3e  max=%.3e\n"
+                "  AdamW base lr=%.3e\n"
+                "  Effective LR ratio (Muon/AdamW): mean=%.2fx  max=%.2fx\n"
+                "  NOTE: ratio >> 1 means Muon matrices get proportionally larger\n"
+                "  updates than AdamW (embeddings/LM-head). Ideal range: 1-5x.\n"
+                "  If > 10x, reduce --muon-lr or increase --adam-lr.",
+                muon_base_lr,
+                mean_scale,
+                max_scale,
+                muon_base_lr * mean_scale,
+                muon_base_lr * max_scale,
+                adam_base_lr,
+                audit["effective_lr_ratio_mean"],
+                audit["effective_lr_ratio_max"],
+            )
+        else:
+            logger.info(
+                "T-6 optimizer LR audit: Muon base lr=%.3e | AdamW base lr=%.3e "
+                "(no 2D Muon matrices found; RMS scale not computed)",
+                muon_base_lr,
+                adam_base_lr,
+            )
+    elif adam_base_lr is not None:
+        logger.info(
+            "T-6 optimizer LR audit: AdamW-only mode | base lr=%.3e",
+            adam_base_lr,
+        )
+
+    return audit
+
+
+def _per_group_grad_norms(
+    optimizers: list[optim.Optimizer],
+    use_muon: bool,
+) -> dict[str, float]:
+    """Compute per-optimizer-group gradient L2 norms (T-6: per-group observability).
+
+    Returns a flat dict with keys like ``muon_g0_grad_norm``,
+    ``adamw_g0_grad_norm``, etc.  Called during the metrics flush window so
+    gradients are still live (before zero_grad of the *next* iteration).
+
+    Cost: one sqrt per group (already paid for clipping); the per-param
+    norm-squared accumulation is the only extra work and is O(params).
+    """
+    result: dict[str, float] = {}
+    for opt_idx, opt in enumerate(optimizers):
+        opt_name = "muon" if (use_muon and opt_idx == 0) else "adamw"
+        for grp_idx, group in enumerate(opt.param_groups):
+            norm_sq = 0.0
+            for p in group["params"]:
+                if p.grad is not None:
+                    norm_sq += float(p.grad.detach().float().norm().item() ** 2)
+            result[f"{opt_name}_g{grp_idx}_grad_norm"] = math.sqrt(norm_sq)
+    return result
+
+
 def align_tokens_per_shard(tokens_per_shard: int, seq_len: int) -> int:
     """Round down so shard boundaries never drop partial sequences."""
     chunk = seq_len + 1  # MmapShardDataset uses seq_len+1 for input/label pairs
@@ -378,6 +537,72 @@ class RollingAverage:
         if not self._values:
             return None
         return sum(self._values) / len(self._values)
+
+
+class LossSpikeGuard:
+    """EMA-based finite magnitude spike guard (T-C2 fix, restored from 821fec3).
+
+    The original training loop only skipped updates for non-finite losses
+    (NaN/Inf). But large finite associative auxiliary blowups (e.g. 4e19 at
+    step 5,400) are fully finite and pass ``torch.isfinite()`` — they still
+    flowed through backward and clipping, overwriting Adam/Muon momentum
+    buffers entirely with the auxiliary-error direction.
+
+    This guard maintains an exponential moving average (EMA) of the total loss
+    over ``warmup_steps`` good steps before activating. Once active, any step
+    whose loss exceeds ``multiplier * ema`` is flagged as a spike and the
+    caller should skip ``opt.step()`` / ``sched.step()`` for that iteration.
+    The EMA is only updated on non-spike (accepted) steps so one bad step
+    cannot poison the baseline.
+    """
+
+    def __init__(
+        self,
+        warmup_steps: int = 100,
+        alpha: float = 0.98,
+        multiplier: float = 100.0,
+    ) -> None:
+        self._warmup_steps = max(1, warmup_steps)
+        self._alpha = alpha
+        self._multiplier = multiplier
+        self._ema: float | None = None
+        self._good_steps = 0
+
+    def is_spike(self, loss: float) -> bool:
+        """Return True if ``loss`` is a finite magnitude spike.
+
+        Updates the EMA on non-spike steps. Should be called *after* checking
+        ``math.isfinite(loss)``; pass only finite values here.
+        """
+        if not math.isfinite(loss):
+            # Non-finite: always spike; let the existing guard handle it.
+            return True
+
+        # Warmup phase: accept all steps and build the EMA baseline.
+        if self._good_steps < self._warmup_steps:
+            if self._ema is None:
+                self._ema = loss
+            else:
+                self._ema = self._alpha * self._ema + (1.0 - self._alpha) * loss
+            self._good_steps += 1
+            return False
+
+        # Active phase: flag if loss exceeds multiplier * EMA.
+        assert self._ema is not None
+        if loss > self._multiplier * self._ema:
+            return True
+
+        # Accept this step and update EMA.
+        self._ema = self._alpha * self._ema + (1.0 - self._alpha) * loss
+        return False
+
+    @property
+    def ema(self) -> float | None:
+        return self._ema
+
+    @property
+    def is_warmed_up(self) -> bool:
+        return self._good_steps >= self._warmup_steps
 
 
 class StepProgressWatchdog:
@@ -476,6 +701,7 @@ def _weighted_term_tensors(
     return {
         "recon_w": cfg.lambda_recon * aux.recon,
         "assoc_w": cfg.lambda_assoc * assoc_scale * aux.assoc,
+        "assoc_norm_w": cfg.lambda_assoc_norm * aux.assoc_norm,
         "gate_w": cfg.lambda_gate * aux.gate,
         "read_w": cfg.lambda_read * aux.read,
         "fusion_w": cfg.lambda_fusion * aux.fusion,
@@ -497,6 +723,15 @@ def _as_flush_scalar(value: Any, device: torch.device) -> torch.Tensor:
     if isinstance(value, torch.Tensor):
         return value.detach().to(device=device, dtype=torch.float32).reshape(())
     return torch.tensor(value, device=device, dtype=torch.float32)
+
+
+def _mean_metric_sums(
+    sums: dict[str, torch.Tensor], count: int
+) -> dict[str, torch.Tensor]:
+    """Average equal-token-count microbatch metric sums without host sync."""
+    if count < 1:
+        raise ValueError("Metric reduction requires at least one microbatch.")
+    return {name: value / count for name, value in sums.items()}
 
 
 def _weighted_terms(
@@ -541,6 +776,7 @@ def _non_finite_diagnosis(
         for name in (
             "recon",
             "assoc",
+            "assoc_norm",
             "gate",
             "read",
             "fusion",
@@ -1186,6 +1422,18 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         logger=logger,
     )
 
+    # T-6 fix: audit actual post-construction LR for every param group.
+    # This captures what PyTorch *actually stored* after any version-specific
+    # Muon adjust_lr_fn processing — not just the configured --lr values.
+    _lr_audit = audit_optimizer_lr(optimizers, use_muon, logger)
+    if jsonl_path is not None:
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with jsonl_path.open("a", encoding="utf-8") as _f:
+            _f.write(
+                json.dumps({"event": "optimizer_audit", "step": 0, **_lr_audit})
+                + "\n"
+            )
+
     validator: WikiTextCyclicValidator | None = None
     if not args.no_validation:
         try:
@@ -1212,6 +1460,37 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 "Failed to initialize WikiTextCyclicValidator; disabling validation"
             )
             validator = None
+
+    # T-3 fix: initialize a packed-window validator that evaluates on a fixed
+    # continuous token stream (same semantics as training) for a CE that is
+    # directly comparable to training CE.  Falls back to None on failure so
+    # training is never blocked by a dataset download error.
+    packed_validator: PackedWindowValidator | None = None
+    if not args.no_validation:
+        try:
+            packed_validator = PackedWindowValidator(
+                producer.tokenizer,
+                seq_len=args.seq_len,
+                num_texts=200,
+                batch_size=args.val_batch_size,
+                dataset_config=args.val_dataset_config,
+                bos_id=cfg.bos_token_id,
+                eos_id=cfg.eos_token_id,
+            )
+            logger.info(
+                "PackedWindowValidator initialized | dataset=Salesforce/wikitext/%s "
+                "stream_len=%d windows=%d (T-3 fix: packed CE comparable to training CE)",
+                args.val_dataset_config,
+                packed_validator._stream_len,
+                len(packed_validator._dataset),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to initialize PackedWindowValidator; packed validation disabled. "
+                "Convergence monitoring will rely only on row-based WikiText validation.",
+                exc_info=True,
+            )
+            packed_validator = None
 
     warmup_steps = _resolve_warmup_steps(args.warmup_steps, args.max_steps)
     lr_lambda = _build_lr_lambda(warmup_steps, args.max_steps, args.min_lr_ratio)
@@ -1257,6 +1536,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     stop_event = threading.Event()
     producer_thread: threading.Thread | None = None
     ce_smooth = RollingAverage(args.smooth_window)
+    # T-C2 fix: EMA-based finite spike guard. Skips optimizer/scheduler updates
+    # when total loss exceeds 100× the running EMA (active after 100 warmup steps).
+    spike_guard = LossSpikeGuard(warmup_steps=100, alpha=0.98, multiplier=100.0)
     # GPU-side metric accumulators: per-step scalars are summed on-device and
     # pulled to the host with ONE transfer every --log-interval steps instead
     # of ~25 blocking .item() round-trips per step (each would synchronize
@@ -1293,6 +1575,16 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         )
         producer_thread.start()
         logger.info("Shard producer started | cache_dir=%s", args.cache_dir)
+
+        accum = max(1, args.gradient_accumulation_steps)
+        if accum > 1:
+            logger.info(
+                "Gradient accumulation enabled: %d micro-batches per optimizer step "
+                "(effective batch=%d sequences = %d tokens)",
+                accum,
+                args.batch_size * accum,
+                args.batch_size * accum * args.seq_len,
+            )
 
         while global_step < args.max_steps:
             shard_name = f"shard_{current_shard_idx:06d}.bin"
@@ -1350,7 +1642,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
             )
 
             shard_fully_consumed = True
-            for batches_in_shard, (input_ids, labels) in enumerate(dataloader):
+            batches_iter = iter(dataloader)
+            batches_seen = 0
+            while True:
                 if global_step >= args.max_steps:
                     # Hitting max-steps mid-shard: leave the shard unmarked
                     # and the cursor where it is so a later --max-steps
@@ -1359,59 +1653,133 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     shard_fully_consumed = False
                     break
 
-                if step_window_started is None:
-                    step_window_started = time.perf_counter()
-                watchdog.progress(global_step, "input_transfer")
-                input_ids = input_ids.to(device, non_blocking=True)
-                labels = labels.to(device, non_blocking=True)
-                # The min/max reductions force a device sync each; shards are
-                # immutable memmaps, so checking shard starts plus a periodic
-                # sample catches corrupt files / vocab drift at ~1/256th of
-                # the pipeline cost. --validate-token-interval 1 restores
-                # every-batch checking.
-                if batches_in_shard == 0 or (
-                    args.validate_token_interval > 0
-                    and global_step % args.validate_token_interval == 0
-                ):
-                    validate_token_batch(
-                        input_ids,
-                        cfg.vocab_size,
-                        labels=labels,
-                        ignore_index=cfg.label_ignore_index,
-                    )
+                # Collect `accum` micro-batches for one optimizer step (T-H1)
+                micro_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+                while len(micro_inputs) < accum:
+                    try:
+                        input_ids, labels = next(batches_iter)
+                    except StopIteration:
+                        break
+                    input_ids = input_ids.to(device, non_blocking=True)
+                    labels = labels.to(device, non_blocking=True)
+                    # Shards are immutable memmaps: first batch of every shard
+                    # plus the interval cadence catches corrupt files / vocab
+                    # drift at ~1/Nth of the pipeline cost (each check syncs).
+                    if batches_seen == 0 or (
+                        args.validate_token_interval > 0
+                        and global_step % args.validate_token_interval == 0
+                    ):
+                        validate_token_batch(
+                            input_ids,
+                            cfg.vocab_size,
+                            labels=labels,
+                            ignore_index=cfg.label_ignore_index,
+                        )
+                    micro_inputs.append((input_ids, labels))
+                    batches_seen += 1
+
+                if not micro_inputs:
+                    break  # shard exhausted cleanly
+                if len(micro_inputs) < accum:
+                    # Partial tail at shard end: drop it rather than apply a
+                    # mis-scaled update (<= accum-1 batches lost per boundary).
+                    break
 
                 for opt in optimizers:
                     opt.zero_grad(set_to_none=True)
 
-                watchdog.progress(global_step, "forward")
-                with torch.autocast(
-                    device_type=device.type,
-                    dtype=amp_dtype,
-                    enabled=use_amp,
-                    # Checkpoint replay must not depend on casts cached by a
-                    # sibling internal sequence chunk.
-                    cache_enabled=not args.gradient_checkpointing,
-                ):
-                    outputs = model(
-                        input_ids=input_ids,
-                        labels=labels,
-                        training_step=global_step,
-                        max_training_steps=args.max_steps,
-                    )
-                assert outputs.loss is not None
+                if step_window_started is None:
+                    step_window_started = time.perf_counter()
 
-                # Non-finiteness is handled entirely ON-DEVICE (counters +
-                # masking in the metric accumulation below, plus grad
-                # sanitation after clipping). A NaN/Inf loss or gradient no
-                # longer branches on the host mid-step: branching on a CUDA
-                # scalar (.item() / __bool__ / error_if_nonfinite=True) would
-                # force a stream-syncing D2H copy EVERY step. The cost is a
-                # wasted backward pass on an already-failed step.
-                watchdog.progress(global_step, "backward")
-                if use_fp16_scaler:
-                    scaler.scale(outputs.loss).backward()
-                else:
-                    outputs.loss.backward()
+                step_metric_sums: dict[str, torch.Tensor] = {}
+                step_gate_sums: dict[str, torch.Tensor] = {}
+                schedule_scales: dict[str, float] = {}
+
+                for micro_idx, (m_ids, m_labels) in enumerate(micro_inputs):
+                    watchdog.progress(
+                        global_step,
+                        f"forward_micro_{micro_idx + 1}/{len(micro_inputs)}",
+                    )
+                    with torch.autocast(
+                        device_type=device.type,
+                        dtype=amp_dtype,
+                        enabled=use_amp,
+                        # Checkpoint replay must not depend on casts cached by a
+                        # sibling internal sequence chunk.
+                        cache_enabled=not args.gradient_checkpointing,
+                    ):
+                        outputs = model(
+                            input_ids=m_ids,
+                            labels=m_labels,
+                            training_step=global_step,
+                            max_training_steps=args.max_steps,
+                        )
+                    assert outputs.loss is not None
+                    aux = outputs.auxiliary_losses
+                    assert aux is not None
+                    weighted_t = _weighted_term_tensors(
+                        model, outputs, global_step, args.max_steps
+                    )
+                    micro_scalars: dict[str, Any] = {
+                        "loss": outputs.loss,
+                        "ce_loss": (
+                            outputs.ce_loss
+                            if outputs.ce_loss is not None
+                            else outputs.loss.new_zeros(())
+                        ),
+                        "router_aux_loss": (
+                            outputs.router_aux_loss
+                            if outputs.router_aux_loss is not None
+                            else outputs.loss.new_zeros(())
+                        ),
+                        "router_z_loss": (
+                            outputs.router_z_loss
+                            if outputs.router_z_loss is not None
+                            else outputs.loss.new_zeros(())
+                        ),
+                    }
+                    for name in (
+                        "recon",
+                        "assoc",
+                        "assoc_norm",
+                        "gate",
+                        "read",
+                        "fusion",
+                        "expert",
+                        "ssm",
+                        "slot",
+                    ):
+                        micro_scalars[name] = getattr(aux, name)
+                    for name, value in weighted_t.items():
+                        if isinstance(value, torch.Tensor):
+                            micro_scalars[name] = value
+                        else:
+                            schedule_scales[name] = float(value)
+                    for name, value in micro_scalars.items():
+                        scalar = _as_flush_scalar(value, outputs.loss.device)
+                        step_metric_sums[name] = step_metric_sums.get(name, 0) + scalar
+                    for name, value in (outputs.gate_stats or {}).items():
+                        scalar = _as_flush_scalar(value, outputs.loss.device)
+                        step_gate_sums[name] = step_gate_sums.get(name, 0) + scalar
+
+                    # Non-finiteness is handled entirely ON-DEVICE (counters +
+                    # masking in the metric accumulation below, plus grad
+                    # sanitation after clipping).
+                    watchdog.progress(
+                        global_step,
+                        f"backward_micro_{micro_idx + 1}/{len(micro_inputs)}",
+                    )
+                    micro_loss = outputs.loss / len(micro_inputs)
+                    if use_fp16_scaler:
+                        scaler.scale(micro_loss).backward()
+                    else:
+                        micro_loss.backward()
+
+                micro_count = len(micro_inputs)
+                scalars = _mean_metric_sums(step_metric_sums, micro_count)
+                gate_stats = _mean_metric_sums(step_gate_sums, micro_count)
+                assoc_scale_sum += schedule_scales.get("assoc_scale", 0.0)
+                expert_scale_sum += schedule_scales.get("expert_scale", 0.0)
 
                 watchdog.progress(global_step, "optimizer")
                 # Unscale before clipping so max_grad_norm applies to true
@@ -1419,21 +1787,11 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 if use_fp16_scaler:
                     for opt in optimizers:
                         scaler.unscale_(opt)
-                # No .item(): the raw norm tensor feeds the metric vector,
-                # and non-finite norms surface via the flush-time counter.
-                # (Exception: --grad-nan-guard=strict deliberately reads it
-                # every step — see below.)
                 grad_norm = clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                scalars["grad_norm"] = grad_norm
+
                 allow_update = True
                 if args.grad_nan_guard == "strict":
-                    # The ONE deliberate per-step D2H sync in this mode
-                    # (bool() on a CUDA scalar) buys TRUE skip semantics: a
-                    # bad-grad step executes no optimizer update, no scheduler
-                    # tick, and mutates no Adam/Muon moments. This is exactly
-                    # what 'sanitize' approximates asynchronously — pick this
-                    # mode only if the per-step sync stall is acceptable.
-                    # Redundant but harmless on the fp16 GradScaler path,
-                    # which already syncs inside scaler.step().
                     allow_update = bool(torch.isfinite(grad_norm))
                     if not allow_update:
                         logger.error(
@@ -1460,25 +1818,53 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                                     + "\n"
                                 )
                 elif args.grad_nan_guard == "sanitize" and not use_fp16_scaler:
-                    # A non-finite norm makes clip's coef NaN, which spreads
-                    # NaN across EVERY gradient (norm-bad <=> some grad bad);
-                    # zero them so the optimizer update stays finite instead
-                    # of permanently poisoning Adam/Muon moments (M10
-                    # protection, now async). Cost: one read+write pass over
-                    # all grads per step (~sub-ms at production scale) — the
-                    # price of a hard guarantee without a host branch. The
-                    # GradScaler path must NOT be pre-sanitized: scaler.step()
-                    # only skips the update and shrinks the scale when it
-                    # still sees inf/nan itself.
                     for p in model.parameters():
                         if p.grad is not None:
                             torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
 
+                # T-C2 fix: EMA-based finite spike guard.  The existing guards
+                # above catch non-finite losses/gradients, but large finite
+                # auxiliary blowups (e.g. 4e19 at step 5,400) pass isfinite()
+                # and corrupt Adam/Muon momentum states.  One deliberate D2H
+                # sync per step for the loss scalar is justified: preventing a
+                # poisoned optimizer update costs far more steps to recover from
+                # than the sync overhead.  Only applied when allow_update is
+                # still True (non-finite guard already did its job otherwise).
+                if allow_update:
+                    _loss_scalar = float(scalars["loss"].detach().item())
+                    if spike_guard.is_spike(_loss_scalar):
+                        allow_update = False
+                        logger.warning(
+                            "Finite magnitude spike at step %d: loss=%.6g "
+                            "EMA=%.6g ratio=%.1fx — optimizer/scheduler "
+                            "update SKIPPED (T-C2 spike guard)",
+                            global_step,
+                            _loss_scalar,
+                            spike_guard.ema or float("nan"),
+                            (
+                                _loss_scalar / spike_guard.ema
+                                if spike_guard.ema
+                                else float("nan")
+                            ),
+                        )
+                        if jsonl_path is not None:
+                            with jsonl_path.open("a", encoding="utf-8") as f:
+                                f.write(
+                                    json.dumps(
+                                        {
+                                            "event": "finite_spike_skipped",
+                                            "step": global_step,
+                                            "shard_idx": current_shard_idx,
+                                            "loss": _loss_scalar,
+                                            "ema": spike_guard.ema,
+                                        }
+                                    )
+                                    + "\n"
+                                )
+
                 if allow_update:
                     for i, opt in enumerate(optimizers):
                         if use_fp16_scaler:
-                            # Internally no-ops when unscaled grads contain
-                            # inf/nan; update() then shrinks the scale.
                             scaler.step(opt)
                         else:
                             opt.step()
@@ -1487,62 +1873,6 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     for sched in schedulers:
                         sched.step()
                 watchdog.progress(global_step, "metrics")
-                # When strict skipped the update, the NaN grads are freed by
-                # the zero_grad(set_to_none=True) at the top of the next
-                # iteration — they never reach an optimizer or accumulate.
-
-                aux = outputs.auxiliary_losses
-                assert aux is not None
-
-                # ---- metrics: accumulate on-device, transfer on flush ------
-                # Every logged scalar (losses, aux terms, weighted terms,
-                # gate stats, schedule scales) is summed into one fp32 vector
-                # on the compute device. Nothing here synchronizes; the only
-                # host readback happens in the flush below, once per
-                # --log-interval steps.
-                weighted_t = _weighted_term_tensors(
-                    model, outputs, global_step, args.max_steps
-                )
-                scalars: dict[str, Any] = {
-                    "loss": outputs.loss,
-                    "ce_loss": (
-                        outputs.ce_loss
-                        if outputs.ce_loss is not None
-                        else outputs.loss.new_zeros(())
-                    ),
-                    "router_aux_loss": (
-                        outputs.router_aux_loss
-                        if outputs.router_aux_loss is not None
-                        else outputs.loss.new_zeros(())
-                    ),
-                    "router_z_loss": (
-                        outputs.router_z_loss
-                        if outputs.router_z_loss is not None
-                        else outputs.loss.new_zeros(())
-                    ),
-                    "grad_norm": grad_norm,
-                }
-                # Schedule scales are pure-Python values: averaging them
-                # host-side avoids two device-tensor constructions (H2D)
-                # every step for numbers the GPU never needs.
-                assoc_scale_sum += weighted_t["assoc_scale"]
-                expert_scale_sum += weighted_t["expert_scale"]
-                for name in (
-                    "recon",
-                    "assoc",
-                    "gate",
-                    "read",
-                    "fusion",
-                    "expert",
-                    "ssm",
-                    "slot",
-                ):
-                    scalars[name] = getattr(aux, name)
-                for name, value in weighted_t.items():
-                    if isinstance(value, torch.Tensor):
-                        scalars[name] = value
-
-                gate_stats = outputs.gate_stats or {}
                 # Schema is static for a fixed config; reuse the cached
                 # name lists instead of rebuilding them every step (the
                 # equality check below still guards against drift).
@@ -1619,6 +1949,19 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         "step_time_s": step_time_s,
                         "gate_stats": dict(zip(metric_gate_names, values[n_main:])),
                     }
+                    # T-6 fix: log actual per-group LRs from scheduler (not just
+                    # group-0) and per-group gradient norms for every optimizer
+                    # group so the Muon/AdamW effective-LR balance is visible in
+                    # every metrics record.
+                    for _oi, (_opt, _sched) in enumerate(zip(optimizers, schedulers)):
+                        _oname = "muon" if (use_muon and _oi == 0) else "adamw"
+                        _sched_lrs = _sched.get_last_lr()
+                        for _gi, _glr in enumerate(_sched_lrs):
+                            record[f"{_oname}_g{_gi}_sched_lr"] = float(_glr)
+                    # Per-group gradient norms (O(params) extra work, only at flush).
+                    record["per_group_grad_norms"] = _per_group_grad_norms(
+                        optimizers, use_muon
+                    )
                     bad_names = {
                         name: int(cnt)
                         for name, cnt in list(
@@ -1663,6 +2006,27 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     expert_scale_sum = 0.0
                     step_window_started = None
 
+                    # T-6 fix: periodic optimizer LR audit to track actual per-group
+                    # LRs throughout training (not just at startup).
+                    if (
+                        args.lr_audit_interval > 0
+                        and global_step % args.lr_audit_interval == 0
+                        and global_step > 0
+                    ):
+                        _periodic_audit = audit_optimizer_lr(optimizers, use_muon, logger)
+                        if jsonl_path is not None:
+                            with jsonl_path.open("a", encoding="utf-8") as f:
+                                f.write(
+                                    json.dumps(
+                                        {
+                                            "event": "optimizer_audit",
+                                            "step": global_step,
+                                            **_periodic_audit,
+                                        }
+                                    )
+                                    + "\n"
+                                )
+
                     # JSONL records and console lines are emitted per flush
                     # window (means over --log-interval steps), matching the
                     # single-transfer cadence rather than per-step.
@@ -1693,6 +2057,35 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                                 f.write(json.dumps(val_record) + "\n")
 
                         logger.info(_format_val_log_line(val_record))
+                        watchdog.progress(global_step, "metrics")
+
+                    # T-3 fix: run packed-window validation alongside the row-based
+                    # validator. packed_val_ce is directly comparable to train CE.
+                    if (
+                        packed_validator is not None
+                        and args.val_interval > 0
+                        and global_step % args.val_interval == 0
+                    ):
+                        watchdog.progress(global_step, "packed_validation")
+                        packed_val_record = packed_validator.evaluate(
+                            model,
+                            device=device,
+                            global_step=global_step,
+                            max_training_steps=args.max_steps,
+                            use_amp=use_amp,
+                            amp_dtype=amp_dtype,
+                            ignore_index=cfg.label_ignore_index,
+                        )
+                        record["packed_val_ce"] = packed_val_record["packed_val_ce"]
+                        if jsonl_path is not None:
+                            with jsonl_path.open("a", encoding="utf-8") as f:
+                                f.write(json.dumps(packed_val_record) + "\n")
+                        logger.info(
+                            "packed_val | step=%d packed_val_ce=%.4f windows=%d",
+                            global_step,
+                            packed_val_record["packed_val_ce"],
+                            packed_val_record["packed_val_windows"],
+                        )
                         watchdog.progress(global_step, "metrics")
 
                     if jsonl_path is not None:
@@ -1917,6 +2310,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=int, default=100_000)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        "--grad-accum-steps",
+        dest="gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Number of micro-batches to accumulate before performing an "
+        "optimizer step (T-H1: target effective batch >= 32k tokens, "
+        "e.g. 4 with batch-size 8 and seq-len 1024). Default: 1.",
+    )
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-interval", type=int, default=10)
@@ -1960,6 +2363,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--smooth-window", type=int, default=50, help="Rolling CE mean window."
+    )
+    parser.add_argument(
+        "--lr-audit-interval",
+        type=int,
+        default=0,
+        help="T-6: emit a full optimizer_audit JSONL event every N steps "
+        "(actual per-group LRs, Muon RMS scales, effective LR ratio). "
+        "0 = startup-only audit (default). Recommended: 1000.",
     )
     parser.add_argument("--num-workers", type=int, default=2)
 

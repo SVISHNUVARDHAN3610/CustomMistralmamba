@@ -128,6 +128,11 @@ class HybridModel(nn.Module):
             persistent=True,
         )
         self.register_buffer(
+            "assoc_norm_gammas",
+            torch.full((config.num_layers,), float(config.assoc_norm_gamma_init)),
+            persistent=True,
+        )
+        self.register_buffer(
             "ssm_gammas_calibrated",
             torch.tensor(0.0),
             persistent=True,
@@ -145,6 +150,7 @@ class HybridModel(nn.Module):
         if self._ssm_calibration_done():
             for i, layer in enumerate(self.layers):
                 layer.ssm_norm_gamma = self.ssm_norm_gammas[i]
+                layer.assoc_norm_gamma = self.assoc_norm_gammas[i]
             return
 
         embed_weight = local_dtensor(self.embed_tokens.weight)
@@ -169,10 +175,53 @@ class HybridModel(nn.Module):
             self.ssm_norm_gammas[i] = torch.quantile(norms, 0.9)
             layer.ssm_norm_gamma = self.ssm_norm_gammas[i]
 
+            if layer.use_dual_memory and self.config.use_auxiliary_losses:
+                # Calibrate the assoc bank gamma from a dummy write: init the
+                # bank from its (learned) init_state, write a random chunk,
+                # and take the q-th percentile of the post-write state norm.
+                a_mem, s_mem = layer.init_memory_state(batch_size, device, dtype)
+                buf_a = torch.randn(
+                    batch_size,
+                    seq_len,
+                    self.config.hidden_size,
+                    device=device,
+                    dtype=dtype,
+                )
+                buf_s = torch.randn(
+                    batch_size,
+                    seq_len,
+                    self.config.hidden_size,
+                    device=device,
+                    dtype=dtype,
+                )
+                new_a, _, _, new_s, _, _ = batched_dual_memory_write(
+                    layer.attn_memory_bank,
+                    layer.state_memory_bank,
+                    buf_a,
+                    buf_s,
+                    a_mem,
+                    s_mem,
+                    attention_mask=None,
+                    fast_path=False,
+                )
+                norms_a = new_a.float().pow(2).mean(dim=(1, 2))
+                norms_s = new_s.float().pow(2).mean(dim=(1, 2))
+                q = self.config.assoc_norm_gamma_quantile
+                gamma = max(
+                    torch.quantile(norms_a, q).item(),
+                    torch.quantile(norms_s, q).item(),
+                )
+                self.assoc_norm_gammas[i] = max(gamma, self.assoc_norm_gammas[i].item())
+            else:
+                self.assoc_norm_gammas[i] = 0.0
+            layer.assoc_norm_gamma = self.assoc_norm_gammas[i]
+
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.broadcast(self.ssm_norm_gammas, src=0)
+            torch.distributed.broadcast(self.assoc_norm_gammas, src=0)
             for i, layer in enumerate(self.layers):
                 layer.ssm_norm_gamma = self.ssm_norm_gammas[i]
+                layer.assoc_norm_gamma = self.assoc_norm_gammas[i]
 
         self.ssm_gammas_calibrated.fill_(1.0)
 
@@ -377,6 +426,7 @@ class HybridModel(nn.Module):
                 expert=aux_sums.expert + layer_aux.expert,
                 ssm=aux_sums.ssm + layer_aux.ssm,
                 slot=aux_sums.slot + layer_aux.slot,
+                assoc_norm=aux_sums.assoc_norm + layer_aux.assoc_norm,
             )
             if use_cache:
                 present_key_values.append(present_kv)
@@ -393,6 +443,7 @@ class HybridModel(nn.Module):
             expert=aux_sums.expert / n_layers,
             ssm=aux_sums.ssm / n_layers,
             slot=aux_sums.slot / n_layers,
+            assoc_norm=aux_sums.assoc_norm / n_layers,
         )
         aux_breakdown = HybridAuxiliaryLossBreakdown(
             recon=aux_avg.recon,
@@ -403,6 +454,7 @@ class HybridModel(nn.Module):
             expert=aux_avg.expert,
             ssm=aux_avg.ssm,
             slot=aux_avg.slot,
+            assoc_norm=aux_avg.assoc_norm,
         )
         return (
             hidden_states,
@@ -687,6 +739,7 @@ class HybridForCausalLM(nn.Module):
             + cfg.lambda_expert * expert_scale * aux.expert
             + cfg.lambda_ssm * aux.ssm
             + cfg.lambda_slot * aux.slot
+            + cfg.lambda_assoc_norm * aux.assoc_norm
         )
 
     def forward(
@@ -912,6 +965,7 @@ class HybridForCausalLM(nn.Module):
                 expert=aux_weighted.expert + chunk_aux.expert * chunk_len,
                 ssm=aux_weighted.ssm + chunk_aux.ssm * chunk_len,
                 slot=aux_weighted.slot + chunk_aux.slot * chunk_len,
+                assoc_norm=aux_weighted.assoc_norm + chunk_aux.assoc_norm * chunk_len,
             )
             for key, val in gate_stats.items():
                 if key not in gate_stat_sums:
@@ -938,6 +992,7 @@ class HybridForCausalLM(nn.Module):
             expert=aux_weighted.expert / chunk_tw,
             ssm=aux_weighted.ssm / chunk_tw,
             slot=aux_weighted.slot / chunk_tw,
+            assoc_norm=aux_weighted.assoc_norm / chunk_tw,
         )
 
         loss = None

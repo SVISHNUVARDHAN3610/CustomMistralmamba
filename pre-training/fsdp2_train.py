@@ -1389,6 +1389,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     for name in (
                         "recon",
                         "assoc",
+                        "assoc_norm",
                         "gate",
                         "read",
                         "fusion",
@@ -1859,6 +1860,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument(
         "--grad-accum-steps",
+        "--gradient-accumulation-steps",
+        dest="grad_accum_steps",
         type=int,
         default=1,
         help="Micro-batches per optimizer step (FSDP2 no-sync accumulation: "

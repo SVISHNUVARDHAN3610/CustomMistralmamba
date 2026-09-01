@@ -28,12 +28,21 @@ class HybridLayerAuxLosses:
     expert: Tensor
     ssm: Tensor
     slot: Tensor
+    assoc_norm: Tensor
 
     @staticmethod
     def zeros(device: torch.device, dtype: torch.dtype) -> HybridLayerAuxLosses:
         z = torch.tensor(0.0, device=device, dtype=dtype)
         return HybridLayerAuxLosses(
-            recon=z, assoc=z, gate=z, read=z, fusion=z, expert=z, ssm=z, slot=z
+            recon=z,
+            assoc=z,
+            gate=z,
+            read=z,
+            fusion=z,
+            expert=z,
+            ssm=z,
+            slot=z,
+            assoc_norm=z,
         )
 
 
@@ -49,6 +58,7 @@ class HybridAuxiliaryLossBreakdown:
     expert: Tensor | None = None
     ssm: Tensor | None = None
     slot: Tensor | None = None
+    assoc_norm: Tensor | None = None
 
 
 def _aux_loss_schedule(
@@ -73,23 +83,47 @@ def write_gate_entropy_loss(
     gate: Tensor,
     eps: float = 1e-6,
     row_mask: Tensor | None = None,
+    saturation_threshold: float = 0.05,
+    saturation_penalty_weight: float = 1.0,
 ) -> Tensor:
-    """Negative binary entropy of write gates (encourage non-saturated gates).
+    """Entropy regularizer plus a soft barrier against saturated write gates.
 
     ``gate`` is typically ``[B, memory_size, H]``. When ``row_mask`` is provided
     (``[B]`` bool, True = include), rows with no valid write tokens are skipped
     so all-padding chunks contribute a finite zero instead of poisoning the mean.
+
+    The memory update is ``gate * old + (1 - gate) * candidate``: values near
+    one saturate toward retention and values near zero saturate toward overwrite.
+    Negative entropy encourages an interior solution, while the normalized
+    quadratic barrier supplies a direct penalty once either tail crosses the
+    configured threshold. Setting the threshold or weight to zero disables the
+    barrier and preserves the original entropy-only behavior.
     """
+    if not 0.0 <= saturation_threshold < 0.5:
+        raise ValueError("saturation_threshold must be in [0, 0.5).")
+    if saturation_penalty_weight < 0.0:
+        raise ValueError("saturation_penalty_weight must be non-negative.")
+
     # FP16: clamp before log to avoid NaNs when gates saturate or drift slightly.
     gate_f = _promote_fp32(gate).clamp(min=eps, max=1.0 - eps)
     ent = -(gate_f * torch.log(gate_f) + (1.0 - gate_f) * torch.log(1.0 - gate_f))
-    per_row = ent.reshape(ent.size(0), -1).mean(dim=-1)
+    per_row_loss = -ent.reshape(ent.size(0), -1).mean(dim=-1)
+    if saturation_threshold > 0.0 and saturation_penalty_weight > 0.0:
+        scale = saturation_threshold
+        low_excess = torch.relu(scale - gate_f) / scale
+        high_excess = torch.relu(gate_f - (1.0 - scale)) / scale
+        saturation = (low_excess.square() + high_excess.square()).reshape(
+            gate_f.size(0), -1
+        )
+        per_row_loss = per_row_loss + saturation_penalty_weight * saturation.mean(
+            dim=-1
+        )
     if row_mask is not None:
         valid = row_mask.bool()
         if not valid.any():
             return torch.zeros((), device=gate.device, dtype=gate.dtype)
-        return (-per_row[valid].mean()).to(dtype=gate.dtype)
-    return (-per_row.mean()).to(dtype=gate.dtype)
+        return per_row_loss[valid].mean().to(dtype=gate.dtype)
+    return per_row_loss.mean().to(dtype=gate.dtype)
 
 
 def masked_token_mse(
@@ -165,6 +199,19 @@ def ssm_state_norm_loss(ssm_state: Tensor, gamma: Tensor) -> Tensor:
     return torch.relu(s_bar - gamma)
 
 
+def assoc_state_norm_loss(memory_state: Tensor, gamma: Tensor) -> Tensor:
+    """Hinge penalty keeping the associative memory bank state bounded (T-7).
+
+    Analogous to :func:`ssm_state_norm_loss`: the mean squared entry of the
+    post-write bank state is penalized once it exceeds ``gamma``. Without it
+    the recurrent ``memory = gate*memory + (1-gate)*write_update(...)`` update
+    receives almost no CE gradient within a chunk and can drift unbounded,
+    which in turn feeds the (now normalized) retrieval loss with huge keys.
+    """
+    s_bar = memory_state.float().pow(2).mean()
+    return torch.relu(s_bar - gamma)
+
+
 class MemoryReconstructionDecoder(nn.Module):
     """Training-only decoder: reconstruct x from compressed summary s."""
 
@@ -218,6 +265,7 @@ def associative_retrieval_loss(
     per_token_residual: Tensor,
     sample_count: int,
     attention_mask: Tensor | None,
+    err_clip: float | None = 25.0,
 ) -> Tensor:
     batch_size, seq_len, hidden = x.shape
     device = x.device
@@ -259,9 +307,24 @@ def associative_retrieval_loss(
 
     x_sel = x.gather(1, indices.unsqueeze(-1).expand(-1, -1, hidden))
     keys = bank.assoc_key(x_sel)
-    values = bank.assoc_val(x_sel)
-    retrieved = bank.read_query(keys, new_memory)
-    err = (retrieved - values).pow(2).sum(dim=-1)
+    # FIX T-C1: L2-normalize both retrieved and values vectors before computing
+    # the squared error. After normalization all vectors lie on the unit sphere,
+    # so ||(retrieved - values)||^2 is bounded in [0, 4] by the Cauchy-Schwarz
+    # inequality. The previous unnormalized .sum(dim=-1) formulation could grow
+    # without bound (e.g. 3.36e23 at step 5,400) because hidden activations in
+    # the recurrent memory bank drift far from the origin when the write path
+    # receives little direct CE feedback. Switching from .sum to .mean makes the
+    # scale independent of hidden_size. The additional clamp(max=25.0) is a
+    # defensive backstop against any floating-point edge cases (true maximum
+    # after normalization is 4.0). Design intent restored from commit 821fec3.
+    _norm_eps = 1e-8
+    values = F.normalize(bank.assoc_val(x_sel), dim=-1, eps=_norm_eps)
+    retrieved = F.normalize(bank.read_query(keys, new_memory), dim=-1, eps=_norm_eps)
+    # mean (not sum) over the hidden dimension: result is in [0, 4] post-norm.
+    err = (retrieved - values).pow(2).mean(dim=-1)
+    # Defensive cap: true max is 4.0; err_clip (default 25.0) absorbs numerical edge-cases.
+    if err_clip is not None:
+        err = err.clamp(max=err_clip)
     surprise = per_token_residual.gather(1, indices).detach()
     if n_sel > 1:
         sigma = surprise.std(dim=1, keepdim=True, unbiased=False).clamp(min=1e-6)

@@ -10,6 +10,7 @@ from model.core.dtype import _promote_fp32, _restore_dtype
 from model.hybrid.losses import (
     HybridLayerAuxLosses,
     _expert_loss_schedule,
+    assoc_state_norm_loss,
     associative_retrieval_loss,
     combine_read_utilization_loss,
     fusion_balance_loss,
@@ -30,6 +31,57 @@ from model.layers.attention import SlidingWindowGQA
 from model.layers.fusion import TokenGatedFusion
 from model.layers.moe import DroplessMoELayer, MOERouter, SwiGLUExpert
 from model.layers.norm import RMSNorm
+
+
+def _gate_monitoring_stats(
+    prefix: str, gate: Tensor, saturation_threshold: float
+) -> dict[str, Tensor]:
+    """Return scalar gate-distribution telemetry without retaining autograd state."""
+    gate_f = gate.detach().float()
+    low = gate_f <= saturation_threshold
+    high = gate_f >= 1.0 - saturation_threshold
+    return {
+        f"{prefix}_mean": gate_f.mean(),
+        # Moments and bucket fractions are mergeable across FSDP ranks by the
+        # trainers' existing sum/count reduction. Per-rank extrema/quantiles
+        # are deliberately avoided because averaging them is not a global
+        # extremum/quantile.
+        f"{prefix}_mean_square": gate_f.square().mean(),
+        f"{prefix}_overwrite_saturated_fraction": low.float().mean(),
+        f"{prefix}_interior_fraction": (~(low | high)).float().mean(),
+        f"{prefix}_retention_saturated_fraction": high.float().mean(),
+    }
+
+
+def _memory_state_monitoring_stats(
+    prefix: str, state: Tensor, gamma: Tensor | None
+) -> dict[str, Tensor]:
+    """Return mergeable per-slot state-norm telemetry used by T-7."""
+    per_slot_mse = state.detach().float().pow(2).mean(dim=-1).reshape(-1)
+    stats = {
+        f"{prefix}_norm": per_slot_mse.mean(),
+        f"{prefix}_norm_mean_square": per_slot_mse.square().mean(),
+    }
+    if gamma is not None:
+        gamma_f = gamma.detach().float().to(device=per_slot_mse.device)
+        half_gamma = 0.5 * gamma_f
+        twice_gamma = 2.0 * gamma_f
+        below_half = per_slot_mse <= half_gamma
+        near_below = (per_slot_mse > half_gamma) & (per_slot_mse <= gamma_f)
+        near_above = (per_slot_mse > gamma_f) & (per_slot_mse <= twice_gamma)
+        far_above = per_slot_mse > twice_gamma
+        stats.update(
+            {
+                f"{prefix}_norm_below_half_gamma_fraction": below_half.float().mean(),
+                f"{prefix}_norm_half_to_one_gamma_fraction": near_below.float().mean(),
+                f"{prefix}_norm_one_to_two_gamma_fraction": near_above.float().mean(),
+                f"{prefix}_norm_above_two_gamma_fraction": far_above.float().mean(),
+                f"{prefix}_norm_above_gamma_fraction": (near_above | far_above)
+                .float()
+                .mean(),
+            }
+        )
+    return stats
 
 
 def _hybrid_layer_forward(
@@ -368,8 +420,26 @@ class HybridDecoderLayer(nn.Module):
                 new_memory_state = (new_a_mem, new_s_mem)
                 new_write_buffer = None
                 gate_stats = {
-                    "attn_write_gate_mean": a_write_gate.detach().mean(),
-                    "state_write_gate_mean": s_write_gate.detach().mean(),
+                    **_gate_monitoring_stats(
+                        "attn_write_gate",
+                        a_write_gate,
+                        cfg.gate_saturation_threshold,
+                    ),
+                    **_gate_monitoring_stats(
+                        "state_write_gate",
+                        s_write_gate,
+                        cfg.gate_saturation_threshold,
+                    ),
+                    **_memory_state_monitoring_stats(
+                        "attn_mem",
+                        new_a_mem,
+                        getattr(self, "assoc_norm_gamma", None),
+                    ),
+                    **_memory_state_monitoring_stats(
+                        "state_mem",
+                        new_s_mem,
+                        getattr(self, "assoc_norm_gamma", None),
+                    ),
                 }
 
                 if self.training and self.use_auxiliary_losses:
@@ -413,6 +483,7 @@ class HybridDecoderLayer(nn.Module):
                             attn_recon_tok,
                             cfg.assoc_sample_count,
                             write_mask,
+                            err_clip=cfg.assoc_err_clip,
                         )
                         mamba_assoc = associative_retrieval_loss(
                             self.state_memory_bank,
@@ -421,15 +492,20 @@ class HybridDecoderLayer(nn.Module):
                             mamba_recon_tok,
                             cfg.assoc_sample_count,
                             write_mask,
+                            err_clip=cfg.assoc_err_clip,
                         )
                         gate_loss = write_gate_entropy_loss(
                             a_write_gate,
                             cfg.gate_entropy_eps,
                             row_mask=row_has_valid,
+                            saturation_threshold=cfg.gate_saturation_threshold,
+                            saturation_penalty_weight=cfg.gate_saturation_penalty_weight,
                         ) + write_gate_entropy_loss(
                             s_write_gate,
                             cfg.gate_entropy_eps,
                             row_mask=row_has_valid,
+                            saturation_threshold=cfg.gate_saturation_threshold,
+                            saturation_penalty_weight=cfg.gate_saturation_penalty_weight,
                         )
                         slot_loss = memory_slot_diversity_loss(
                             new_a_mem,
@@ -437,6 +513,18 @@ class HybridDecoderLayer(nn.Module):
                             cfg.slot_similarity_margin,
                             cfg.slot_cross_bank_alpha,
                         )
+                        # Bound the post-write bank state (ssm_state_norm_loss
+                        # analog, T-7). Zero state contributes nothing (hinge at 0),
+                        # so a Jamba-like zero-bank start never adds a bias.
+                        assoc_norm_gamma = getattr(self, "assoc_norm_gamma", None)
+                        if assoc_norm_gamma is not None:
+                            assoc_norm_loss = assoc_state_norm_loss(
+                                new_a_mem, assoc_norm_gamma
+                            ) + assoc_state_norm_loss(new_s_mem, assoc_norm_gamma)
+                        else:
+                            assoc_norm_loss = torch.tensor(
+                                0.0, device=x.device, dtype=x.dtype
+                            )
                     layer_aux = HybridLayerAuxLosses(
                         recon=_restore_dtype((attn_recon + mamba_recon) / 2.0, x.dtype),
                         assoc=_restore_dtype((attn_assoc + mamba_assoc) / 2.0, x.dtype),
@@ -446,6 +534,7 @@ class HybridDecoderLayer(nn.Module):
                         expert=layer_aux.expert,
                         ssm=layer_aux.ssm,
                         slot=_restore_dtype(slot_loss, x.dtype),
+                        assoc_norm=_restore_dtype(assoc_norm_loss / 2.0, x.dtype),
                     )
 
         fused, fusion_gate = self.fusion(attn_out, mamba_out)
@@ -493,6 +582,7 @@ class HybridDecoderLayer(nn.Module):
                 expert=expert_loss,
                 ssm=ssm_loss,
                 slot=layer_aux.slot,
+                assoc_norm=layer_aux.assoc_norm,
             )
 
         return (

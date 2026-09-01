@@ -50,6 +50,33 @@ class TestToyTrainSmoke(unittest.TestCase):
             out.loss.backward()
             optimizer.step()
 
+    def test_gradient_accumulation_smoke(self) -> None:
+        torch.manual_seed(0)
+        cfg = build_toy_config()
+        cfg.memory_chunk_size = 128
+        model = HybridForCausalLM(cfg).train()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+        accum_steps = 2
+        optimizer.zero_grad(set_to_none=True)
+
+        for micro in range(accum_steps):
+            ids = torch.randint(0, cfg.vocab_size, (1, 256))
+            labels = ids.roll(shifts=-1, dims=1)
+            out = model(input_ids=ids, labels=labels)
+            assert out.loss is not None
+            (out.loss / accum_steps).backward()
+
+        # Check gradients exist and are finite
+        has_grad = False
+        for p in model.parameters():
+            if p.requires_grad and p.grad is not None:
+                has_grad = True
+                self.assertTrue(torch.isfinite(p.grad).all())
+        self.assertTrue(has_grad)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+
 
 if __name__ == "__main__":
     unittest.main()

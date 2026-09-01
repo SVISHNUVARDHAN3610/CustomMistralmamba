@@ -1,4 +1,11 @@
-"""Cyclic validation on Salesforce/wikitext (validation split)."""
+"""Cyclic validation on Salesforce/wikitext (validation split).
+
+T-3 fix: ``PackedWindowValidator`` evaluates on a fixed packed token stream
+with identical tokenizer/context/shift semantics as training, making the
+validation CE directly comparable to training CE.  The legacy
+``WikiTextCyclicValidator`` (row-based, padded) is preserved for backward
+compatibility but should not be used for convergence decisions.
+"""
 
 from __future__ import annotations
 
@@ -236,4 +243,156 @@ class WikiTextCyclicValidator:
             "val_row_end": row_end,
             "val_cursor": self.cursor,
             "val_dataset": f"Salesforce/wikitext/{self.dataset_config}",
+        }
+
+
+class _PackedWindowDataset(Dataset):
+    """Fixed packed token stream split into non-overlapping (input, label) windows.
+
+    Identical shift semantics to ``MmapShardDataset.__getitem__``:
+    ``input_ids = stream[start:start+seq_len]``,
+    ``labels    = stream[start+1:start+seq_len+1]``.
+    """
+
+    def __init__(self, token_stream: list[int], seq_len: int) -> None:
+        self._stream = token_stream
+        self._seq_len = seq_len
+        # Number of complete windows that fit in the stream.
+        self._n_windows = (len(token_stream) - 1) // seq_len
+
+    def __len__(self) -> int:
+        return self._n_windows
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        start = idx * self._seq_len
+        chunk = self._stream[start : start + self._seq_len + 1]
+        ids = torch.tensor(chunk, dtype=torch.long)
+        return ids[:-1], ids[1:]  # input_ids, labels
+
+
+class PackedWindowValidator:
+    """T-3 fix: evaluate on packed continuous token windows.
+
+    Unlike ``WikiTextCyclicValidator``, this validator concatenates a fixed
+    snapshot of Salesforce/wikitext validation texts into a single packed token
+    stream and scores it on non-overlapping ``seq_len``-token windows — exactly
+    matching training data tokenization and loss reduction semantics.
+
+    The resulting ``packed_val_ce`` metric is directly comparable to training CE
+    and enables reliable convergence decisions.  The legacy row-based validator
+    is still available for comparison under ``val_ce_loss`` in the JSONL log.
+    """
+
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        *,
+        seq_len: int,
+        num_texts: int = 200,
+        batch_size: int = 8,
+        dataset_config: str = "wikitext-2-raw-v1",
+        bos_id: int = 1,
+        eos_id: int = 2,
+    ) -> None:
+        from datasets import load_dataset  # type: ignore[import-untyped]
+
+        ds = load_dataset("Salesforce/wikitext", dataset_config, split="validation")
+        texts = [row["text"] for row in ds if row["text"].strip()]
+        if not texts:
+            raise ValueError(
+                f"No non-empty rows in Salesforce/wikitext validation ({dataset_config})"
+            )
+        # Use the first num_texts texts (fixed snapshot for reproducibility).
+        texts = texts[:num_texts]
+
+        # Build a packed token stream: BOS + tokens + EOS per document,
+        # concatenated into one continuous uint-id list.
+        stream: list[int] = []
+        for text in texts:
+            raw = tokenizer.encode(text, add_special_tokens=False)
+            stream.extend([bos_id] + raw + [eos_id])
+
+        self._dataset = _PackedWindowDataset(stream, seq_len)
+        self._batch_size = batch_size
+        self._seq_len = seq_len
+        self._dataset_config = dataset_config
+        self._num_texts = num_texts
+        self._stream_len = len(stream)
+
+    @torch.no_grad()
+    def evaluate(
+        self,
+        model: HybridForCausalLM,
+        *,
+        device: torch.device,
+        global_step: int,
+        max_training_steps: int,
+        use_amp: bool,
+        amp_dtype: torch.dtype,
+        ignore_index: int,
+    ) -> dict[str, Any]:
+        """Return a dict with ``packed_val_ce`` and metadata."""
+        loader = DataLoader(
+            self._dataset,
+            batch_size=self._batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+
+        was_training = model.training
+        model.eval()
+
+        total_ce = 0.0
+        total_tokens = 0
+        n_windows = 0
+
+        for input_ids, labels in loader:
+            input_ids = input_ids.to(device)
+            labels = labels.to(device)
+
+            with torch.autocast(
+                device_type=device.type,
+                dtype=amp_dtype,
+                enabled=use_amp,
+            ):
+                out = model(
+                    input_ids=input_ids,
+                    labels=labels,
+                    training_step=global_step,
+                    max_training_steps=max_training_steps,
+                )
+
+            if out.ce_loss is None or out.loss is None:
+                continue
+
+            n_tokens = int((labels != ignore_index).sum().item())
+            if n_tokens == 0:
+                continue
+
+            total_ce += float(out.ce_loss.item()) * n_tokens
+            total_tokens += n_tokens
+            n_windows += input_ids.size(0)
+
+        if was_training:
+            model.train()
+
+        if total_tokens == 0:
+            return {
+                "event": "packed_validation",
+                "step": global_step,
+                "packed_val_ce": float("inf"),
+                "packed_val_windows": 0,
+                "packed_val_tokens": 0,
+                "packed_val_dataset": f"Salesforce/wikitext/{self._dataset_config}",
+            }
+
+        return {
+            "event": "packed_validation",
+            "step": global_step,
+            "packed_val_ce": total_ce / total_tokens,
+            "packed_val_windows": n_windows,
+            "packed_val_tokens": total_tokens,
+            "packed_val_dataset": f"Salesforce/wikitext/{self._dataset_config}",
+            "packed_stream_len": self._stream_len,
+            "packed_num_texts": self._num_texts,
         }
