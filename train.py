@@ -595,6 +595,8 @@ def checkpoint_runtime_contract(
     model: HybridForCausalLM,
     *,
     distributed_strategy: str,
+    checkpoint_family: str | None = None,
+    optimizer_policy: str | None = None,
 ) -> dict[str, Any]:
     """Persist autograd/distributed choices that can change collective graphs."""
     ddp_find_unused: bool | None = None
@@ -604,7 +606,7 @@ def checkpoint_runtime_contract(
         ddp_find_unused = bool(model.find_unused_parameters)
         ddp_static_graph = bool(model.static_graph)
     return {
-        "version": 1,
+        "version": 2,
         "gradient_checkpointing": model.is_gradient_checkpointing,
         "gradient_checkpointing_use_reentrant": False,
         # Always serialize the TRAINING preference. eval() intentionally flips
@@ -613,6 +615,8 @@ def checkpoint_runtime_contract(
         if model.is_gradient_checkpointing
         else bool(model.config.use_cache),
         "distributed_strategy": distributed_strategy,
+        "checkpoint_family": checkpoint_family or distributed_strategy,
+        "optimizer_policy": optimizer_policy,
         "ddp_find_unused_parameters": ddp_find_unused,
         "ddp_static_graph": ddp_static_graph,
     }
@@ -632,6 +636,8 @@ def validate_resume_runtime_contract(
     logger: logging.Logger,
     *,
     distributed_strategy: str,
+    checkpoint_family: str | None = None,
+    optimizer_policy: str | None = None,
 ) -> None:
     """Fail fast on graph-changing resume drift; repair stale use_cache."""
     runtime = checkpoint.get("training_runtime")
@@ -683,9 +689,33 @@ def validate_resume_runtime_contract(
     model.config.use_cache = not (model.training and current_gc)
 
     current = checkpoint_runtime_contract(
-        model, distributed_strategy=distributed_strategy
+        model,
+        distributed_strategy=distributed_strategy,
+        checkpoint_family=checkpoint_family,
+        optimizer_policy=optimizer_policy,
     )
     saved_strategy = runtime.get("distributed_strategy")
+    current_family = current["checkpoint_family"]
+    saved_family = runtime.get("checkpoint_family", saved_strategy)
+    if saved_family is not None and saved_family != current_family:
+        raise RuntimeError(
+            "Checkpoint family mismatch: checkpoint="
+            f"{saved_family!r}, current={current_family!r}. Model weights may be "
+            "converted separately, but optimizer/scheduler resume across trainer "
+            "families is unsupported. Start fresh or use a checkpoint written by "
+            "the same trainer."
+        )
+    saved_optimizer_policy = runtime.get("optimizer_policy")
+    if (
+        saved_optimizer_policy is not None
+        and optimizer_policy is not None
+        and saved_optimizer_policy != optimizer_policy
+    ):
+        raise RuntimeError(
+            "Optimizer policy mismatch on resume: checkpoint="
+            f"{saved_optimizer_policy!r}, current={optimizer_policy!r}. "
+            "Optimizer state cannot be reassigned safely between policies."
+        )
     if saved_strategy == "ddp" or current["distributed_strategy"] == "ddp":
         for key in ("ddp_find_unused_parameters", "ddp_static_graph"):
             if runtime.get(key) != current[key]:
@@ -825,7 +855,10 @@ def save_checkpoint(
         "memory_nan_fix_id": MEMORY_NAN_FIX_ID,
         "use_muon": use_muon,
         "training_runtime": checkpoint_runtime_contract(
-            model, distributed_strategy="single_process"
+            model,
+            distributed_strategy="single_process",
+            checkpoint_family="single_process",
+            optimizer_policy="muon_adamw" if use_muon else "adamw",
         ),
     }
     if validator is not None:
@@ -890,6 +923,8 @@ def load_checkpoint(
         model,
         logger,
         distributed_strategy="single_process",
+        checkpoint_family="single_process",
+        optimizer_policy=("muon_adamw" if use_muon is not False else "adamw"),
     )
     model.load_state_dict(checkpoint["model_state_dict"])
 

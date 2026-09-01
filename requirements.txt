@@ -1,5 +1,5 @@
 # Runtime — model/ package + tests/test_model.py
-torch>=2.1.0
+torch>=2.6.0
 
 # Training entry points (train.py, utils/, scripts/) — NOT needed for the
 # model package or unit tests (CI installs torch only).

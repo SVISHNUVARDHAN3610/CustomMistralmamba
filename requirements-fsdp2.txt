@@ -1,0 +1,4 @@
+# Reproducible FSDP2 baseline used by CI and documented in README.md.
+# Select the matching official PyTorch wheel index for CPU/CUDA at install time.
+-r requirements.txt
+torch==2.6.0

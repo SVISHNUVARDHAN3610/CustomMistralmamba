@@ -1,7 +1,7 @@
 # CustomMistralMamba: Sub-Quadratic Hybrid Mamba–MoE with Dual Compressive Memory
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-ee4c2c.svg)](https://pytorch.org/)
+[![PyTorch 2.6+](https://img.shields.io/badge/PyTorch-2.6%2B-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Tests: 83 Passed](https://img.shields.io/badge/tests-83%20passed-brightgreen.svg)](tests/test_model.py)
@@ -20,7 +20,7 @@
 | **Core Research Document** | [`research/research.md`](research/research.md) |
 | **Loss Specification** | [`research/loss-definitions.md`](research/loss-definitions.md) |
 | **Package Architecture Reference** | [`model/README.md`](model/README.md) (Comprehensive 24-section developer specification) |
-| **Optimization Stack** | PyTorch FSDP2 (`fully_shard`) + Moonshot Muon (Newton–Schulz) / AdamW Hybrid |
+| **Optimization Stack** | Moonshot Muon + AdamW on one GPU; AdamW-only with PyTorch FSDP2 |
 | **Scan Acceleration** | 4-Tier Selective Scan (Fused CUDA `mamba-ssm` $\to$ Parallel $\to$ Blocked $\to$ Checkpointed) |
 | **Test Suite** | [`tests/test_model.py`](tests/test_model.py) (83 deterministic unit tests, AMP & gradient verified) |
 
@@ -353,8 +353,14 @@ python train.py \
 
 ### 2. Distributed Multi-GPU Pre-Training (`pre-training/fsdp2_train.py`)
 * **PyTorch FSDP2 (`fully_shard`):** Parameters are sharded per-layer across distributed ranks. Master weights remain in FP32 while activations and forward computations run under `torch.autocast(bfloat16)`.
+* **AdamW-only distributed optimizer:** FSDP2 deliberately uses AdamW for every parameter. Muon remains available in the single-GPU trainer, but is disabled in FSDP2 to avoid full-matrix all-gathers on every optimization step.
 * **Zero-Sync Telemetry:** Training metrics and auxiliary loss breakdowns are accumulated locally and all-reduced globally once per logging window, eliminating host-device synchronization stalls.
 * **Strict NaN Trilemma Guard:** Global voting mechanism halts optimization safely if any distributed rank detects non-finite gradients.
+
+The reproducible FSDP2 baseline is Python 3.11, PyTorch 2.6.0, and CUDA 12.4
+(or the PyTorch 2.6.0 CPU wheel for CI). Install `requirements-fsdp2.txt`
+using the official PyTorch wheel index matching the host. Every checkpoint also
+records the resolved Python, PyTorch, CUDA, cuDNN, and world-size values.
 
 ```bash
 torchrun --nproc_per_node=8 pre-training/fsdp2_train.py \
@@ -473,7 +479,7 @@ CustomMistralmamba/
 │   └── Improvement-suggestions.md  # Architectural backlog & scaling suggestions
 │
 ├── pre-training/                   # Distributed multi-GPU training
-│   └── fsdp2_train.py              # PyTorch FSDP2 + Muon distributed trainer
+│   └── fsdp2_train.py              # PyTorch FSDP2 + AdamW distributed trainer
 │
 ├── utils/                          # Dataset streaming & validation utilities
 │   ├── dataset.py                  # TokenizedShardProducer, MmapShardDataset
@@ -611,7 +617,7 @@ print(f"Generated sequence shape: {generated_ids.shape}")
 - [x] Version 2.1 reference architecture implementation and package restructuring.
 - [x] Implementation of 8-objective auxiliary loss suite with warmup schedules.
 - [x] Multi-tier Mamba scan dispatch (fused, parallel, blocked, sequential checkpointed).
-- [x] PyTorch FSDP2 distributed trainer with Moonshot Muon optimizer integration.
+- [x] PyTorch FSDP2 distributed trainer with an AdamW-only optimizer policy.
 - [ ] Implement synthetic needle-in-a-haystack and associative retrieval evaluation benchmarks.
 - [ ] Execute the complete 3-stage falsification suite (Inference Zeroing, Gate Telemetry, Null Baseline).
 - [ ] Develop custom fused Triton kernels for batched dual-memory summary writes.
