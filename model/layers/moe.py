@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from model.core.fsdp import local_dtensor
+
 _GROUPED_GEMM_FALLBACK_WARNED = False
 
 
@@ -174,9 +176,20 @@ class DroplessMoELayer(nn.Module):
     def _stack_expert_weights(
         self,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        w_gate = torch.stack([e.w_gate.weight for e in self.experts], dim=0)
-        w_up = torch.stack([e.w_up.weight for e in self.experts], dim=0)
-        w_down = torch.stack([e.w_down.weight for e in self.experts], dim=0)
+        if any(
+            type(expert.w_gate.weight).__name__ == "DTensor" for expert in self.experts
+        ):
+            raise RuntimeError(
+                "Grouped MoE dispatch is incompatible with FSDP2-sharded expert "
+                "weights. Disable grouped dispatch or use per-expert module calls."
+            )
+        w_gate = torch.stack(
+            [local_dtensor(e.w_gate.weight) for e in self.experts], dim=0
+        )
+        w_up = torch.stack([local_dtensor(e.w_up.weight) for e in self.experts], dim=0)
+        w_down = torch.stack(
+            [local_dtensor(e.w_down.weight) for e in self.experts], dim=0
+        )
         return w_gate, w_up, w_down
 
     def _apply_capacity(

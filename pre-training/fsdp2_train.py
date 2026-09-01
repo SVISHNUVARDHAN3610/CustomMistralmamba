@@ -1,9 +1,9 @@
-"""FSDP2 + Muon distributed training for Hybrid Mamba-MoE.
+"""FSDP2 + AdamW distributed training for Hybrid Mamba-MoE.
 
-Multi-GPU port of the root ``train.py`` trainer: the SAME Moonshot Muon +
-AdamW hybrid (identical grouping rules, LR resolution, warmup/cosine math,
-nan-guard trilemma, zero-sync logging discipline) executed over ``fully_shard``
-sharded parameters. Only the execution model changes.
+Multi-GPU port of the root ``train.py`` trainer using AdamW for every
+parameter. Muon is deliberately excluded from FSDP2: global Newton--Schulz
+semantics require full-matrix all-gathers on every step, which defeats the
+communication and memory goals of parameter sharding.
 
 Deliberate deviations from ``train.py`` (each required by distribution):
   * ``fully_shard`` wrapping (inner-to-outer). Parameters stay FP32 under
@@ -29,12 +29,12 @@ Deliberate deviations from ``train.py`` (each required by distribution):
   * ``--grad-nan-guard=strict`` takes a GLOBAL min-vote over ranks before
     skipping: a per-rank skip would leave that rank's parameter shard
     permanently out of sync with the rest of the model.
-  * Checkpoints consolidate through the public DTensor state-dict APIs
-    (``get_/set_model_state_dict`` + hand consolidation of optimizer state)
-    into the ROOT ``train.py`` payload schema, so checkpoints stay
-    interchangeable between the two trainers. RNG state is captured
-    per-rank under a different key layout than root's single-process
-    payload; data order still replays exactly via the seeded sampler.
+  * FSDP2 checkpoints use an explicit trainer family and AdamW optimizer
+    policy. Cross-trainer optimizer resume is rejected instead of relying on
+    unsafe positional state compatibility. RNG state is captured per rank.
+  * Checkpoints persist an intra-shard batch cursor. The seeded sampler plus
+    that offset resumes at the exact next per-rank batch for the same world
+    size instead of replaying the beginning of the shard.
   * ``--compile`` is rejected (torch.compile x FSDP2 wrap-order pitfalls).
   * ``--batch-size`` is PER RANK (effective batch = batch-size x world x
     --grad-accum-steps); ``--device`` is derived from the launcher.
@@ -53,9 +53,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import itertools
 import json
 import logging
 import os
+import platform
 import random
 import sys
 import threading
@@ -64,7 +66,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -72,19 +73,78 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Light imports only above this line: model/** and utils.fsdp2_muon pull no
+# Light imports only above this line: model/** pulls no
 # datasets/transformers, so --ns-self-check stays cheap and dependency-light
 # (same rationale as model/core/optim.py).
 from model.core.builders import count_trainable_params
 from model.core.constants import MEMORY_NAN_FIX_ID
-from model.core.optim import _is_adamw_no_decay, split_muon_adam_params
+from model.core.optim import _is_adamw_no_decay
+from model.hybrid.layer import HybridDecoderLayer
 from model.hybrid.mamba import (
+    MambaBlock,
     fused_mamba_scan_available,
     get_mamba_scan_stats,
     log_mamba_backend,
     reset_mamba_scan_stats,
 )
-from utils.fsdp2_muon import MuonDTensor, run_ns_self_check
+from model.hybrid.memory import CompressiveMemoryBank
+from model.layers.moe import DroplessMoELayer
+from model.layers.norm import RMSNorm
+
+FSDP2_CHECKPOINT_FAMILY = "fsdp2"
+FSDP2_OPTIMIZER_POLICY = "fsdp2_adamw"
+
+
+def _runtime_environment(world_size: int) -> dict[str, Any]:
+    """Resolved software/runtime versions persisted with every checkpoint."""
+    cudnn_version = (
+        torch.backends.cudnn.version() if torch.cuda.is_available() else None
+    )
+    return {
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "cudnn": cudnn_version,
+        "world_size": world_size,
+    }
+
+
+def _data_runtime_contract(args: argparse.Namespace) -> dict[str, Any]:
+    """Arguments that define the meaning of the intra-shard batch cursor."""
+    return {
+        "seed": args.seed,
+        "batch_size_per_rank": args.batch_size,
+        "grad_accum_steps": args.grad_accum_steps,
+        "seq_len": args.seq_len,
+        "sampler_drop_last": True,
+    }
+
+
+class _OffsetSampler:
+    """Resume a deterministic base sampler after ``offset`` local samples."""
+
+    def __init__(self, base_sampler: DistributedSampler, offset: int) -> None:
+        if offset < 0 or offset > len(base_sampler):
+            raise ValueError(
+                f"Sampler resume offset {offset} is outside [0, {len(base_sampler)}]."
+            )
+        self.base_sampler = base_sampler
+        self.offset = offset
+
+    def __iter__(self):
+        return itertools.islice(iter(self.base_sampler), self.offset, None)
+
+    def __len__(self) -> int:
+        return len(self.base_sampler) - self.offset
+
+
+def _mean_metric_sums(
+    sums: dict[str, torch.Tensor], count: int
+) -> dict[str, torch.Tensor]:
+    """Average equal-token-count microbatch metric sums without host sync."""
+    if count < 1:
+        raise ValueError("Metric reduction requires at least one microbatch.")
+    return {name: value / count for name, value in sums.items()}
 
 
 def _setup_logging(run_dir: Path, *, level: int = logging.INFO) -> logging.Logger:
@@ -123,7 +183,20 @@ def _require_heavy_imports() -> None:
 
 
 def _require_fsdp2() -> dict[str, Any]:
-    """Public FSDP2 / DTensor / DCP state-dict APIs (torch >= 2.6 recommended)."""
+    """Load the public FSDP2/DTensor APIs required by the pinned baseline."""
+    release = torch.__version__.split("+", maxsplit=1)[0]
+    try:
+        major, minor = (int(part) for part in release.split(".")[:2])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Cannot parse PyTorch version {torch.__version__!r}."
+        ) from exc
+    if (major, minor) < (2, 6):
+        raise RuntimeError(
+            f"FSDP2 training requires torch>=2.6.0; found {torch.__version__}. "
+            "Install requirements-fsdp2.txt using the matching official "
+            "PyTorch CPU/CUDA wheel index."
+        )
     try:
         from torch.distributed.checkpoint.state_dict import (
             StateDictOptions,
@@ -148,6 +221,138 @@ def _require_fsdp2() -> dict[str, Any]:
         "DTensor": DTensor,
         "distribute_tensor": distribute_tensor,
     }
+
+
+def _prepare_fsdp2_custom_math_params(
+    model: torch.nn.Module,
+) -> set[torch.nn.Parameter]:
+    """Keep custom direct-math parameters replicated under FSDP2.
+
+    FSDP2 temporarily represents sharded parameters as DTensors. Standard
+    module calls such as ``nn.Linear`` are safe, but this model has several
+    custom kernels/fast paths that read parameters directly (RMSNorm gains,
+    dual-memory stacked projections, Mamba A/D vectors). Under activation
+    checkpoint recompute those direct reads can see sharded DTensors, causing
+    either Tensor/DTensor mixed-dispatch errors or local-shard shape mismatches.
+
+    Mark those parameters as ignored for ``fully_shard`` and force them into
+    AdamW; their gradients are averaged explicitly by
+    ``_sync_replicated_param_grads`` before clipping/stepping.
+    """
+    ignored: set[torch.nn.Parameter] = set()
+    seen: set[int] = set()
+
+    def add(param: torch.nn.Parameter | None) -> None:
+        if param is None:
+            return
+        param_id = id(param)
+        if param_id in seen:
+            return
+        seen.add(param_id)
+        param._fsdp2_force_adamw = True  # type: ignore[attr-defined]
+        ignored.add(param)
+
+    for module in model.modules():
+        if isinstance(module, RMSNorm):
+            for param in module.parameters(recurse=False):
+                add(param)
+        elif isinstance(module, HybridDecoderLayer) and module.use_dual_memory:
+            # These projections are siblings of the memory banks, rather than
+            # children of them. Checkpoint replay can otherwise enter their
+            # nn.Linear calls with a local Tensor activation and a DTensor
+            # weight before FSDP2 has materialized the weight.
+            for combine in (
+                module.attn_memory_combine,
+                module.state_memory_combine,
+            ):
+                for param in combine.parameters(recurse=False):
+                    add(param)
+        elif isinstance(module, CompressiveMemoryBank):
+            for param in module.parameters(recurse=True):
+                add(param)
+        elif isinstance(module, MambaBlock):
+            add(module.A_log)
+            add(module.D)
+
+        if isinstance(module, DroplessMoELayer):
+            # Grouped/stacked expert dispatch reads expert weights directly and
+            # bypasses each expert module's FSDP2 hooks. The loop dispatch calls
+            # the expert modules normally, so each expert can be safely sharded.
+            module.use_grouped_moe_dispatch = False
+            module.use_grouped_gemm = False
+
+    return ignored
+
+
+def _sync_replicated_param_grads(
+    params: set[torch.nn.Parameter],
+    *,
+    world_size: int,
+) -> None:
+    """Average gradients for FSDP2 ignored replicated parameters."""
+    if world_size <= 1:
+        return
+    for param in params:
+        grad = param.grad
+        if grad is None or hasattr(grad, "full_tensor"):
+            continue
+        torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.SUM)
+        grad.div_(world_size)
+
+
+def _clip_grad_norm_fsdp2_mixed(
+    parameters,
+    max_norm: float,
+    *,
+    world_size: int,
+) -> torch.Tensor:
+    """Clip gradients for mixed FSDP2 DTensor and replicated plain params.
+
+    ``torch.nn.utils.clip_grad_norm_`` can route through foreach/fused paths
+    that assume a homogeneous tensor representation. This trainer deliberately
+    has both FSDP2-managed DTensor gradients and ignored replicated Tensor
+    gradients, so compute the norm and scaling explicitly.
+
+    Replicated Tensor gradients have already been averaged across ranks by
+    ``_sync_replicated_param_grads``; count one logical copy in the global norm
+    by dividing their local contribution by ``world_size`` before all-reduce.
+    DTensor gradients contribute their local shard, and the all-reduce sums the
+    complete global parameter norm.
+    """
+    params = list(parameters)
+    device = None
+    total_sq = None
+
+    for param in params:
+        grad = param.grad
+        if grad is None:
+            continue
+        local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
+        if device is None:
+            device = local_grad.device
+            total_sq = torch.zeros((), device=device, dtype=torch.float32)
+        contrib = local_grad.detach().float().pow(2).sum()
+        if not hasattr(grad, "to_local") and world_size > 1:
+            contrib = contrib / world_size
+        total_sq = total_sq + contrib
+
+    if total_sq is None:
+        fallback_device = params[0].device if params else torch.device("cpu")
+        return torch.zeros((), device=fallback_device, dtype=torch.float32)
+
+    if world_size > 1:
+        torch.distributed.all_reduce(total_sq, op=torch.distributed.ReduceOp.SUM)
+    total_norm = total_sq.sqrt()
+
+    # If the norm is non-finite, report it and let the configured nan-guard
+    # decide whether to skip or sanitize. Scaling by NaN would hide the source.
+    if torch.isfinite(total_norm):
+        clip_coef = max_norm / (total_norm.item() + 1e-6)
+        if clip_coef < 1.0:
+            for param in params:
+                if param.grad is not None:
+                    param.grad.mul_(clip_coef)
+    return total_norm
 
 
 # ---------------------------------------------------------------------------
@@ -236,19 +441,31 @@ def _gather_rng_payload(rank: int, world_size: int) -> dict[str, Any]:
 
 def _restore_rng_payload(state: Any, rank: int, world: int) -> bool:
     """Restore THIS rank's RNG entry; False when the payload mismatches."""
-    if not isinstance(state, dict) or state.get("format") != "fsdp2_per_rank_v1":
+    if not isinstance(state, dict):
         return False
-    ranks = state.get("ranks") or []
-    if world == 1 and len(ranks) == 1 and isinstance(ranks[0], dict):
-        entry = ranks[0]
-    elif len(ranks) == world and isinstance(ranks[rank], dict):
-        entry = ranks[rank]
+    if state.get("format") == "fsdp2_per_rank_v1":
+        ranks = state.get("ranks") or []
+        if world == 1 and len(ranks) == 1 and isinstance(ranks[0], dict):
+            entry = ranks[0]
+        elif len(ranks) == world and isinstance(ranks[rank], dict):
+            entry = ranks[rank]
+        else:
+            return False
+    elif world == 1 and "python" in state and "torch" in state:
+        # Root-trainer checkpoint resumed by a world-of-one FSDP2 smoke run.
+        entry = state
     else:
         return False
     random.setstate(entry["python"])
     torch.set_rng_state(entry["torch"].to(dtype=torch.uint8))
     if "cuda" in entry and torch.cuda.is_available():
-        torch.cuda.set_rng_state(entry["cuda"].to(dtype=torch.uint8))
+        cuda_state = entry["cuda"]
+        if isinstance(cuda_state, torch.Tensor):
+            torch.cuda.set_rng_state(cuda_state.to(dtype=torch.uint8))
+        elif len(cuda_state) == 1:
+            torch.cuda.set_rng_state(cuda_state[0].to(dtype=torch.uint8))
+        else:
+            return False
     return True
 
 
@@ -258,10 +475,8 @@ def _consolidate_optimizer_state(
     """``opt.state_dict()`` with DTensor values replaced by full CPU tensors.
 
     Preserves the exact ``{"state": {index: {...}}, "param_groups": [...]}``
-    layout of a plain ``optimizer.state_dict()``, so payloads remain loadable
-    by the root single-GPU trainer. Parameter indices derive from
-    construction order; split_muon_adam_params + the group assembly here are
-    deterministic given the model, keeping indices stable across trainers.
+    layout of a plain ``optimizer.state_dict()``. The positional layout is
+    supported only inside the explicit FSDP2/AdamW checkpoint family.
     """
     sd = opt.state_dict()
     consolidated: dict[int, dict[str, Any]] = {}
@@ -297,11 +512,17 @@ def _reshard_optimizer_state(
         p = index_to_param[int(idx)]
         restored: dict[str, Any] = {}
         for key, value in entries.items():
-            if isinstance(value, torch.Tensor):
+            if isinstance(value, torch.Tensor) and tuple(value.shape) == tuple(p.shape):
                 value = value.to(device=device, dtype=p.dtype)
                 restored[key] = distribute_tensor(
                     value, p.device_mesh, list(p.placements)
                 )
+            elif isinstance(value, torch.Tensor):
+                # Optimizer counters such as AdamW's scalar ``step`` are
+                # replicated local state, not parameter-shaped DTensors. The
+                # previous code attempted to Shard(0) these scalars and could
+                # fail or stall every rank during resume.
+                restored[key] = value.to(device=device)
             else:
                 restored[key] = value
         state[int(idx)] = restored
@@ -315,75 +536,75 @@ def save_checkpoint_fsdp2(
     schedulers: list[Any],
     global_step: int,
     current_shard_idx: int,
+    current_batch_idx: int,
     checkpoint_dir: Path,
     logger: logging.Logger,
     validator: Any | None = None,
-    use_muon: bool = True,
     extra_payload: dict[str, Any] | None = None,
 ) -> None:
-    """Consolidated checkpoint in the ROOT ``train.py`` payload schema.
+    """Consolidated checkpoint in the FSDP2/AdamW checkpoint family.
 
     Model/optimizer state is gathered to full CPU tensors via public APIs
     (every rank participates in those collectives); rank 0 alone writes the
     file atomically. At <=~200M params consolidation is sub-second; the
     sharded DCP format is the >1B-scale follow-up.
     """
-    from train import CHECKPOINT_FILENAME, CONFIG_FILENAME  # lazy: heavy module
+    import train as train_mod  # lazy: heavy module
 
     api = _require_fsdp2()
     rank = torch.distributed.get_rank()
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = checkpoint_dir / CHECKPOINT_FILENAME
+    ckpt_path = checkpoint_dir / train_mod.CHECKPOINT_FILENAME
     tmp_path = ckpt_path.with_suffix(".pth.tmp")
 
-    config = dataclasses.asdict(model.config)
+    config = train_mod.normalized_checkpoint_config(model)
     model_sd = api["get_model_state_dict"](
         model,
         options=api["StateDictOptions"](full_state_dict=True, cpu_offload=True),
     )
 
-    # In Muon mode optimizers=[muon, adam]; AdamW-only mode stores its single
-    # optimizer ONLY under the adam_* keys (same convention as train.py).
     payload: dict[str, Any] = {
+        "checkpoint_schema_version": 2,
         "model_state_dict": model_sd,
         "config": config,
         "global_step": global_step,
         "current_shard_idx": current_shard_idx,
+        "current_batch_idx": current_batch_idx,
         "rng_state": _gather_rng_payload(rank, torch.distributed.get_world_size()),
         "memory_nan_fix_id": MEMORY_NAN_FIX_ID,
-        "use_muon": use_muon,
+        "use_muon": False,
+        "training_runtime": train_mod.checkpoint_runtime_contract(
+            model,
+            distributed_strategy="fsdp2",
+            checkpoint_family=FSDP2_CHECKPOINT_FAMILY,
+            optimizer_policy=FSDP2_OPTIMIZER_POLICY,
+        ),
+        "runtime_environment": _runtime_environment(torch.distributed.get_world_size()),
     }
     if validator is not None:
         # The cyclic cursor advances identically on every rank (replicated
         # params scoring the same fixed rows), so rank0's view is canonical.
         payload["validator_state_dict"] = validator.state_dict
-    if use_muon:
-        payload["muon_optimizer_state_dict"] = _consolidate_optimizer_state(
-            optimizers[0], api["DTensor"]
-        )
-        payload["muon_scheduler_state_dict"] = schedulers[0].state_dict()
-        payload["adam_optimizer_state_dict"] = _consolidate_optimizer_state(
-            optimizers[-1], api["DTensor"]
-        )
-        payload["adam_scheduler_state_dict"] = schedulers[-1].state_dict()
-    else:
-        payload["adam_optimizer_state_dict"] = _consolidate_optimizer_state(
-            optimizers[0], api["DTensor"]
-        )
-        payload["adam_scheduler_state_dict"] = schedulers[0].state_dict()
+    payload["adam_optimizer_state_dict"] = _consolidate_optimizer_state(
+        optimizers[0], api["DTensor"]
+    )
+    payload["adam_scheduler_state_dict"] = schedulers[0].state_dict()
     if extra_payload:
         payload.update(extra_payload)
 
     if rank == 0:
         torch.save(payload, tmp_path)
         os.replace(tmp_path, ckpt_path)
-        with (checkpoint_dir / CONFIG_FILENAME).open("w", encoding="utf-8") as f:
+        with (checkpoint_dir / train_mod.CONFIG_FILENAME).open(
+            "w", encoding="utf-8"
+        ) as f:
             json.dump(config, f, indent=2)
         logger.info(
-            "Checkpoint saved step=%d shard=%d path=%s",
+            "Checkpoint saved step=%d shard=%d batch=%d path=%s",
             global_step,
             current_shard_idx,
+            current_batch_idx,
             ckpt_path,
         )
     if torch.distributed.get_world_size() > 1:
@@ -399,16 +620,18 @@ def load_checkpoint_fsdp2(
     checkpoint_dir: Path,
     device: torch.device,
     logger: logging.Logger,
+    data_runtime: dict[str, Any],
     validator: Any | None = None,
-    use_muon: bool | None = None,
     dl_generator: torch.Generator | None = None,
-) -> tuple[int, int]:
-    """Resume from a consolidated checkpoint (fsdp2- OR root-written).
+) -> tuple[int, int, int]:
+    """Resume from an AdamW-only FSDP2 consolidated checkpoint.
 
     Every rank reads the shared file and re-shards locally through the
     public state-dict APIs. weights_only-first loading mirrors train.py;
     the fallback warning below carries the same pickle caveat.
     """
+    import train as train_mod
+
     api = _require_fsdp2()
     rank = torch.distributed.get_rank()
     world = torch.distributed.get_world_size()
@@ -428,6 +651,40 @@ def load_checkpoint_fsdp2(
         )
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
+    train_mod.validate_resume_runtime_contract(
+        checkpoint,
+        model,
+        logger,
+        distributed_strategy="fsdp2",
+        checkpoint_family=FSDP2_CHECKPOINT_FAMILY,
+        optimizer_policy=FSDP2_OPTIMIZER_POLICY,
+    )
+
+    if "current_batch_idx" not in checkpoint:
+        raise RuntimeError(
+            "This FSDP2 checkpoint predates exact intra-shard cursors and cannot "
+            "be resumed without replaying data. Start a fresh run, or explicitly "
+            "convert a checkpoint known to have been saved at a shard boundary."
+        )
+    saved_data_runtime = checkpoint.get("data_runtime")
+    if saved_data_runtime != data_runtime:
+        raise RuntimeError(
+            "Exact FSDP2 resume data contract mismatch: "
+            f"checkpoint={saved_data_runtime!r}, current={data_runtime!r}. "
+            "Resume with the original seed, per-rank batch size, accumulation, "
+            "and sequence length."
+        )
+
+    saved_environment = checkpoint.get("runtime_environment")
+    if isinstance(saved_environment, dict):
+        saved_world_size = saved_environment.get("world_size")
+        if saved_world_size is not None and int(saved_world_size) != world:
+            raise RuntimeError(
+                "Exact FSDP2 resume requires the checkpoint world size: "
+                f"checkpoint={saved_world_size}, current={world}. Start a fresh "
+                "run when changing world size."
+            )
+
     api["set_model_state_dict"](
         model,
         checkpoint["model_state_dict"],
@@ -437,45 +694,45 @@ def load_checkpoint_fsdp2(
     ckpt_use_muon = bool(
         checkpoint.get("use_muon", "muon_optimizer_state_dict" in checkpoint)
     )
-    has_explicit_flag = "use_muon" in checkpoint
-    if use_muon is not None and has_explicit_flag and ckpt_use_muon != use_muon:
+    if ckpt_use_muon:
         raise RuntimeError(
-            f"Checkpoint was saved with use_muon={ckpt_use_muon} but this run "
-            f"uses use_muon={use_muon}; optimizer states are incompatible. "
-            f"Start fresh or rerun with the matching --no-muon setting."
+            "FSDP2 is AdamW-only, but this checkpoint contains Muon optimizer "
+            "state. Start a fresh distributed run; automatic optimizer-state "
+            "conversion is intentionally unsupported."
         )
 
-    if ckpt_use_muon and "muon_optimizer_state_dict" in checkpoint:
-        optimizers[0].load_state_dict(
-            _reshard_optimizer_state(
-                checkpoint["muon_optimizer_state_dict"],
-                optimizers[0],
-                device,
-                api["distribute_tensor"],
-            )
-        )
-        optimizers[-1].load_state_dict(
-            _reshard_optimizer_state(
-                checkpoint["adam_optimizer_state_dict"],
-                optimizers[-1],
-                device,
-                api["distribute_tensor"],
-            )
-        )
-        schedulers[0].load_state_dict(checkpoint["muon_scheduler_state_dict"])
-        schedulers[-1].load_state_dict(checkpoint["adam_scheduler_state_dict"])
-    elif "adam_optimizer_state_dict" in checkpoint:
-        optimizers[0].load_state_dict(
-            _reshard_optimizer_state(
-                checkpoint["adam_optimizer_state_dict"],
-                optimizers[0],
-                device,
-                api["distribute_tensor"],
-            )
-        )
-        schedulers[0].load_state_dict(checkpoint["adam_scheduler_state_dict"])
+    required_state = ["adam_optimizer_state_dict", "adam_scheduler_state_dict"]
+    train_mod._require_resume_keys(checkpoint, required_state)
 
-    if not _restore_rng_payload(checkpoint.get("rng_state"), rank, world):
+    optimizers[0].load_state_dict(
+        _reshard_optimizer_state(
+            checkpoint["adam_optimizer_state_dict"],
+            optimizers[0],
+            device,
+            api["distribute_tensor"],
+        )
+    )
+    schedulers[0].load_state_dict(checkpoint["adam_scheduler_state_dict"])
+
+    optimizer_state_counts = [len(opt.state) for opt in optimizers]
+    saved_optimizer_counts = [
+        len(checkpoint["adam_optimizer_state_dict"].get("state", {}))
+    ]
+    saved_scheduler_epochs = [checkpoint["adam_scheduler_state_dict"].get("last_epoch")]
+    scheduler_epochs = [sched.last_epoch for sched in schedulers]
+    if optimizer_state_counts != saved_optimizer_counts:
+        raise RuntimeError(
+            "FSDP2 optimizer state restore count mismatch: "
+            f"checkpoint={saved_optimizer_counts}, loaded={optimizer_state_counts}."
+        )
+    if scheduler_epochs != saved_scheduler_epochs:
+        raise RuntimeError(
+            "FSDP2 scheduler state restore mismatch: "
+            f"checkpoint={saved_scheduler_epochs}, loaded={scheduler_epochs}."
+        )
+
+    rng_restored = _restore_rng_payload(checkpoint.get("rng_state"), rank, world)
+    if not rng_restored:
         saved_ws = (checkpoint.get("rng_state") or {}).get("world_size", "unknown")
         logger.warning(
             "RNG state missing or saved under a different layout/world size "
@@ -488,6 +745,21 @@ def load_checkpoint_fsdp2(
         gen_state = checkpoint.get("dl_generator_state")
         if gen_state is not None:
             dl_generator.set_state(gen_state.to(dtype=torch.uint8))
+        else:
+            logger.warning(
+                "Resume DataLoader RNG diagnostic FAIL: dl_generator_state missing."
+            )
+
+    logger.info(
+        "Resume state diagnostics %s | rank=%d optimizer_entries=%s "
+        "scheduler_last_epoch=%s rng_restored=%s dataloader_rng_restored=%s",
+        "PASS" if rng_restored else "WARN",
+        rank,
+        optimizer_state_counts,
+        scheduler_epochs,
+        rng_restored,
+        dl_generator is None or checkpoint.get("dl_generator_state") is not None,
+    )
 
     if validator is not None and "validator_state_dict" in checkpoint:
         validator.load_state_dict(checkpoint["validator_state_dict"])
@@ -519,19 +791,21 @@ def load_checkpoint_fsdp2(
 
     global_step = int(checkpoint.get("global_step", 0))
     current_shard_idx = int(checkpoint.get("current_shard_idx", 0))
+    current_batch_idx = int(checkpoint.get("current_batch_idx", 0))
     logger.info(
-        "Resumed from %s | step=%d shard=%d fix_id=%s use_muon=%s",
+        "Resumed from %s | step=%d shard=%d batch=%d fix_id=%s optimizer=%s",
         ckpt_path,
         global_step,
         current_shard_idx,
+        current_batch_idx,
         ckpt_fix_id if ckpt_fix_id is not None else "unknown",
-        ckpt_use_muon,
+        FSDP2_OPTIMIZER_POLICY,
     )
-    return global_step, current_shard_idx
+    return global_step, current_shard_idx, current_batch_idx
 
 
 # ---------------------------------------------------------------------------
-# Optimizer construction (semantics identical to train.build_optimizers)
+# Optimizer construction
 # ---------------------------------------------------------------------------
 
 
@@ -541,50 +815,42 @@ def build_fsdp2_optimizers(
     args: argparse.Namespace,
     logger: logging.Logger,
 ) -> tuple[list[torch.optim.Optimizer], bool, dict[str, Any]]:
-    """MuonDTensor + AdamW over FSDP2-sharded DTensor parameters.
+    """Build one unfused AdamW over all managed and replicated parameters.
 
-    Grouping rules, LR resolution, decay subgrouping, hyperparameters, and
-    log wording mirror ``train.build_optimizers``; only ``torch.optim.Muon``
-    is swapped for the DTensor-native ``MuonDTensor``, and AdamW runs
-    unfused (fused kernels' DTensor support is not guaranteed).
+    FSDP2 parameters are DTensors while deliberately ignored custom-math
+    parameters are ordinary replicated tensors. Stock unfused AdamW provides
+    local elementwise updates for both. Muon is excluded because correct
+    Newton--Schulz updates require gathering every global matrix.
     """
-    adam_params, muon_params, inventory = split_muon_adam_params(model)
+    adam_params = [p for p in model.parameters() if p.requires_grad]
+    adam_names = [name for name, p in model.named_parameters() if p.requires_grad]
     total_params = sum(p.numel() for p in model.parameters())
     adam_count = sum(p.numel() for p in adam_params)
-    muon_count = sum(p.numel() for p in muon_params)
-
-    enable_muon = not args.no_muon and bool(muon_params)
 
     shared_lr = args.lr
-    resolved_muon_lr = args.muon_lr if args.muon_lr is not None else shared_lr
     resolved_adam_lr = args.adam_lr if args.adam_lr is not None else shared_lr
 
     meta: dict[str, Any] = {
-        "enable_muon": enable_muon,
-        "muon_adjust_lr_fn": args.muon_adjust_lr_fn if enable_muon else None,
-        "inventory": inventory,
+        "enable_muon": False,
+        "optimizer_policy": FSDP2_OPTIMIZER_POLICY,
+        "inventory": {"adamw": adam_names, "muon": []},
     }
 
     logger.info(
-        "optimizer split: adamw=%.2f%% (%d tensors, %s params) "
-        "muon=%.2f%% (%d tensors, %s params) total=%.3fB",
-        100.0 * adam_count / max(total_params, 1),
-        len(inventory["adamw"]),
+        "optimizer split: adamw=100.00%% (%d tensors, %s params) "
+        "muon=0.00%% (0 tensors, 0 params) total=%.3fB",
+        len(adam_names),
         f"{adam_count:,}",
-        100.0 * (muon_count if enable_muon else 0) / max(total_params, 1),
-        len(inventory["muon"]) if enable_muon else 0,
-        f"{muon_count if enable_muon else 0:,}",
         total_params / 1e9,
     )
-    logger.debug("AdamW params: %s", inventory["adamw"])
-    logger.debug("Muon params: %s", inventory["muon"] if enable_muon else [])
+    logger.debug("AdamW params: %s", adam_names)
 
     def _adamw(params_list: list[torch.nn.Parameter]) -> torch.optim.AdamW:
         adam_decay = [p for p in params_list if not _is_adamw_no_decay(p)]
         adam_no_decay = [p for p in params_list if _is_adamw_no_decay(p)]
         logger.info(
             "AdamW(lr=%.3e, betas=(%.2f, %.2f), wd=%.3g on %d params / "
-            "wd=0 on %d params, fused=False)",
+            "wd=0 on %d params, fused=False, foreach=False)",
             resolved_adam_lr,
             args.adam_beta1,
             args.adam_beta2,
@@ -601,33 +867,14 @@ def build_fsdp2_optimizers(
             betas=(args.adam_beta1, args.adam_beta2),
             eps=args.adam_eps,
             fused=False,  # fused kernels are not DTensor-safe
+            foreach=False,  # groups mix DTensors and replicated plain tensors
         )
 
-    if enable_muon:
-        muon_opt = MuonDTensor(
-            muon_params,
-            lr=resolved_muon_lr,
-            momentum=args.muon_momentum,
-            nesterov=not args.no_muon_nesterov,
-            weight_decay=args.weight_decay,
-            ns_steps=args.muon_ns_steps,
-            adjust_lr_fn=(
-                args.muon_adjust_lr_fn
-                if args.muon_adjust_lr_fn in ("match_rms_adamw", "original")
-                else None
-            ),
+    if not args.no_muon or args.muon_lr is not None:
+        logger.warning(
+            "FSDP2 optimizer policy is AdamW-only; Muon CLI options are ignored. "
+            "Use --adam-lr (or --lr) for the distributed learning rate."
         )
-        logger.info(
-            "Muon(lr=%.3e, wd=%.3g, momentum=%.3g, nesterov=%s, ns_steps=%d, "
-            "adjust_lr_fn=%s)",
-            resolved_muon_lr,
-            args.weight_decay,
-            args.muon_momentum,
-            not args.no_muon_nesterov,
-            args.muon_ns_steps,
-            args.muon_adjust_lr_fn,
-        )
-        return [muon_opt, _adamw(adam_params)], True, meta
 
     logger.info("Muon disabled — AdamW-only fallback for all parameters")
     return [_adamw(list(model.parameters()))], False, meta
@@ -652,6 +899,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
     rank, world_size, device = init_distributed(args.dist_backend)
     is_rank0 = rank == 0
+    runtime_environment = _runtime_environment(world_size)
+    if is_rank0:
+        logger.info("FSDP2 runtime environment: %s", runtime_environment)
 
     run_dir = Path(args.run_dir)
     jsonl_path = Path(args.log_jsonl) if args.log_jsonl else None
@@ -723,15 +973,53 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     )
 
     model = train_mod.HybridForCausalLM(cfg).to(device)
+    fsdp2_ignored_params = _prepare_fsdp2_custom_math_params(model)
+    train_mod.configure_gradient_checkpointing(
+        model, args.gradient_checkpointing, logger
+    )
+    # All ranks must construct the same autograd graph. Catch launcher/CLI
+    # drift before fully_shard collectives turn it into an opaque NCCL hang.
+    local_gc_contract = torch.tensor(
+        [
+            int(model.is_gradient_checkpointing),
+            int(model.config.gradient_checkpointing_use_reentrant),
+            int(model.config.use_cache),
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    contract_min = local_gc_contract.clone()
+    contract_max = local_gc_contract.clone()
+    if world_size > 1:
+        torch.distributed.all_reduce(contract_min, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(contract_max, op=torch.distributed.ReduceOp.MAX)
+    if not torch.equal(contract_min, contract_max):
+        raise RuntimeError(
+            "Gradient-checkpointing/use_cache settings differ across ranks; "
+            "refusing to enter FSDP2 training because collective graphs can deadlock."
+        )
+    logger.info(
+        "Distributed checkpointing diagnostics PASS | strategy=fsdp2 (not DDP; "
+        "find_unused_parameters/static_graph=N/A) rank_contract=%s",
+        local_gc_contract.tolist(),
+    )
     # Calibration AFTER process-group init (its rank0 broadcast engages) and
     # BEFORE fully_shard (plain params/buffers, no DTensor plumbing yet). It
     # lives on the inner HybridModel, not the HybridForCausalLM wrapper.
+    # Must stay before ``fully_shard``: calibration directly executes each
+    # Mamba block with a dummy input, so the standard Mamba projections must
+    # still be ordinary tensors rather than FSDP2-managed DTensors.
     model.model.calibrate_ssm_norm_thresholds()
     reset_mamba_scan_stats()
     n_params = count_trainable_params(model)
     if is_rank0:
         # numel() on Shard(0) DTensors reports GLOBAL counts.
         logger.info("trainable_params=%s (%.3fB)", f"{n_params:,}", n_params / 1e9)
+        logger.info(
+            "FSDP2 replicated custom-math params=%d (RMSNorm/memory-bank/Mamba "
+            "vectors); gradients are all-reduced manually",
+            len(fsdp2_ignored_params),
+        )
 
     api = _require_fsdp2()
     # Params stay fp32; the autocast below provides bf16 compute, mirroring
@@ -742,21 +1030,34 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     use_amp = device.type == "cuda" and not args.no_amp
     amp_dtype = torch.bfloat16  # main() rejects anything else
     fully_shard = api["fully_shard"]
-    # Inner-to-outer: layers first (independent reshard-after-forward /
-    # prefetch), then the root gathers everything left outside the layers.
+    # Inner-to-outer: layers first (independent communication groups), then
+    # the root gathers everything left outside the layers. With activation
+    # checkpointing, the layer's backward replay executes regular nn.Linear
+    # calls while FSDP2 params would otherwise be back in DTensor form after
+    # the original forward. Keeping checkpointed layer params unsharded until
+    # backward completes preserves the Tensor/parameter contract for replay.
+    layer_reshard_after_forward = not args.gradient_checkpointing
     for layer in model.model.layers:
-        fully_shard(layer, mp_policy=mp_policy)
-    fully_shard(model, mp_policy=mp_policy)
+        layer_param_ids = {id(param) for param in layer.parameters()}
+        layer_ignored_params = {
+            param for param in fsdp2_ignored_params if id(param) in layer_param_ids
+        }
+        fully_shard(
+            layer,
+            mp_policy=mp_policy,
+            ignored_params=layer_ignored_params,
+            reshard_after_forward=layer_reshard_after_forward,
+        )
+    fully_shard(model, mp_policy=mp_policy, ignored_params=fsdp2_ignored_params)
     logger.info(
-        "fully_shard applied: layers=%d world=%d mp=%s",
+        "fully_shard applied: layers=%d world=%d mp=%s layer_reshard_after_forward=%s",
         len(model.model.layers),
         world_size,
         f"{'autocast-bf16' if use_amp else 'fp32'}/fp32-params/fp32-reduce",
+        layer_reshard_after_forward,
     )
 
-    optimizers, use_muon, opt_meta = build_fsdp2_optimizers(
-        model, args=args, logger=logger
-    )
+    optimizers, _, opt_meta = build_fsdp2_optimizers(model, args=args, logger=logger)
 
     validator: Any | None = None
     if not args.no_validation:
@@ -805,31 +1106,39 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
     global_step = 0
     current_shard_idx = 0
+    current_batch_idx = 0
     ckpt_dir = Path(args.ckpt_dir)
 
     # Seeds DataLoader workers; intra-shard ORDER comes from the seeded
     # DistributedSampler (epoch = shard index), which needs no persistence.
     dl_generator = torch.Generator()
     dl_generator.manual_seed(args.seed)
+    data_runtime = _data_runtime_contract(args)
 
     if args.resume:
-        global_step, current_shard_idx = load_checkpoint_fsdp2(
+        global_step, current_shard_idx, current_batch_idx = load_checkpoint_fsdp2(
             model=model,
             optimizers=optimizers,
             schedulers=schedulers,
             checkpoint_dir=ckpt_dir,
             device=device,
             logger=logger,
+            data_runtime=data_runtime,
             validator=validator,
-            use_muon=use_muon,
             dl_generator=dl_generator,
         )
         # LambdaLR.load_state_dict restores `_last_lr` but not
         # param_group['lr'], and opt.step() precedes sched.step() — without
         # this sync the first post-resume step runs at constructor LR.
         for opt, sched in zip(optimizers, schedulers):
-            for group in opt.param_groups:
-                group["lr"] = group["initial_lr"] * lr_lambda(max(sched.last_epoch, 0))
+            saved_lrs = sched.get_last_lr()
+            if len(saved_lrs) != len(opt.param_groups):
+                raise RuntimeError(
+                    "Scheduler/optimizer param-group mismatch after resume: "
+                    f"scheduler_lrs={len(saved_lrs)} groups={len(opt.param_groups)}."
+                )
+            for group, saved_lr in zip(opt.param_groups, saved_lrs):
+                group["lr"] = saved_lr
 
     stop_event = threading.Event()
     producer_thread: threading.Thread | None = None
@@ -845,6 +1154,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     # — identical on every rank, so host-side averaging needs no reduction.
     assoc_scale_sum = 0.0
     expert_scale_sum = 0.0
+    step_window_started: float | None = None
     metric_main_names: list[str] | None = None
     metric_gate_names: list[str] | None = None
 
@@ -857,20 +1167,27 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
             args.batch_size * world_size * accum,
         )
 
+    watchdog = train_mod.StepProgressWatchdog(
+        logger, args.step_watchdog_seconds, rank=rank
+    )
+    watchdog.start()
+
     def _save_checkpoint() -> None:
+        watchdog.progress(global_step, "checkpoint_save")
         save_checkpoint_fsdp2(
             model=model,
             optimizers=optimizers,
             schedulers=schedulers,
             global_step=global_step,
             current_shard_idx=current_shard_idx,
+            current_batch_idx=current_batch_idx,
             checkpoint_dir=ckpt_dir,
             logger=logger,
             validator=validator,
-            use_muon=use_muon,
             extra_payload={
                 "dl_generator_state": dl_generator.get_state(),
-                "muon_adjust_lr_fn": opt_meta.get("muon_adjust_lr_fn"),
+                "optimizer_policy": opt_meta.get("optimizer_policy"),
+                "data_runtime": data_runtime,
             },
         )
         if is_rank0 and producer is not None:
@@ -937,10 +1254,12 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 drop_last=True,  # uneven tails would deadlock collective bwd
             )
             sampler.set_epoch(current_shard_idx)  # replayable permutation
+            resume_sample_offset = current_batch_idx * args.batch_size
+            sampler_for_loader = _OffsetSampler(sampler, resume_sample_offset)
             dataloader = DataLoader(
                 dataset,
                 batch_size=args.batch_size,
-                sampler=sampler,
+                sampler=sampler_for_loader,
                 pin_memory=device.type == "cuda",
                 num_workers=args.num_workers,
                 persistent_workers=args.num_workers > 0,
@@ -955,17 +1274,20 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
             model.train()
             if is_rank0:
                 logger.info(
-                    "Shard %d | sequences=%d | per-rank batches=%d | step %d/%d",
+                    "Shard %d | sequences=%d | remaining per-rank batches=%d | "
+                    "resume batch=%d | step %d/%d",
                     current_shard_idx,
                     len(dataset),
                     len(dataloader),
+                    current_batch_idx,
                     global_step,
                     args.max_steps,
                 )
 
             shard_fully_consumed = True
             batches_iter = iter(dataloader)
-            batches_seen = 0
+            shard_resume_batch_idx = current_batch_idx
+            batches_seen = current_batch_idx
             while True:
                 if global_step >= args.max_steps:
                     # Mid-shard stop: leave the shard unmarked and the cursor
@@ -986,7 +1308,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     # Shards are immutable memmaps: first batch of every shard
                     # plus the interval cadence catches corrupt files / vocab
                     # drift at ~1/Nth of the pipeline cost (each check syncs).
-                    if batches_seen == 0 or (
+                    if batches_seen == shard_resume_batch_idx or (
                         args.validate_token_interval > 0
                         and global_step % args.validate_token_interval == 0
                     ):
@@ -1008,20 +1330,31 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
                 for opt in optimizers:
                     opt.zero_grad(set_to_none=True)
+                if step_window_started is None:
+                    step_window_started = time.perf_counter()
 
                 # Micro-steps run with gradient sync OFF; the last micro-step
                 # re-enables it so the WHOLE accumulated gradient is
                 # reduce-scattered exactly once per optimizer step.
                 if accum > 1:
                     model.set_requires_gradient_sync(False, recurse=True)
-                loss_for_metrics: torch.Tensor | None = None
+                step_metric_sums: dict[str, torch.Tensor] = {}
+                step_gate_sums: dict[str, torch.Tensor] = {}
+                schedule_scales: dict[str, float] = {}
                 for micro_idx, (m_ids, m_labels) in enumerate(micro_inputs):
                     if accum > 1 and micro_idx == len(micro_inputs) - 1:
                         model.set_requires_gradient_sync(True, recurse=True)
+                    watchdog.progress(
+                        global_step,
+                        f"forward_micro_{micro_idx + 1}/{len(micro_inputs)}",
+                    )
                     with torch.autocast(
                         device_type=device.type,
                         dtype=amp_dtype,
                         enabled=use_amp,
+                        # Keep sibling checkpoint regions and their independent
+                        # backward replays on the same parameter-cast path.
+                        cache_enabled=not args.gradient_checkpointing,
                     ):
                         outputs = model(
                             input_ids=m_ids,
@@ -1030,23 +1363,76 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                             max_training_steps=args.max_steps,
                         )
                     assert outputs.loss is not None
+                    aux = outputs.auxiliary_losses
+                    assert aux is not None
+                    weighted_t = train_mod._weighted_term_tensors(
+                        model, outputs, global_step, args.max_steps
+                    )
+                    micro_scalars: dict[str, Any] = {
+                        "loss": outputs.loss,
+                        "ce_loss": (
+                            outputs.ce_loss
+                            if outputs.ce_loss is not None
+                            else outputs.loss.new_zeros(())
+                        ),
+                        "router_aux_loss": (
+                            outputs.router_aux_loss
+                            if outputs.router_aux_loss is not None
+                            else outputs.loss.new_zeros(())
+                        ),
+                        "router_z_loss": (
+                            outputs.router_z_loss
+                            if outputs.router_z_loss is not None
+                            else outputs.loss.new_zeros(())
+                        ),
+                    }
+                    for name in (
+                        "recon",
+                        "assoc",
+                        "assoc_norm",
+                        "gate",
+                        "read",
+                        "fusion",
+                        "expert",
+                        "ssm",
+                        "slot",
+                    ):
+                        micro_scalars[name] = getattr(aux, name)
+                    for name, value in weighted_t.items():
+                        if isinstance(value, torch.Tensor):
+                            micro_scalars[name] = value
+                        else:
+                            schedule_scales[name] = float(value)
+                    for name, value in micro_scalars.items():
+                        scalar = train_mod._as_flush_scalar(value, outputs.loss.device)
+                        step_metric_sums[name] = step_metric_sums.get(name, 0) + scalar
+                    for name, value in (outputs.gate_stats or {}).items():
+                        scalar = train_mod._as_flush_scalar(value, outputs.loss.device)
+                        step_gate_sums[name] = step_gate_sums.get(name, 0) + scalar
                     # Mean-of-means: equal-size micro-batches (drop_last), so
                     # dividing by count averages correctly.
+                    watchdog.progress(
+                        global_step,
+                        f"backward_micro_{micro_idx + 1}/{len(micro_inputs)}",
+                    )
                     (outputs.loss / len(micro_inputs)).backward()
-                    if micro_idx == len(micro_inputs) - 1:
-                        loss_for_metrics = outputs.loss.detach()
 
-                assert loss_for_metrics is not None
-                outputs.loss = loss_for_metrics
+                micro_count = len(micro_inputs)
+                scalars = _mean_metric_sums(step_metric_sums, micro_count)
+                scalars.update(schedule_scales)
+                gate_stats = _mean_metric_sums(step_gate_sums, micro_count)
 
+                watchdog.progress(global_step, "optimizer_and_collectives")
+                _sync_replicated_param_grads(
+                    fsdp2_ignored_params, world_size=world_size
+                )
                 # Params are fp32 masters (see the mp_policy note above), so
                 # gradients arrive fp32 and clip sees TRUE magnitudes — no
                 # scaler unscale step exists on this bf16-autocast path.
-                grad_norm_dt = clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                grad_norm = (
-                    grad_norm_dt.full_tensor()
-                    if hasattr(grad_norm_dt, "full_tensor")
-                    else grad_norm_dt
+                grad_norm = _clip_grad_norm_fsdp2_mixed(
+                    model.parameters(),
+                    args.max_grad_norm,
+                    world_size=world_size,
                 )
                 allow_update = True
                 if args.grad_nan_guard == "strict":
@@ -1093,53 +1479,19 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         opt.step()
                     for sched in schedulers:
                         sched.step()
+                # This is the last data cursor known to correspond to a fully
+                # completed training iteration. If forward/backward raises,
+                # exception checkpointing retains the previous committed
+                # cursor and replays the interrupted update on resume.
+                current_batch_idx = batches_seen
+                watchdog.progress(global_step, "metrics_and_collectives")
                 # When strict skipped, the NaN grads die via zero_grad(
                 # set_to_none=True) at the top of the next iteration.
 
-                aux = outputs.auxiliary_losses
-                assert aux is not None
-
                 # ---- metrics: accumulate on-device, transfer on flush ------
-                weighted_t = train_mod._weighted_term_tensors(
-                    model, outputs, global_step, args.max_steps
-                )
-                scalars: dict[str, Any] = {
-                    "loss": outputs.loss,
-                    "ce_loss": (
-                        outputs.ce_loss
-                        if outputs.ce_loss is not None
-                        else outputs.loss.new_zeros(())
-                    ),
-                    "router_aux_loss": (
-                        outputs.router_aux_loss
-                        if outputs.router_aux_loss is not None
-                        else outputs.loss.new_zeros(())
-                    ),
-                    "router_z_loss": (
-                        outputs.router_z_loss
-                        if outputs.router_z_loss is not None
-                        else outputs.loss.new_zeros(())
-                    ),
-                    "grad_norm": grad_norm,
-                }
-                assoc_scale_sum += weighted_t["assoc_scale"]
-                expert_scale_sum += weighted_t["expert_scale"]
-                for name in (
-                    "recon",
-                    "assoc",
-                    "gate",
-                    "read",
-                    "fusion",
-                    "expert",
-                    "ssm",
-                    "slot",
-                ):
-                    scalars[name] = getattr(aux, name)
-                for name, value in weighted_t.items():
-                    if isinstance(value, torch.Tensor):
-                        scalars[name] = value
-
-                gate_stats = outputs.gate_stats or {}
+                scalars["grad_norm"] = grad_norm
+                assoc_scale_sum += schedule_scales["assoc_scale"]
+                expert_scale_sum += schedule_scales["expert_scale"]
                 # Schema is static for a fixed config; cache the name lists.
                 main_names = (
                     metric_main_names
@@ -1206,6 +1558,8 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     metrics = dict(zip(metric_main_names, values[:n_main]))
                     ce_smooth.update(metrics["ce_loss"])
                     window = max(metric_count, 1)
+                    assert step_window_started is not None
+                    step_time_s = (time.perf_counter() - step_window_started) / window
                     record: dict[str, Any] = {
                         "step": global_step,
                         "shard_idx": current_shard_idx,
@@ -1213,8 +1567,8 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         "assoc_scale": assoc_scale_sum / window,
                         "expert_scale": expert_scale_sum / window,
                         "ce_smooth": ce_smooth.mean,
-                        "muon_lr": float(schedulers[0].get_last_lr()[0]),
-                        "adam_lr": float(schedulers[-1].get_last_lr()[0]),
+                        "adam_lr": float(schedulers[0].get_last_lr()[0]),
+                        "step_time_s": step_time_s,
                         "gate_stats": dict(zip(metric_gate_names, values[n_main:])),
                     }
                     bad_names = {
@@ -1255,12 +1609,14 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     metric_count = 0
                     assoc_scale_sum = 0.0
                     expert_scale_sum = 0.0
+                    step_window_started = None
 
                     if (
                         validator is not None
                         and args.val_interval > 0
                         and global_step % args.val_interval == 0
                     ):
+                        watchdog.progress(global_step, "validation_collectives")
                         # Every rank evaluates the SAME replicated buffers +
                         # sharded params on the SAME cyclic rows; average the
                         # four totals for one canonical number.
@@ -1301,6 +1657,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         _write_jsonl(val_record)
                         if is_rank0:
                             logger.info(train_mod._format_val_log_line(val_record))
+                        watchdog.progress(global_step, "metrics_and_collectives")
 
                     _write_jsonl(record)
                     if is_rank0:
@@ -1310,14 +1667,16 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                             )
                         )
 
-                if global_step % args.save_interval == 0 and global_step > 0:
-                    _save_checkpoint()
+                watchdog.progress(global_step, "complete", active=False)
 
-                # Convention: global_step counts iterations ENTERED, so the
-                # first completed update logs as step=0 — identical to
-                # train.py (assoc/expert warmups, cadences, checkpoints and
-                # resume all share it).
+                # Metrics for an update use its entry step (the first is 0).
+                # The persisted cursor below is the next step to enter.
                 global_step += 1
+                # Checkpoints store the NEXT step to enter. Saving after the
+                # increment keeps schedules and cadences identical to an
+                # uninterrupted run instead of repeating a completed step.
+                if global_step % args.save_interval == 0:
+                    _save_checkpoint()
 
             if not shard_fully_consumed:
                 break
@@ -1330,6 +1689,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     f.write("done\n")
                 logger.info("Marked shard %d complete", current_shard_idx)
             current_shard_idx += 1
+            current_batch_idx = 0
 
         if global_step > 0 and global_step % args.save_interval != 0:
             _save_checkpoint()
@@ -1348,6 +1708,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         raise
 
     finally:
+        watchdog.close()
         stop_event.set()
         if producer_thread is not None:
             producer_thread.join(timeout=30.0)
@@ -1363,7 +1724,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="FSDP2 multi-GPU training for Hybrid Mamba-MoE "
-        "(Muon + AdamW hybrid; launch under torchrun).",
+        "(AdamW-only; launch under torchrun).",
     )
     parser.add_argument(
         "--run-dir",
@@ -1411,6 +1772,20 @@ def parse_args() -> argparse.Namespace:
         "runtime (torch.compile x FSDP2 wrap-order pitfalls).",
     )
     parser.add_argument("--compile-mode", type=str, default="default")
+    checkpointing = parser.add_mutually_exclusive_group()
+    checkpointing.add_argument(
+        "--gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_true",
+        help="Checkpoint decoder layers with use_reentrant=False to reduce VRAM.",
+    )
+    checkpointing.add_argument(
+        "--no-gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action="store_false",
+        help="Disable decoder-layer gradient checkpointing (default).",
+    )
+    parser.set_defaults(gradient_checkpointing=False)
 
     parser.add_argument("--vocab-size", type=int, default=32000)
     parser.add_argument(
@@ -1422,23 +1797,23 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Cosine floor as fraction of peak LR.",
     )
-    # Moonshot Muon (arXiv:2502.16982): with match_rms_adamw, share eta and
-    # weight decay across Muon + AdamW.
     parser.add_argument(
         "--lr",
         type=float,
         default=1e-3,
-        help="Shared peak LR for Muon and AdamW when --muon-lr/--adam-lr are "
-        "unset (Moonlight-style after update-RMS matching).",
+        help="AdamW peak LR when --adam-lr is unset.",
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.1,
-        help="Decoupled weight decay for Muon and AdamW (Moonlight uses 0.1).",
+        help="Decoupled AdamW weight decay.",
     )
     parser.add_argument(
-        "--muon-lr", type=float, default=None, help="Optional Muon LR override."
+        "--muon-lr",
+        type=float,
+        default=None,
+        help="Deprecated compatibility option; ignored because FSDP2 is AdamW-only.",
     )
     parser.add_argument(
         "--adam-lr", type=float, default=None, help="Optional AdamW LR override."
@@ -1447,31 +1822,33 @@ def parse_args() -> argparse.Namespace:
         "--muon-momentum",
         type=float,
         default=0.95,
-        help="Muon momentum mu (paper / Keller default: 0.95).",
+        help="Deprecated compatibility option; ignored by FSDP2.",
     )
     parser.add_argument(
         "--no-muon-nesterov",
         action="store_true",
-        help="Disable Nesterov momentum in Muon (enabled by default).",
+        help="Deprecated compatibility option; ignored by FSDP2.",
     )
     parser.add_argument(
         "--muon-ns-steps",
         type=int,
         default=5,
-        help="Newton-Schulz orthogonalization steps (paper: 5; 10 is not better).",
+        help="Deprecated compatibility option; ignored by FSDP2.",
     )
     parser.add_argument(
         "--muon-adjust-lr-fn",
         type=str,
         default="match_rms_adamw",
         choices=("match_rms_adamw", "original"),
-        help="Muon per-matrix LR scale. match_rms_adamw = Moonshot 0.2*sqrt(max(A,B)).",
+        help="Deprecated compatibility option; ignored by FSDP2.",
     )
     parser.add_argument("--adam-beta1", type=float, default=0.9)
     parser.add_argument("--adam-beta2", type=float, default=0.95)
     parser.add_argument("--adam-eps", type=float, default=1e-8)
     parser.add_argument(
-        "--no-muon", action="store_true", help="Use AdamW for all parameters."
+        "--no-muon",
+        action="store_true",
+        help="Deprecated no-op retained for command compatibility; FSDP2 is AdamW-only.",
     )
     parser.add_argument("--max-steps", type=int, default=100_000)
     parser.add_argument(
@@ -1483,6 +1860,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument(
         "--grad-accum-steps",
+        "--gradient-accumulation-steps",
+        dest="grad_accum_steps",
         type=int,
         default=1,
         help="Micro-batches per optimizer step (FSDP2 no-sync accumulation: "
@@ -1491,6 +1870,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--save-interval", type=int, default=1000)
+    parser.add_argument(
+        "--step-watchdog-seconds",
+        type=float,
+        default=300.0,
+        help="Warn per rank when a forward/backward/collective/checkpoint phase "
+        "makes no progress for this many seconds; 0 disables the watchdog.",
+    )
     parser.add_argument(
         "--validate-token-interval",
         type=int,
@@ -1572,6 +1958,8 @@ def parse_args() -> argparse.Namespace:
         "process group, no dataset imports).",
     )
     args = parser.parse_args()
+    if args.step_watchdog_seconds < 0:
+        parser.error("--step-watchdog-seconds must be >= 0")
     if not args.log_jsonl:
         args.log_jsonl = str(Path(args.run_dir) / "metrics.jsonl")
     return args
@@ -1580,6 +1968,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.ns_self_check:
+        from utils.fsdp2_muon import run_ns_self_check
+
         print("pre-training/fsdp2_train.py Newton-Schulz self-check (CPU)")
         raise SystemExit(0 if run_ns_self_check() else 1)
     if args.compile:

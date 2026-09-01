@@ -22,6 +22,7 @@ from model.hybrid.losses import (
     _expert_loss_schedule,
     associative_retrieval_loss,
     fusion_balance_loss,
+    write_gate_entropy_loss,
 )
 from model.hybrid.mamba import (
     MambaBlock,
@@ -802,6 +803,57 @@ class TestHybridModel(unittest.TestCase):
             self.assertGreaterEqual(float(v), 0.0)
             self.assertLessEqual(float(v), 1.0)
 
+    def test_gate_regularizer_penalizes_both_saturated_tails(self) -> None:
+        centered = torch.full((2, 4, 8), 0.5)
+        overwrite_saturated = torch.full_like(centered, 0.001)
+        retention_saturated = torch.full_like(centered, 0.999)
+        centered_loss = write_gate_entropy_loss(centered)
+        low_loss = write_gate_entropy_loss(overwrite_saturated)
+        high_loss = write_gate_entropy_loss(retention_saturated)
+        self.assertGreater(low_loss.item(), centered_loss.item())
+        self.assertGreater(high_loss.item(), centered_loss.item())
+        self.assertAlmostEqual(low_loss.item(), high_loss.item(), places=4)
+
+    def test_gate_and_memory_distribution_metrics_are_reported(self) -> None:
+        cfg = _small_hybrid_config(memory_chunk_size=8, num_layers=1)
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (2, 8))
+        out = model(input_ids=ids, labels=ids.clone())
+        expected = {
+            "layer_0_attn_write_gate_mean_square",
+            "layer_0_attn_write_gate_overwrite_saturated_fraction",
+            "layer_0_attn_write_gate_interior_fraction",
+            "layer_0_attn_write_gate_retention_saturated_fraction",
+            "layer_0_attn_mem_norm_mean_square",
+            "layer_0_attn_mem_norm_below_half_gamma_fraction",
+            "layer_0_attn_mem_norm_half_to_one_gamma_fraction",
+            "layer_0_attn_mem_norm_one_to_two_gamma_fraction",
+            "layer_0_attn_mem_norm_above_two_gamma_fraction",
+            "layer_0_attn_mem_norm_above_gamma_fraction",
+        }
+        self.assertTrue(expected.issubset(out.gate_stats))
+        for name in expected:
+            self.assertTrue(torch.isfinite(out.gate_stats[name]))
+        bucket_sum = sum(
+            out.gate_stats[name]
+            for name in (
+                "layer_0_attn_write_gate_overwrite_saturated_fraction",
+                "layer_0_attn_write_gate_interior_fraction",
+                "layer_0_attn_write_gate_retention_saturated_fraction",
+            )
+        )
+        self.assertAlmostEqual(float(bucket_sum), 1.0, places=5)
+        state_bucket_sum = sum(
+            out.gate_stats[name]
+            for name in (
+                "layer_0_attn_mem_norm_below_half_gamma_fraction",
+                "layer_0_attn_mem_norm_half_to_one_gamma_fraction",
+                "layer_0_attn_mem_norm_one_to_two_gamma_fraction",
+                "layer_0_attn_mem_norm_above_two_gamma_fraction",
+            )
+        )
+        self.assertAlmostEqual(float(state_bucket_sum), 1.0, places=5)
+
     def test_chunked_aux_loss_token_weighting(self) -> None:
         """When chunking is not triggered, aux/z losses match across chunk configs."""
         torch.manual_seed(9)
@@ -828,11 +880,34 @@ class TestHybridModel(unittest.TestCase):
         self.assertIsNotNone(out.auxiliary_losses)
         aux = out.auxiliary_losses
         assert aux is not None
-        for name in ("recon", "gate", "read", "fusion", "expert", "ssm", "slot"):
+        for name in (
+            "recon",
+            "assoc",
+            "gate",
+            "read",
+            "fusion",
+            "expert",
+            "ssm",
+            "slot",
+            "assoc_norm",
+        ):
             val = getattr(aux, name)
             self.assertIsNotNone(val)
             self.assertFalse(torch.isnan(val).any())
         self.assertIsNotNone(out.loss)
+        out.loss.backward()
+
+    def test_assoc_norm_loss_present_and_weighted(self) -> None:
+        cfg = _small_hybrid_config(num_layers=1, lambda_assoc_norm=1.0)
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 16))
+        labels = ids.clone()
+        out = model(input_ids=ids, labels=labels)
+        assert out.auxiliary_losses is not None
+        self.assertIsNotNone(out.auxiliary_losses.assoc_norm)
+        self.assertFalse(torch.isnan(out.auxiliary_losses.assoc_norm).any())
+        self.assertIsNotNone(out.loss)
+        self.assertTrue(torch.isfinite(out.loss))
         out.loss.backward()
 
     def test_auxiliary_losses_disabled(self) -> None:
@@ -1523,6 +1598,83 @@ class TestHybridModel(unittest.TestCase):
         ]
         self.assertEqual(len(layer_ckpts), cfg.num_layers)
         self.assertEqual(len(scan_ckpts), 0)
+        self.assertTrue(
+            all(call.kwargs.get("use_reentrant") is False for call in layer_ckpts)
+        )
+        self.assertTrue(all(call.kwargs.get("context_fn") for call in layer_ckpts))
+
+    def test_checkpointed_chunks_disable_autocast_weight_cache(self) -> None:
+        cfg = _small_hybrid_config(
+            vocab_size=512,
+            hidden_size=128,
+            head_dim=32,
+            intermediate_size=256,
+            memory_size=8,
+            memory_chunk_size=8,
+            return_logits=False,
+            use_fused_mamba_scan=False,
+        )
+        model = HybridForCausalLM(cfg).train()
+        model.gradient_checkpointing_enable()
+        cache_states: list[bool] = []
+
+        def _record_cache_state(_module, _args) -> None:
+            cache_states.append(torch.is_autocast_cache_enabled())
+
+        handles = [
+            layer.register_forward_pre_hook(_record_cache_state)
+            for layer in model.model.layers
+        ]
+        ids = torch.randint(0, cfg.vocab_size, (1, 16))
+        try:
+            with torch.autocast(
+                device_type="cpu",
+                dtype=torch.bfloat16,
+                cache_enabled=True,
+            ):
+                self.assertTrue(torch.is_autocast_cache_enabled())
+                out = model(input_ids=ids, labels=ids)
+            assert out.loss is not None
+            out.loss.backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        self.assertGreaterEqual(len(cache_states), cfg.num_layers * 2)
+        self.assertTrue(all(state is False for state in cache_states))
+
+    def test_gradient_checkpointing_lifecycle_with_frozen_embeddings(self) -> None:
+        cfg = _small_hybrid_config(memory_chunk_size=None)
+        model = HybridForCausalLM(cfg)
+        model.get_input_embeddings().weight.requires_grad_(False)
+
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        model.train()
+        self.assertTrue(model.is_gradient_checkpointing)
+        self.assertFalse(model.config.gradient_checkpointing_use_reentrant)
+        self.assertFalse(model.config.use_cache)
+        ids = torch.randint(0, cfg.vocab_size, (1, 12))
+        embedding_output = model.get_input_embeddings()(ids)
+        self.assertTrue(embedding_output.requires_grad)
+
+        labels = torch.randint(0, cfg.vocab_size, (1, 12))
+        out = model(input_ids=ids, labels=labels)
+        assert out.loss is not None
+        out.loss.backward()
+        adjacent_grad = model.model.layers[0].attention_block.q_proj.weight.grad
+        self.assertIsNotNone(adjacent_grad)
+        assert adjacent_grad is not None
+        self.assertGreater(adjacent_grad.abs().sum().item(), 0.0)
+
+        model.eval()
+        self.assertTrue(model.config.use_cache)
+        model.train()
+        self.assertFalse(model.config.use_cache)
+        model.gradient_checkpointing_disable()
+        self.assertFalse(model.is_gradient_checkpointing)
+        self.assertTrue(model.config.use_cache)
 
     def test_torch_compile_forward_parity(self) -> None:
         if not hasattr(torch, "compile"):

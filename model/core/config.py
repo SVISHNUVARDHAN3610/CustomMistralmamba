@@ -64,6 +64,12 @@ class MixtralConfig:
     # If True, lm_head.weight shares storage with embed_tokens.weight.
     tie_word_embeddings: bool = False
 
+    # Runtime cache preference. Training forwards in this repository pass
+    # ``use_cache`` explicitly, but persisting this bit makes the intended
+    # train/eval lifecycle unambiguous in checkpoints. Gradient checkpointing
+    # forces it off while training and restores it for eval/generation.
+    use_cache: bool = True
+
     def to_dict(self) -> dict[str, Any]:
         """Serializes configuration parameters to a dictionary layout."""
         return asdict(self)
@@ -116,6 +122,10 @@ class HybridMambaMoEConfig(MixtralConfig):
     blocked_scan_min_len: int = 4096
     sequential_scan_min_len: int = 65536
     gradient_checkpointing: bool = False
+    # This implementation deliberately supports only non-reentrant checkpointing.
+    # Persist the choice so resume can reject incompatible historical runs
+    # instead of hanging in a differently constructed autograd/collective graph.
+    gradient_checkpointing_use_reentrant: bool = False
     mamba_internal_checkpoint: bool = True
     debug_state_checks: bool = False
     use_grouped_moe_dispatch: bool = True
@@ -135,11 +145,33 @@ class HybridMambaMoEConfig(MixtralConfig):
     # Auxiliary training losses (see loss-definitions.md). Training-only.
     use_auxiliary_losses: bool = True
     lambda_recon: float = 0.08
-    lambda_assoc: float = 1.2e-4
+    # NOTE: lambda_assoc is calibrated for the MEAN over hidden of the squared
+    # retrieval error on L2-normalized vectors (err in [0, 4]). 0.0614 = 1.2e-4 * 512
+    # preserves the original effective weighting under the normalized/mean formulation.
+    lambda_assoc: float = 0.0614
     assoc_warmup_fraction: float = 0.05
     assoc_sample_count: int = 24
+    # T-C1 fix: hard upper bound on the per-sample associative retrieval error
+    # (applied inside associative_retrieval_loss after L2 normalization).
+    # After normalization the true maximum MSE is 4.0; 25.0 is a defensive cap.
+    assoc_err_clip: float = 25.0
+    # T-7 fix: Hinge penalty (see assoc_state_norm_loss) keeping the post-write memory
+    # bank state bounded; ssm_state_norm_loss analog. Per-layer gammas are
+    # calibrated to the `assoc_norm_gamma_quantile` percentile of a dummy
+    # write's state norm at the first training forward.
+    lambda_assoc_norm: float = 1e-3
+    assoc_norm_gamma_quantile: float = 0.9
+    # Fallback gamma before calibration (approx. E[x^2] for init_range=0.02
+    # hidden activations: (0.02^2)/3 ≈ 1.3e-4, padded to 1e-3).
+    assoc_norm_gamma_init: float = 1e-3
     lambda_gate: float = 1e-3
     gate_entropy_eps: float = 1e-6
+    # The entropy term has its optimum at 0.5. This additional soft barrier
+    # gives saturated gates a direct, scale-controlled penalty outside
+    # [threshold, 1-threshold]. In this model gate=1 retains old memory and
+    # gate=0 overwrites it, so both tails are undesirable when persistent.
+    gate_saturation_threshold: float = 0.05
+    gate_saturation_penalty_weight: float = 1.0
     lambda_read: float = 5e-3
     read_util_min_fraction: float = 0.15
     lambda_fusion: float = 8e-3

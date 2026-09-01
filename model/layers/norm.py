@@ -3,6 +3,8 @@
 import torch
 from torch import nn
 
+from model.core.fsdp import local_dtensor
+
 
 class RMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
@@ -17,4 +19,4 @@ class RMSNorm(nn.Module):
         variance = x_fp32.pow(2).mean(-1, keepdim=True)
         norm_x = torch.rsqrt(variance + self.eps)
 
-        return (x_fp32 * norm_x).to(input_dtype) * self.weight
+        return (x_fp32 * norm_x).to(input_dtype) * local_dtensor(self.weight)

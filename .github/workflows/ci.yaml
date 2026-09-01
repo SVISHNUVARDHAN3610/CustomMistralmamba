@@ -58,7 +58,10 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+        run: pip install "torch==2.6.0" --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Verify pinned FSDP2 APIs
+        run: python -c "from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard; from torch.distributed.checkpoint.state_dict import StateDictOptions; print('FSDP2 API contract PASS')"
 
       - name: Run unit tests
         run: python -m unittest tests.test_model -v
@@ -67,3 +70,6 @@ jobs:
         # The only gate exercising chunked-BPTT *backward* (the unit suite
         # covers forward parity); a regression here previously shipped green.
         run: python -m unittest tests.test_toy_train_smoke -v
+
+      - name: Run FSDP2 contract tests
+        run: python -m unittest tests.test_fsdp2_contracts -v
