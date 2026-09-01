@@ -77,6 +77,7 @@ if str(ROOT) not in sys.path:
 from model.core.builders import count_trainable_params
 from model.core.constants import MEMORY_NAN_FIX_ID
 from model.core.optim import _is_adamw_no_decay, split_muon_adam_params
+from model.hybrid.layer import HybridDecoderLayer
 from model.hybrid.mamba import (
     MambaBlock,
     fused_mamba_scan_available,
@@ -186,6 +187,17 @@ def _prepare_fsdp2_custom_math_params(
         if isinstance(module, RMSNorm):
             for param in module.parameters(recurse=False):
                 add(param)
+        elif isinstance(module, HybridDecoderLayer) and module.use_dual_memory:
+            # These projections are siblings of the memory banks, rather than
+            # children of them. Checkpoint replay can otherwise enter their
+            # nn.Linear calls with a local Tensor activation and a DTensor
+            # weight before FSDP2 has materialized the weight.
+            for combine in (
+                module.attn_memory_combine,
+                module.state_memory_combine,
+            ):
+                for param in combine.parameters(recurse=False):
+                    add(param)
         elif isinstance(module, CompressiveMemoryBank):
             for param in module.parameters(recurse=True):
                 add(param)
