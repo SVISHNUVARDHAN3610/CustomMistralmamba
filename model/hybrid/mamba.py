@@ -268,7 +268,7 @@ class MambaBlock(nn.Module):
         device: torch.device,
         dtype: torch.dtype | None = None,
     ) -> MambaCache:
-        conv_dtype = self.conv1d.weight.dtype if dtype is None else dtype
+        conv_dtype = local_dtensor(self.conv1d.weight).dtype if dtype is None else dtype
         ssm_dtype = torch.float32
         conv_state = torch.zeros(
             batch_size,

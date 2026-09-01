@@ -14,6 +14,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from model.core.config import HybridMambaMoEConfig, MambaCache
+from model.core.fsdp import local_dtensor
 from model.hybrid.layer import (
     HybridDecoderLayer,
     HybridMemoryState,
@@ -146,8 +147,9 @@ class HybridModel(nn.Module):
                 layer.ssm_norm_gamma = self.ssm_norm_gammas[i]
             return
 
-        device = self.embed_tokens.weight.device
-        dtype = self.embed_tokens.weight.dtype
+        embed_weight = local_dtensor(self.embed_tokens.weight)
+        device = embed_weight.device
+        dtype = embed_weight.dtype
         dummy = torch.randn(
             batch_size, seq_len, self.config.hidden_size, device=device, dtype=dtype
         )
@@ -839,9 +841,7 @@ class HybridForCausalLM(nn.Module):
         total_chunk_len = 0
         ce_loss_sum = torch.tensor(0.0, device=device)
         vocab_z_sum = torch.tensor(0.0, device=device)
-        aux_weighted = HybridLayerAuxLosses.zeros(
-            device, self.model.embed_tokens.weight.dtype
-        )
+        aux_weighted: HybridLayerAuxLosses | None = None
 
         for start in range(0, seq_len, chunk_size):
             end = min(start + chunk_size, seq_len)
@@ -878,6 +878,8 @@ class HybridForCausalLM(nn.Module):
                 training_step=training_step,
                 max_training_steps=max_training_steps,
             )
+            if aux_weighted is None:
+                aux_weighted = HybridLayerAuxLosses.zeros(device, hidden_states.dtype)
             chunk_logits: Tensor | None = None
             if labels is not None:
                 chunk_labels = labels[:, start:end]
@@ -920,6 +922,7 @@ class HybridForCausalLM(nn.Module):
                     gate_stat_counts[key] += 1
 
         logits = torch.cat(logits_chunks, dim=1) if materialize_logits else None
+        assert aux_weighted is not None
         chunk_tw = max(total_chunk_len, 1)
         aux_loss = total_aux / chunk_tw
         z_loss = total_z / chunk_tw
@@ -944,7 +947,7 @@ class HybridForCausalLM(nn.Module):
             aux_total = self._weighted_auxiliary_loss(
                 auxiliary_losses,
                 device=device,
-                dtype=self.model.embed_tokens.weight.dtype,
+                dtype=aux_weighted.recon.dtype,
                 training_step=training_step,
                 max_training_steps=max_training_steps,
             )

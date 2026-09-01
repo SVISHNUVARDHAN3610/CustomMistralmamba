@@ -976,6 +976,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     # Calibration AFTER process-group init (its rank0 broadcast engages) and
     # BEFORE fully_shard (plain params/buffers, no DTensor plumbing yet). It
     # lives on the inner HybridModel, not the HybridForCausalLM wrapper.
+    # Must stay before ``fully_shard``: calibration directly executes each
+    # Mamba block with a dummy input, so the standard Mamba projections must
+    # still be ordinary tensors rather than FSDP2-managed DTensors.
     model.model.calibrate_ssm_norm_thresholds()
     reset_mamba_scan_stats()
     n_params = count_trainable_params(model)

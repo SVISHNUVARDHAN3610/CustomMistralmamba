@@ -176,12 +176,17 @@ class DroplessMoELayer(nn.Module):
     def _stack_expert_weights(
         self,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        if any(
+            type(expert.w_gate.weight).__name__ == "DTensor" for expert in self.experts
+        ):
+            raise RuntimeError(
+                "Grouped MoE dispatch is incompatible with FSDP2-sharded expert "
+                "weights. Disable grouped dispatch or use per-expert module calls."
+            )
         w_gate = torch.stack(
             [local_dtensor(e.w_gate.weight) for e in self.experts], dim=0
         )
-        w_up = torch.stack(
-            [local_dtensor(e.w_up.weight) for e in self.experts], dim=0
-        )
+        w_up = torch.stack([local_dtensor(e.w_up.weight) for e in self.experts], dim=0)
         w_down = torch.stack(
             [local_dtensor(e.w_down.weight) for e in self.experts], dim=0
         )
