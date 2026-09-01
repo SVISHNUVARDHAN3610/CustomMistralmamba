@@ -77,6 +77,5 @@ class TestToyTrainSmoke(unittest.TestCase):
         optimizer.zero_grad(set_to_none=True)
 
 
-
 if __name__ == "__main__":
     unittest.main()

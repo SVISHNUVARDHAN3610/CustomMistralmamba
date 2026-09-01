@@ -411,7 +411,9 @@ def audit_optimizer_lr(
             max_scale = max(muon_scale_factors)
             audit["muon_mean_effective_lr"] = muon_base_lr * mean_scale
             audit["muon_max_effective_lr"] = muon_base_lr * max_scale
-            audit["effective_lr_ratio_mean"] = (muon_base_lr * mean_scale) / adam_base_lr
+            audit["effective_lr_ratio_mean"] = (
+                muon_base_lr * mean_scale
+            ) / adam_base_lr
             audit["effective_lr_ratio_max"] = (muon_base_lr * max_scale) / adam_base_lr
             logger.info(
                 "T-6 optimizer LR audit:\n"
@@ -1430,8 +1432,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         with jsonl_path.open("a", encoding="utf-8") as _f:
             _f.write(
-                json.dumps({"event": "optimizer_audit", "step": 0, **_lr_audit})
-                + "\n"
+                json.dumps({"event": "optimizer_audit", "step": 0, **_lr_audit}) + "\n"
             )
 
     validator: WikiTextCyclicValidator | None = None
@@ -2013,7 +2014,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         and global_step % args.lr_audit_interval == 0
                         and global_step > 0
                     ):
-                        _periodic_audit = audit_optimizer_lr(optimizers, use_muon, logger)
+                        _periodic_audit = audit_optimizer_lr(
+                            optimizers, use_muon, logger
+                        )
                         if jsonl_path is not None:
                             with jsonl_path.open("a", encoding="utf-8") as f:
                                 f.write(

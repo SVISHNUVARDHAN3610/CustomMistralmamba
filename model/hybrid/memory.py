@@ -355,7 +355,9 @@ class CompressiveMemoryBank(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         kpm = self._key_padding_mask(attention_mask)
         batch_size = x.size(0)
-        query = local_dtensor(self.summary_query).unsqueeze(0).expand(batch_size, -1, -1)
+        query = (
+            local_dtensor(self.summary_query).unsqueeze(0).expand(batch_size, -1, -1)
+        )
         chunk_summary = self._attend(
             query, x, x, key_padding_mask=kpm, fast_path=fast_path
         )
