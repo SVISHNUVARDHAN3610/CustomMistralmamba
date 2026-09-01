@@ -64,7 +64,6 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
@@ -218,6 +217,61 @@ def _sync_replicated_param_grads(
             continue
         torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.SUM)
         grad.div_(world_size)
+
+
+def _clip_grad_norm_fsdp2_mixed(
+    parameters,
+    max_norm: float,
+    *,
+    world_size: int,
+) -> torch.Tensor:
+    """Clip gradients for mixed FSDP2 DTensor and replicated plain params.
+
+    ``torch.nn.utils.clip_grad_norm_`` can route through foreach/fused paths
+    that assume a homogeneous tensor representation. This trainer deliberately
+    has both FSDP2-managed DTensor gradients and ignored replicated Tensor
+    gradients, so compute the norm and scaling explicitly.
+
+    Replicated Tensor gradients have already been averaged across ranks by
+    ``_sync_replicated_param_grads``; count one logical copy in the global norm
+    by dividing their local contribution by ``world_size`` before all-reduce.
+    DTensor gradients contribute their local shard, and the all-reduce sums the
+    complete global parameter norm.
+    """
+    params = list(parameters)
+    device = None
+    total_sq = None
+
+    for param in params:
+        grad = param.grad
+        if grad is None:
+            continue
+        local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
+        if device is None:
+            device = local_grad.device
+            total_sq = torch.zeros((), device=device, dtype=torch.float32)
+        contrib = local_grad.detach().float().pow(2).sum()
+        if not hasattr(grad, "to_local") and world_size > 1:
+            contrib = contrib / world_size
+        total_sq = total_sq + contrib
+
+    if total_sq is None:
+        fallback_device = params[0].device if params else torch.device("cpu")
+        return torch.zeros((), device=fallback_device, dtype=torch.float32)
+
+    if world_size > 1:
+        torch.distributed.all_reduce(total_sq, op=torch.distributed.ReduceOp.SUM)
+    total_norm = total_sq.sqrt()
+
+    # If the norm is non-finite, report it and let the configured nan-guard
+    # decide whether to skip or sanitize. Scaling by NaN would hide the source.
+    if torch.isfinite(total_norm):
+        clip_coef = max_norm / (total_norm.item() + 1e-6)
+        if clip_coef < 1.0:
+            for param in params:
+                if param.grad is not None:
+                    param.grad.mul_(clip_coef)
+    return total_norm
 
 
 # ---------------------------------------------------------------------------
@@ -931,20 +985,31 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     use_amp = device.type == "cuda" and not args.no_amp
     amp_dtype = torch.bfloat16  # main() rejects anything else
     fully_shard = api["fully_shard"]
-    # Inner-to-outer: layers first (independent reshard-after-forward /
-    # prefetch), then the root gathers everything left outside the layers.
+    # Inner-to-outer: layers first (independent communication groups), then
+    # the root gathers everything left outside the layers. With activation
+    # checkpointing, the layer's backward replay executes regular nn.Linear
+    # calls while FSDP2 params would otherwise be back in DTensor form after
+    # the original forward. Keeping checkpointed layer params unsharded until
+    # backward completes preserves the Tensor/parameter contract for replay.
+    layer_reshard_after_forward = not args.gradient_checkpointing
     for layer in model.model.layers:
         layer_param_ids = {id(param) for param in layer.parameters()}
         layer_ignored_params = {
             param for param in fsdp2_ignored_params if id(param) in layer_param_ids
         }
-        fully_shard(layer, mp_policy=mp_policy, ignored_params=layer_ignored_params)
+        fully_shard(
+            layer,
+            mp_policy=mp_policy,
+            ignored_params=layer_ignored_params,
+            reshard_after_forward=layer_reshard_after_forward,
+        )
     fully_shard(model, mp_policy=mp_policy, ignored_params=fsdp2_ignored_params)
     logger.info(
-        "fully_shard applied: layers=%d world=%d mp=%s",
+        "fully_shard applied: layers=%d world=%d mp=%s layer_reshard_after_forward=%s",
         len(model.model.layers),
         world_size,
         f"{'autocast-bf16' if use_amp else 'fp32'}/fp32-params/fp32-reduce",
+        layer_reshard_after_forward,
     )
 
     optimizers, use_muon, opt_meta = build_fsdp2_optimizers(
@@ -1265,11 +1330,10 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 # Params are fp32 masters (see the mp_policy note above), so
                 # gradients arrive fp32 and clip sees TRUE magnitudes — no
                 # scaler unscale step exists on this bf16-autocast path.
-                grad_norm_dt = clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                grad_norm = (
-                    grad_norm_dt.full_tensor()
-                    if hasattr(grad_norm_dt, "full_tensor")
-                    else grad_norm_dt
+                grad_norm = _clip_grad_norm_fsdp2_mixed(
+                    model.parameters(),
+                    args.max_grad_norm,
+                    world_size=world_size,
                 )
                 allow_update = True
                 if args.grad_nan_guard == "strict":

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from model.core.dtype import _is_low_precision, _promote_fp32, _restore_dtype
+from model.core.fsdp import local_dtensor
 
 if TYPE_CHECKING:
     from model.hybrid.memory import CompressiveMemoryBank
@@ -110,7 +111,7 @@ def masked_token_mse(
 def combine_read_utilization_loss(
     combine: nn.Linear, r_min: float, eps: float = 1e-6
 ) -> Tensor:
-    weight = combine.weight
+    weight = local_dtensor(combine.weight)
     hidden = weight.size(0)
     w_own = weight[:, :hidden]
     w_mem = weight[:, hidden:]
