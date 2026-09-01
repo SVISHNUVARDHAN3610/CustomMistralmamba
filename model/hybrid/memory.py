@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from model.core.dtype import _is_low_precision, _promote_fp32, _restore_dtype
+from model.core.fsdp import local_dtensor
 from model.hybrid.losses import MemoryReconstructionDecoder
 
 
@@ -254,7 +255,8 @@ class CompressiveMemoryBank(nn.Module):
         self, batch_size: int, device: torch.device, dtype: torch.dtype
     ) -> Tensor:
         return (
-            self.init_memory.unsqueeze(0)
+            local_dtensor(self.init_memory)
+            .unsqueeze(0)
             .expand(batch_size, -1, -1)
             .to(device=device, dtype=dtype)
             .clone()
@@ -353,7 +355,7 @@ class CompressiveMemoryBank(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor]:
         kpm = self._key_padding_mask(attention_mask)
         batch_size = x.size(0)
-        query = self.summary_query.unsqueeze(0).expand(batch_size, -1, -1)
+        query = local_dtensor(self.summary_query).unsqueeze(0).expand(batch_size, -1, -1)
         chunk_summary = self._attend(
             query, x, x, key_padding_mask=kpm, fast_path=fast_path
         )
@@ -389,10 +391,25 @@ def batched_dual_memory_read(
     values = keys
     bank_idx = torch.arange(2 * bsz, device=x.device) // bsz
 
-    q_w = torch.stack([bank_a.q_proj.weight, bank_b.q_proj.weight], dim=0)
-    k_w = torch.stack([bank_a.k_proj.weight, bank_b.k_proj.weight], dim=0)
-    v_w = torch.stack([bank_a.v_proj.weight, bank_b.v_proj.weight], dim=0)
-    out_w = torch.stack([bank_a.out_proj.weight, bank_b.out_proj.weight], dim=0)
+    q_w = torch.stack(
+        [local_dtensor(bank_a.q_proj.weight), local_dtensor(bank_b.q_proj.weight)],
+        dim=0,
+    )
+    k_w = torch.stack(
+        [local_dtensor(bank_a.k_proj.weight), local_dtensor(bank_b.k_proj.weight)],
+        dim=0,
+    )
+    v_w = torch.stack(
+        [local_dtensor(bank_a.v_proj.weight), local_dtensor(bank_b.v_proj.weight)],
+        dim=0,
+    )
+    out_w = torch.stack(
+        [
+            local_dtensor(bank_a.out_proj.weight),
+            local_dtensor(bank_b.out_proj.weight),
+        ],
+        dim=0,
+    )
 
     q = torch.bmm(queries, q_w[bank_idx].transpose(1, 2))
     k = torch.bmm(keys, k_w[bank_idx].transpose(1, 2))
@@ -439,8 +456,8 @@ def _batched_memory_summarize(
 
     queries = torch.cat(
         [
-            bank_a.summary_query.unsqueeze(0).expand(bsz, -1, -1),
-            bank_b.summary_query.unsqueeze(0).expand(bsz, -1, -1),
+            local_dtensor(bank_a.summary_query).unsqueeze(0).expand(bsz, -1, -1),
+            local_dtensor(bank_b.summary_query).unsqueeze(0).expand(bsz, -1, -1),
         ],
         dim=0,
     )
@@ -448,10 +465,25 @@ def _batched_memory_summarize(
     values = keys
     bank_idx = torch.arange(2 * bsz, device=buf_a.device) // bsz
 
-    q_w = torch.stack([bank_a.q_proj.weight, bank_b.q_proj.weight], dim=0)
-    k_w = torch.stack([bank_a.k_proj.weight, bank_b.k_proj.weight], dim=0)
-    v_w = torch.stack([bank_a.v_proj.weight, bank_b.v_proj.weight], dim=0)
-    out_w = torch.stack([bank_a.out_proj.weight, bank_b.out_proj.weight], dim=0)
+    q_w = torch.stack(
+        [local_dtensor(bank_a.q_proj.weight), local_dtensor(bank_b.q_proj.weight)],
+        dim=0,
+    )
+    k_w = torch.stack(
+        [local_dtensor(bank_a.k_proj.weight), local_dtensor(bank_b.k_proj.weight)],
+        dim=0,
+    )
+    v_w = torch.stack(
+        [local_dtensor(bank_a.v_proj.weight), local_dtensor(bank_b.v_proj.weight)],
+        dim=0,
+    )
+    out_w = torch.stack(
+        [
+            local_dtensor(bank_a.out_proj.weight),
+            local_dtensor(bank_b.out_proj.weight),
+        ],
+        dim=0,
+    )
 
     q = torch.bmm(queries, q_w[bank_idx].transpose(1, 2))
     k = torch.bmm(keys, k_w[bank_idx].transpose(1, 2))
@@ -507,15 +539,21 @@ def batched_dual_memory_write(
         bank_a, bank_b, buf_attn, buf_mamba, kpm, fast_path
     )
 
-    gate_w = torch.stack([bank_a.write_gate.weight, bank_b.write_gate.weight], dim=0)
+    gate_w = torch.stack(
+        [
+            local_dtensor(bank_a.write_gate.weight),
+            local_dtensor(bank_b.write_gate.weight),
+        ],
+        dim=0,
+    )
     gate_b = torch.stack(
         [
-            bank_a.write_gate.bias
+            local_dtensor(bank_a.write_gate.bias)
             if bank_a.write_gate.bias is not None
             else torch.zeros(
                 bank_a.hidden_size, device=buf_attn.device, dtype=buf_attn.dtype
             ),
-            bank_b.write_gate.bias
+            local_dtensor(bank_b.write_gate.bias)
             if bank_b.write_gate.bias is not None
             else torch.zeros(
                 bank_b.hidden_size, device=buf_attn.device, dtype=buf_attn.dtype
@@ -524,7 +562,11 @@ def batched_dual_memory_write(
         dim=0,
     )
     update_w = torch.stack(
-        [bank_a.write_update.weight, bank_b.write_update.weight], dim=0
+        [
+            local_dtensor(bank_a.write_update.weight),
+            local_dtensor(bank_b.write_update.weight),
+        ],
+        dim=0,
     )
     bsz = buf_attn.size(0)
     bank_idx = torch.arange(2 * bsz, device=buf_attn.device) // bsz

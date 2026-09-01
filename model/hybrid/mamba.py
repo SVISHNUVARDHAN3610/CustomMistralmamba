@@ -12,6 +12,7 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from model.core.config import HybridMambaMoEConfig, MambaCache
+from model.core.fsdp import local_dtensor
 from model.hybrid.memory import _assert_right_padded_attention_mask
 
 
@@ -362,14 +363,15 @@ class MambaBlock(nn.Module):
         )
         dt = F.softplus(self.dt_proj(dt))
 
-        A = -torch.exp(self.A_log.float())
+        A = -torch.exp(local_dtensor(self.A_log).float())
+        D = local_dtensor(self.D)
         y, ssm_state = self._selective_scan(
             x_conv,
             dt,
             A,
             B_param,
             C_param,
-            self.D,
+            D,
             return_final_state=True,
             use_parallel_scan=self.use_parallel_scan,
             use_fused_scan=self.use_fused_scan,
@@ -412,9 +414,10 @@ class MambaBlock(nn.Module):
         # Shift conv buffer in-place (slice copy, no full tensor roll).
         conv_state[:, :, :-1].copy_(conv_state[:, :, 1:])
         conv_state[:, :, -1] = x_in
-        x_conv = torch.sum(conv_state * self.conv1d.weight.squeeze(1), dim=-1)
+        conv_weight = local_dtensor(self.conv1d.weight)
+        x_conv = torch.sum(conv_state * conv_weight.squeeze(1), dim=-1)
         if self.conv1d.bias is not None:
-            x_conv = x_conv + self.conv1d.bias
+            x_conv = x_conv + local_dtensor(self.conv1d.bias)
         x_conv = F.silu(x_conv).to(dtype=dtype)
 
         x_dbl = self.x_proj(x_conv)
@@ -423,7 +426,7 @@ class MambaBlock(nn.Module):
         )
         dt = F.softplus(self.dt_proj(dt))
 
-        A = -torch.exp(self.A_log.float())
+        A = -torch.exp(local_dtensor(self.A_log).float())
         dt_f = dt.float()
         dA = torch.exp(dt_f.unsqueeze(-1) * A)  # [B, d_inner, n]
         dB_u = (
@@ -433,7 +436,7 @@ class MambaBlock(nn.Module):
         )
         ssm_state = ssm_state.float() * dA + dB_u
         y = (ssm_state * C_param.float().unsqueeze(1)).sum(dim=-1)
-        y = (y + x_conv.float() * self.D.float()).to(dtype)
+        y = (y + x_conv.float() * local_dtensor(self.D).float()).to(dtype)
         y = y * F.silu(z)
         out = self.out_proj(y).unsqueeze(1)
 
