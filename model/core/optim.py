@@ -32,6 +32,8 @@ def _is_adamw_parameter(name: str, param: nn.Parameter) -> bool:
       - Mamba Conv1d weights are 3D -> AdamW.
       - Dual-memory slot banks (init_memory / summary_query) are embedding-like -> AdamW.
     """
+    if getattr(param, "_fsdp2_force_adamw", False):
+        return True
     if getattr(param, "_no_weight_decay", False):
         return True
     if param.ndim != 2:

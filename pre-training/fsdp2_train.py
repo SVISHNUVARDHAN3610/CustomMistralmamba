@@ -79,11 +79,15 @@ from model.core.builders import count_trainable_params
 from model.core.constants import MEMORY_NAN_FIX_ID
 from model.core.optim import _is_adamw_no_decay, split_muon_adam_params
 from model.hybrid.mamba import (
+    MambaBlock,
     fused_mamba_scan_available,
     get_mamba_scan_stats,
     log_mamba_backend,
     reset_mamba_scan_stats,
 )
+from model.hybrid.memory import CompressiveMemoryBank
+from model.layers.moe import DroplessMoELayer
+from model.layers.norm import RMSNorm
 from utils.fsdp2_muon import MuonDTensor, run_ns_self_check
 
 
@@ -148,6 +152,72 @@ def _require_fsdp2() -> dict[str, Any]:
         "DTensor": DTensor,
         "distribute_tensor": distribute_tensor,
     }
+
+
+def _prepare_fsdp2_custom_math_params(
+    model: torch.nn.Module,
+) -> list[torch.nn.Parameter]:
+    """Keep custom direct-math parameters replicated under FSDP2.
+
+    FSDP2 temporarily represents sharded parameters as DTensors. Standard
+    module calls such as ``nn.Linear`` are safe, but this model has several
+    custom kernels/fast paths that read parameters directly (RMSNorm gains,
+    dual-memory stacked projections, Mamba A/D vectors). Under activation
+    checkpoint recompute those direct reads can see sharded DTensors, causing
+    either Tensor/DTensor mixed-dispatch errors or local-shard shape mismatches.
+
+    Mark those parameters as ignored for ``fully_shard`` and force them into
+    AdamW; their gradients are averaged explicitly by
+    ``_sync_replicated_param_grads`` before clipping/stepping.
+    """
+    ignored: list[torch.nn.Parameter] = []
+    seen: set[int] = set()
+
+    def add(param: torch.nn.Parameter | None) -> None:
+        if param is None:
+            return
+        param_id = id(param)
+        if param_id in seen:
+            return
+        seen.add(param_id)
+        param._fsdp2_force_adamw = True  # type: ignore[attr-defined]
+        ignored.append(param)
+
+    for module in model.modules():
+        if isinstance(module, RMSNorm):
+            for param in module.parameters(recurse=False):
+                add(param)
+        elif isinstance(module, CompressiveMemoryBank):
+            for param in module.parameters(recurse=True):
+                add(param)
+        elif isinstance(module, MambaBlock):
+            add(module.A_log)
+            add(module.D)
+
+        if isinstance(module, DroplessMoELayer):
+            # Grouped/stacked expert dispatch reads expert weights directly and
+            # bypasses each expert module's FSDP2 hooks. The loop dispatch calls
+            # the expert modules normally, so each expert can be safely sharded.
+            module.use_grouped_moe_dispatch = False
+            module.use_grouped_gemm = False
+
+    return ignored
+
+
+def _sync_replicated_param_grads(
+    params: list[torch.nn.Parameter],
+    *,
+    world_size: int,
+) -> None:
+    """Average gradients for FSDP2 ignored replicated parameters."""
+    if world_size <= 1:
+        return
+    for param in params:
+        grad = param.grad
+        if grad is None or hasattr(grad, "full_tensor"):
+            continue
+        torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.SUM)
+        grad.div_(world_size)
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +877,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     )
 
     model = train_mod.HybridForCausalLM(cfg).to(device)
+    fsdp2_ignored_params = _prepare_fsdp2_custom_math_params(model)
     train_mod.configure_gradient_checkpointing(
         model, args.gradient_checkpointing, logger
     )
@@ -845,6 +916,11 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     if is_rank0:
         # numel() on Shard(0) DTensors reports GLOBAL counts.
         logger.info("trainable_params=%s (%.3fB)", f"{n_params:,}", n_params / 1e9)
+        logger.info(
+            "FSDP2 replicated custom-math params=%d (RMSNorm/memory-bank/Mamba "
+            "vectors); gradients are all-reduced manually",
+            len(fsdp2_ignored_params),
+        )
 
     api = _require_fsdp2()
     # Params stay fp32; the autocast below provides bf16 compute, mirroring
@@ -858,8 +934,12 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     # Inner-to-outer: layers first (independent reshard-after-forward /
     # prefetch), then the root gathers everything left outside the layers.
     for layer in model.model.layers:
-        fully_shard(layer, mp_policy=mp_policy)
-    fully_shard(model, mp_policy=mp_policy)
+        layer_param_ids = {id(param) for param in layer.parameters()}
+        layer_ignored_params = [
+            param for param in fsdp2_ignored_params if id(param) in layer_param_ids
+        ]
+        fully_shard(layer, mp_policy=mp_policy, ignored_params=layer_ignored_params)
+    fully_shard(model, mp_policy=mp_policy, ignored_params=fsdp2_ignored_params)
     logger.info(
         "fully_shard applied: layers=%d world=%d mp=%s",
         len(model.model.layers),
@@ -1179,6 +1259,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 outputs.loss = loss_for_metrics
 
                 watchdog.progress(global_step, "optimizer_and_collectives")
+                _sync_replicated_param_grads(
+                    fsdp2_ignored_params, world_size=world_size
+                )
                 # Params are fp32 masters (see the mp_policy note above), so
                 # gradients arrive fp32 and clip sees TRUE magnitudes — no
                 # scaler unscale step exists on this bf16-autocast path.
