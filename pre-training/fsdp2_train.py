@@ -156,7 +156,7 @@ def _require_fsdp2() -> dict[str, Any]:
 
 def _prepare_fsdp2_custom_math_params(
     model: torch.nn.Module,
-) -> list[torch.nn.Parameter]:
+) -> set[torch.nn.Parameter]:
     """Keep custom direct-math parameters replicated under FSDP2.
 
     FSDP2 temporarily represents sharded parameters as DTensors. Standard
@@ -170,7 +170,7 @@ def _prepare_fsdp2_custom_math_params(
     AdamW; their gradients are averaged explicitly by
     ``_sync_replicated_param_grads`` before clipping/stepping.
     """
-    ignored: list[torch.nn.Parameter] = []
+    ignored: set[torch.nn.Parameter] = set()
     seen: set[int] = set()
 
     def add(param: torch.nn.Parameter | None) -> None:
@@ -181,7 +181,7 @@ def _prepare_fsdp2_custom_math_params(
             return
         seen.add(param_id)
         param._fsdp2_force_adamw = True  # type: ignore[attr-defined]
-        ignored.append(param)
+        ignored.add(param)
 
     for module in model.modules():
         if isinstance(module, RMSNorm):
@@ -205,7 +205,7 @@ def _prepare_fsdp2_custom_math_params(
 
 
 def _sync_replicated_param_grads(
-    params: list[torch.nn.Parameter],
+    params: set[torch.nn.Parameter],
     *,
     world_size: int,
 ) -> None:
@@ -935,9 +935,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     # prefetch), then the root gathers everything left outside the layers.
     for layer in model.model.layers:
         layer_param_ids = {id(param) for param in layer.parameters()}
-        layer_ignored_params = [
+        layer_ignored_params = {
             param for param in fsdp2_ignored_params if id(param) in layer_param_ids
-        ]
+        }
         fully_shard(layer, mp_policy=mp_policy, ignored_params=layer_ignored_params)
     fully_shard(model, mp_policy=mp_policy, ignored_params=fsdp2_ignored_params)
     logger.info(
