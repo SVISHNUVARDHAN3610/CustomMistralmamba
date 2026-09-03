@@ -584,7 +584,7 @@ class HybridForCausalLM(nn.Module):
         # KV/Mamba cache materialization is only for autoregressive inference/eval.
         # During training, use_cache must always be False to avoid retaining
         # autograd history and breaking memory chunking.
-        self.config.use_cache = False if mode else True
+        self.config.use_cache = not mode
         return self
 
     def _init_weights(self, module: nn.Module) -> None:

@@ -62,6 +62,7 @@ import random
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +94,7 @@ from model.layers.norm import RMSNorm
 
 FSDP2_CHECKPOINT_FAMILY = "fsdp2"
 FSDP2_OPTIMIZER_POLICY = "fsdp2_adamw"
+FSDP2_REPLICATED_GRAD_BUCKET_CAP_MB = 25.0
 
 
 def _runtime_environment(world_size: int) -> dict[str, Any]:
@@ -284,20 +286,130 @@ def _prepare_fsdp2_custom_math_params(
     return ignored
 
 
+def _ordered_replicated_params(
+    model: torch.nn.Module,
+    ignored_params: set[torch.nn.Parameter],
+) -> tuple[tuple[str, torch.nn.Parameter], ...]:
+    """Return ignored parameters in stable model traversal order.
+
+    ``fully_shard(..., ignored_params=...)`` needs identity-based set membership,
+    but a set must never define distributed collective order: parameter object
+    hashes depend on process-local identities and therefore differ across ranks.
+    """
+    ignored_ids = {id(param) for param in ignored_params}
+    ordered = tuple(
+        (name, param)
+        for name, param in model.named_parameters()
+        if id(param) in ignored_ids
+    )
+    ordered_ids = {id(param) for _, param in ordered}
+    if ordered_ids != ignored_ids:
+        raise RuntimeError(
+            "Unable to build a complete deterministic order for FSDP2 "
+            f"replicated parameters: expected={len(ignored_ids)} "
+            f"found={len(ordered_ids)}."
+        )
+    return ordered
+
+
 def _sync_replicated_param_grads(
-    params: set[torch.nn.Parameter],
+    named_params: Sequence[tuple[str, torch.nn.Parameter]],
     *,
     world_size: int,
+    bucket_cap_mb: float = FSDP2_REPLICATED_GRAD_BUCKET_CAP_MB,
 ) -> None:
-    """Average gradients for FSDP2 ignored replicated parameters."""
-    if world_size <= 1:
+    """Average ignored-parameter gradients in rank-consistent buckets.
+
+    Every rank first exchanges one compact presence/type vector. Parameters
+    unused on every rank are skipped consistently; when only some ranks have a
+    gradient, the others contribute an explicit zero gradient. The subsequent
+    bucket layout depends only on stable model order, shapes, dtypes, and the
+    globally agreed presence vector, so every rank launches identical
+    collectives in identical order.
+    """
+    if world_size <= 1 or not named_params:
         return
-    for param in params:
-        grad = param.grad
-        if grad is None or hasattr(grad, "full_tensor"):
+    if bucket_cap_mb <= 0:
+        raise ValueError("bucket_cap_mb must be positive")
+
+    device = named_params[0][1].device
+    status = torch.tensor(
+        [
+            [int(param.grad is not None) for _, param in named_params],
+            [int(hasattr(param, "to_local")) for _, param in named_params],
+            [
+                int(param.grad is not None and hasattr(param.grad, "to_local"))
+                for _, param in named_params
+            ],
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+    torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MAX)
+    globally_present, dtensor_params, dtensor_grads = status.tolist()
+
+    invalid = [
+        name
+        for (name, _), param_is_dtensor, grad_is_dtensor in zip(
+            named_params, dtensor_params, dtensor_grads
+        )
+        if param_is_dtensor or grad_is_dtensor
+    ]
+    if invalid:
+        raise RuntimeError(
+            "FSDP2 replicated-gradient synchronization received DTensor state "
+            "for ignored parameter(s): " + ", ".join(invalid[:8])
+        )
+
+    active_grads: list[torch.Tensor] = []
+    for (_, param), is_present in zip(named_params, globally_present):
+        if not is_present:
             continue
-        torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.SUM)
-        grad.div_(world_size)
+        if param.grad is None:
+            # Another rank used this parameter. Contribute zero locally so all
+            # ranks execute the same reduction and obtain the correct average.
+            param.grad = torch.zeros_like(param, memory_format=torch.preserve_format)
+        active_grads.append(param.grad)
+
+    bucket_cap_bytes = max(1, int(bucket_cap_mb * 1024 * 1024))
+    bucket: list[torch.Tensor] = []
+    bucket_bytes = 0
+
+    def flush_bucket() -> None:
+        nonlocal bucket, bucket_bytes
+        if not bucket:
+            return
+        if len(bucket) == 1:
+            # Avoid duplicating a large gradient just to flatten one tensor.
+            torch.distributed.all_reduce(bucket[0], op=torch.distributed.ReduceOp.SUM)
+            bucket[0].div_(world_size)
+        else:
+            flat = torch.cat([grad.reshape(-1) for grad in bucket])
+            torch.distributed.all_reduce(flat, op=torch.distributed.ReduceOp.SUM)
+            flat.div_(world_size)
+            offset = 0
+            for grad in bucket:
+                next_offset = offset + grad.numel()
+                grad.copy_(flat[offset:next_offset].view_as(grad))
+                offset = next_offset
+        bucket = []
+        bucket_bytes = 0
+
+    with torch.no_grad():
+        for grad in active_grads:
+            grad_bytes = grad.numel() * grad.element_size()
+            incompatible = bucket and (
+                grad.device != bucket[0].device or grad.dtype != bucket[0].dtype
+            )
+            if incompatible or (
+                bucket and bucket_bytes + grad_bytes > bucket_cap_bytes
+            ):
+                flush_bucket()
+            bucket.append(grad)
+            bucket_bytes += grad_bytes
+            if bucket_bytes >= bucket_cap_bytes:
+                flush_bucket()
+        flush_bucket()
 
 
 def _clip_grad_norm_fsdp2_mixed(
@@ -366,9 +478,23 @@ def init_distributed(dist_backend: str | None) -> tuple[int, int, torch.device]:
     Works under ``torchrun`` (env vars set) AND as a bare single process
     (world of 1 over gloo) so laptop smoke tests need no launcher.
     """
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+    if torch.cuda.is_available():
+        if local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={local_rank} is invalid for "
+                f"{torch.cuda.device_count()} visible CUDA device(s)."
+            )
+        device = torch.device(f"cuda:{local_rank}")
+        # Pin the process before NCCL creates any communicator. Relying on its
+        # lazy initialization is fragile when an early collective is added.
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device("cpu")
+
     if not torch.distributed.is_initialized():
-        rank = int(os.environ.get("RANK", "0"))
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
         if dist_backend is None or dist_backend == "auto":
             backend = "nccl" if torch.cuda.is_available() else "gloo"
         else:
@@ -395,12 +521,6 @@ def init_distributed(dist_backend: str | None) -> tuple[int, int, torch.device]:
         )
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-    if torch.cuda.is_available():
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-    else:
-        device = torch.device("cpu")
     return rank, world_size, device
 
 
@@ -974,6 +1094,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
     model = train_mod.HybridForCausalLM(cfg).to(device)
     fsdp2_ignored_params = _prepare_fsdp2_custom_math_params(model)
+    fsdp2_replicated_params = _ordered_replicated_params(model, fsdp2_ignored_params)
     train_mod.configure_gradient_checkpointing(
         model, args.gradient_checkpointing, logger
     )
@@ -1424,7 +1545,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
                 watchdog.progress(global_step, "optimizer_and_collectives")
                 _sync_replicated_param_grads(
-                    fsdp2_ignored_params, world_size=world_size
+                    fsdp2_replicated_params, world_size=world_size
                 )
                 # Params are fp32 masters (see the mp_policy note above), so
                 # gradients arrive fp32 and clip sees TRUE magnitudes — no

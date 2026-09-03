@@ -924,7 +924,7 @@ def validate_resume_runtime_contract(
             "Checkpoint recorded use_cache=True with gradient checkpointing; "
             "correcting the training config to use_cache=False before resume."
         )
-    model.config.use_cache = False if model.training else True
+    model.config.use_cache = not model.training
 
     current = checkpoint_runtime_contract(
         model,
@@ -1311,6 +1311,12 @@ def _format_log_line(step: int, max_steps: int, record: dict[str, Any]) -> str:
     else:
         expert_tag = "warm" if record.get("expert_scale") == 0.0 else "on"
         expert_str = f"expert={expert_val:.6f}({expert_tag}) "
+    lr_parts = []
+    if record.get("muon_lr") is not None:
+        lr_parts.append(f"muon_lr={record['muon_lr']:.2e}")
+    if record.get("adam_lr") is not None:
+        lr_parts.append(f"adam_lr={record['adam_lr']:.2e}")
+    lr_str = " ".join(lr_parts) if lr_parts else "lr=n/a"
     return (
         f"step={step}/{max_steps} "
         f"shard={record.get('shard_idx', 0)} "
@@ -1323,7 +1329,7 @@ def _format_log_line(step: int, max_steps: int, record: dict[str, Any]) -> str:
         f"{expert_str}"
         f"grad_norm={record['grad_norm']:.4f} "
         f"step_time={record.get('step_time_s', float('nan')):.3f}s "
-        f"muon_lr={record['muon_lr']:.2e} adam_lr={record['adam_lr']:.2e}"
+        f"{lr_str}"
     )
 
 
