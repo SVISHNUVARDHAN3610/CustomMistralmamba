@@ -776,8 +776,8 @@ def load_checkpoint_fsdp2(
         from torch.torch_version import TorchVersion
 
         torch.serialization.add_safe_globals([TorchVersion])
-    except Exception:
-        pass
+    except (ImportError, AttributeError):
+        pass  # Older PyTorch versions lack TorchVersion or add_safe_globals
 
     try:
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
