@@ -11,6 +11,8 @@ from unittest import mock
 
 import torch
 
+from utils.training_logging import format_training_log_line
+
 
 def _load_fsdp2_train():
     path = Path(__file__).resolve().parents[1] / "pre-training" / "fsdp2_train.py"
@@ -161,8 +163,6 @@ class FSDP2ContractTests(unittest.TestCase):
             )
 
     def test_shared_log_formatter_accepts_adamw_only_record(self) -> None:
-        import train
-
         record = {
             "loss": 1.0,
             "ce_loss": 0.9,
@@ -176,9 +176,18 @@ class FSDP2ContractTests(unittest.TestCase):
             "grad_norm": 0.5,
             "adam_lr": 3e-4,
         }
-        line = train._format_log_line(0, 10, record)
+        line = format_training_log_line(0, 10, record)
         self.assertIn("adam_lr=3.00e-04", line)
         self.assertNotIn("muon_lr=", line)
+
+        line = format_training_log_line(0, 10, {**record, "muon_lr": 6e-4})
+        self.assertIn("muon_lr=6.00e-04", line)
+        self.assertIn("adam_lr=3.00e-04", line)
+
+        line = format_training_log_line(
+            0, 10, {key: value for key, value in record.items() if key != "adam_lr"}
+        )
+        self.assertIn("lr=n/a", line)
 
 
 if __name__ == "__main__":

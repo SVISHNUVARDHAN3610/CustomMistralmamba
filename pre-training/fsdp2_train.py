@@ -91,6 +91,7 @@ from model.hybrid.mamba import (
 from model.hybrid.memory import CompressiveMemoryBank
 from model.layers.moe import DroplessMoELayer
 from model.layers.norm import RMSNorm
+from utils.training_logging import format_training_log_line
 
 FSDP2_CHECKPOINT_FAMILY = "fsdp2"
 FSDP2_OPTIMIZER_POLICY = "fsdp2_adamw"
@@ -1783,7 +1784,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     _write_jsonl(record)
                     if is_rank0:
                         logger.info(
-                            train_mod._format_log_line(
+                            format_training_log_line(
                                 global_step, args.max_steps, record
                             )
                         )
