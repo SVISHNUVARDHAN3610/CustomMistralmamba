@@ -229,38 +229,51 @@ class SlidingWindowGQA(nn.Module):
             )
             batched_sliding_mask[:, :, :k_eff] |= sink_visible
             # [B, S, kv] -> [B, 1, S, kv] so head dim broadcasts cleanly.
-            batched_sliding_mask = batched_sliding_mask.unsqueeze(1)
-        else:
-            mask_key = (seq_len, kv_seq_len, str(device))
-            sliding_causal_mask = self._sliding_mask_cache.get(mask_key)
-            if sliding_causal_mask is None:
-                row_idx = torch.arange(seq_len, device=device).unsqueeze(1) + (
-                    kv_seq_len - seq_len
-                )
-                col_idx = torch.arange(kv_seq_len, device=device).unsqueeze(0)
-                sliding_causal_mask = (row_idx >= col_idx) & (
-                    (row_idx - col_idx) < self.window_size
-                )
-                if len(self._sliding_mask_cache) >= self._sliding_mask_cache_max:
-                    self._sliding_mask_cache.clear()
-                self._sliding_mask_cache[mask_key] = sliding_causal_mask
+        # Fast path: when the sliding window covers the full sequence, no sinks,
+        # and no padding mask, use PyTorch's native FlashAttention-2 causal kernel.
+        is_flash_causal = (
+            not sink_active
+            and attention_mask is None
+            and self.window_size >= kv_seq_len
+            and seq_len == kv_seq_len
+        )
 
-        if attention_mask is not None:
-            padding_mask = (
-                attention_mask.unsqueeze(1).unsqueeze(2)
-                if attention_mask.dim() == 2
-                else attention_mask
-            )
-            if batched_sliding_mask is not None:
-                attn_mask = batched_sliding_mask & padding_mask.bool()
-            else:
-                attn_mask = sliding_causal_mask.unsqueeze(0) & padding_mask.bool()
+        if is_flash_causal:
+            attn_mask = None
+            is_causal = True
         else:
-            attn_mask = (
-                batched_sliding_mask
-                if batched_sliding_mask is not None
-                else sliding_causal_mask
-            )
+            is_causal = False
+            if not sink_active:
+                mask_key = (seq_len, kv_seq_len, str(device))
+                sliding_causal_mask = self._sliding_mask_cache.get(mask_key)
+                if sliding_causal_mask is None:
+                    row_idx = torch.arange(seq_len, device=device).unsqueeze(1) + (
+                        kv_seq_len - seq_len
+                    )
+                    col_idx = torch.arange(kv_seq_len, device=device).unsqueeze(0)
+                    sliding_causal_mask = (row_idx >= col_idx) & (
+                        (row_idx - col_idx) < self.window_size
+                    )
+                    if len(self._sliding_mask_cache) >= self._sliding_mask_cache_max:
+                        self._sliding_mask_cache.clear()
+                    self._sliding_mask_cache[mask_key] = sliding_causal_mask
+
+            if attention_mask is not None:
+                padding_mask = (
+                    attention_mask.unsqueeze(1).unsqueeze(2)
+                    if attention_mask.dim() == 2
+                    else attention_mask
+                )
+                if batched_sliding_mask is not None:
+                    attn_mask = batched_sliding_mask & padding_mask.bool()
+                else:
+                    attn_mask = sliding_causal_mask.unsqueeze(0) & padding_mask.bool()
+            else:
+                attn_mask = (
+                    batched_sliding_mask
+                    if batched_sliding_mask is not None
+                    else sliding_causal_mask
+                )
 
         attn_output = F.scaled_dot_product_attention(
             query_states,
@@ -268,7 +281,7 @@ class SlidingWindowGQA(nn.Module):
             value_states_r,
             attn_mask=attn_mask,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=False,
+            is_causal=is_causal,
         )
 
         # All-masked query rows (pad-only rows in right-padded batches, or

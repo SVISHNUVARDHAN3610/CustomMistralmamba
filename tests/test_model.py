@@ -1674,6 +1674,8 @@ class TestHybridModel(unittest.TestCase):
         self.assertFalse(model.config.use_cache)
         model.gradient_checkpointing_disable()
         self.assertFalse(model.is_gradient_checkpointing)
+        self.assertFalse(model.config.use_cache)
+        model.eval()
         self.assertTrue(model.config.use_cache)
 
     def test_torch_compile_forward_parity(self) -> None:

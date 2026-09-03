@@ -576,15 +576,15 @@ class HybridForCausalLM(nn.Module):
     def gradient_checkpointing_disable(self) -> None:
         self.config.gradient_checkpointing = False
         self.config.gradient_checkpointing_use_reentrant = False
-        self.config.use_cache = True
+        self.config.use_cache = not self.training
         self.disable_input_require_grads()
 
     def train(self, mode: bool = True) -> HybridForCausalLM:
         super().train(mode)
-        # Cache materialization and layer recomputation are incompatible during
-        # training. Eval/generation explicitly re-enable the config preference;
-        # forward still accepts an explicit use_cache argument as before.
-        self.config.use_cache = not (mode and self.is_gradient_checkpointing)
+        # KV/Mamba cache materialization is only for autoregressive inference/eval.
+        # During training, use_cache must always be False to avoid retaining
+        # autograd history and breaking memory chunking.
+        self.config.use_cache = False if mode else True
         return self
 
     def _init_weights(self, module: nn.Module) -> None:

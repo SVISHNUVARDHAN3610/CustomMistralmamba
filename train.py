@@ -924,7 +924,7 @@ def validate_resume_runtime_contract(
             "Checkpoint recorded use_cache=True with gradient checkpointing; "
             "correcting the training config to use_cache=False before resume."
         )
-    model.config.use_cache = not (model.training and current_gc)
+    model.config.use_cache = False if model.training else True
 
     current = checkpoint_runtime_contract(
         model,
