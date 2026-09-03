@@ -309,19 +309,21 @@ The memory write path receives direct supervisory signals through eight dedicate
 │ Loss Function     │ Weight λ    │ Schedule     │ Mathematical Target                   │
 ├───────────────────┼─────────────┼──────────────┼───────────────────────────────────────┤
 │ L_recon           │ 0.08        │ Constant     │ ‖x - g_dec(s)‖² / (B·L·d)             │
-│ L_assoc           │ 1.2e-4      │ 0->1 over 5% │ (1/T) Σ clip(s_t,0,3σ) ‖v̂_t - v_t‖²  │
+│ L_assoc           │ 0.0614      │ 0->1 over 5% │ (1/T) Σ clip(s_t,0,3σ) ‖v̂_t - v_t‖²  │
+│ L_assoc_norm (T-7)│ 1.0e-3      │ Constant     │ max(0, mean(M²) - γ_calibrated)       │
 │ L_gate            │ 1.0e-3      │ Constant     │ -mean(g·log(g+ε) + (1-g)·log(1-g+ε))  │
 │ L_read            │ 5.0e-3      │ Constant     │ max(0, r_min - r_combine)²            │
 │ L_fusion          │ 8.0e-3      │ Constant     │ ‖mean(g_fusion) - 0.5‖² / d           │
-│ L_expert          │ 2.0e-3      │ On at 10%    │ L_ortho + β · L_variance              │
-│ L_ssm             │ 1.0e-5      │ Constant     │ max(0, mean‖h_t‖² - γ_calibrated)     │
 │ L_slot            │ 3.0e-3      │ Constant     │ L_slot_intra + α · L_slot_cross       │
+│ L_expert          │ 0.0         │ Bypassed     │ L_ortho + β · L_variance (disabled)   │
+│ L_ssm             │ 0.0         │ Bypassed     │ max(0, mean‖h_t‖² - γ) (disabled)     │
 └───────────────────┴─────────────┴──────────────┴───────────────────────────────────────┘
 ```
 
 ### Schedule Functions
 * **Associative Retrieval Warmup (`_aux_loss_schedule`):** Ramps $\mathcal{L}_{\text{assoc}}$ linearly from $0.0 \to 1.0$ across the first 5% of training steps, allowing memory slots to stabilize before enforcing retrieval error.
-* **Expert Specialization Warmup (`_expert_loss_schedule`):** Activates $\mathcal{L}_{\text{expert}}$ at step $0.10 \times \text{max\_steps}$, allowing standard router load-balancing to establish initial routing stability before enforcing expert orthogonality.
+* **Expert Specialization:** Bypassed when `lambda_expert == 0.0` to eliminate VRAM holding overhead and pairwise token cosine calculations.
+* **Associative State Norm Control (T-7):** Persistent $\gamma$ calibrated at step 0 to prevent memory bank activation explosion.
 
 ---
 

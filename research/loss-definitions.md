@@ -360,7 +360,7 @@ L_slot = L_slot_intra + α · L_slot_cross
 
 ---
 
-## 5. Combined objective (proposed)
+## 5. Combined objective (active)
 
 **Keep unchanged:** `ce_loss`, `aux_loss`, `z_loss` — same coefficients, same implementations.
 
@@ -371,44 +371,43 @@ L_total = (
     + router_z_loss_coef * z_loss  # 5e-3
     + lambda_recon * L_recon  # 0.08
     + assoc_weight(step)
-    * L_assoc  # → 1.2e-4 (5% warm-up; squared L2 uses sum over hidden)
+    * L_assoc  # → 0.0614 (5% warm-up; mean over hidden, normalized [0, 4])
+    + lambda_assoc_norm * L_assoc_norm  # 1e-3 (T-7: bounded post-write memory norm)
     + lambda_gate * L_gate  # 1e-3
     + lambda_read * L_read  # 5e-3
     + lambda_fusion * L_fusion  # 8e-3
-    + expert_weight(step) * L_expert  # → 2e-3 (on at 10%)
-    + lambda_ssm * L_ssm  # 1e-5
     + lambda_slot * L_slot  # 3e-3
+    # L_expert (0.0, bypassed) and L_ssm (0.0, bypassed) disabled by default to save VRAM/compute
 )
 ```
 
-`assoc_weight(step)` and `expert_weight(step)` are schedule functions (linear ramp / step-on), not fixed constants.
+`assoc_weight(step)` is a linear warmup schedule over the first 5% of training steps.
 
 ### Coefficient rationale (summary)
 
 | Group | Losses | Magnitude | Role |
-|-------|--------|-----------|------|
+|---|---|---|---|
 | Primary | `ce_loss` | 1.0 | Language modeling |
 | Router | `aux_loss`, `z_loss` | ~1e-2 | MoE balance + logit stability |
 | Memory correctness | `L_recon`, `L_assoc` | ~1e-2 | Write-path training + retrieval |
-| Stabilization | `L_gate`, `L_read`, `L_fusion`, `L_ssm`, `L_slot` | ~1e-5 – 8e-3 | Prevent known failure modes |
-| MoE refinement | `L_expert` | 2e-3 | Specialization (secondary) |
-
-**Monitoring recommendation:** Log each term's **raw** (unweighted) value and weighted contribution for the first few hundred steps. Re-tune any coefficient whose weighted gradient norm exceeds ~5% of `ce_loss`.
+| Stabilization | `L_assoc_norm`, `L_gate`, `L_read`, `L_fusion`, `L_slot` | ~1e-3 – 8e-3 | Prevent known memory/fusion failure modes |
+| Bypassed | `L_expert`, `L_ssm` | 0.0 | Disabled to save VRAM & redundant FLOPs |
 
 ---
 
 ## 6. Comparative summary
 
-| Rank | Loss | Primary target | Expected impact | Compute | Impl. difficulty | Default λ |
-|------|------|----------------|-----------------|---------|-------------------|-----------|
-| 1 | `L_recon` | Write-path gradient starvation | Very high (correctness) | Low–moderate | Moderate | 0.08 |
-| 2 | `L_assoc` | Rare-fact recall (Test 1) | High | Low | Moderate–high | 0.03 |
-| 3 | `L_gate` | Write-gate saturation (Test 2) | Moderate | Negligible | Low | 1e-3 |
-| 4 | `L_read` | Combine-layer memory bypass | Moderate | Negligible | Low | 5e-3 |
-| 5 | `L_fusion` | Attention-branch collapse | Moderate (protective) | Negligible | Low | 8e-3 |
-| 6 | `L_expert` | Expert redundancy | Small–moderate | Low | Low–moderate | 2e-3 |
-| 7 | `L_ssm` | Long-context SSM precision | Small–moderate | Negligible | Moderate | 1e-5 |
-| 8 | `L_slot` | Slot collapse | Moderate (capacity) | Low | Moderate | 3e-3 |
+| Rank | Loss | Primary target | Expected impact | Compute | Impl. difficulty | Default λ | Status |
+|---|---|---|---|---|---|---|---|
+| 1 | `L_recon` | Write-path gradient starvation | Very high (correctness) | Moderate (cross-attn) | Moderate | 0.08 | Active |
+| 2 | `L_assoc` | Rare-fact recall (Test 1) | High | Low | Moderate | 0.0614 | Active |
+| 3 | `L_assoc_norm` | Recurrent state explosion (T-7) | High (stability) | Negligible | Low | 1e-3 | Active |
+| 4 | `L_gate` | Write-gate saturation (Test 2) | Moderate | Negligible | Low | 1e-3 | Active |
+| 5 | `L_read` | Combine-layer memory bypass | Moderate | Negligible (weight norm) | Low | 5e-3 | Active |
+| 6 | `L_fusion` | Attention-branch collapse | Moderate (protective) | Negligible | Low | 8e-3 | Active |
+| 7 | `L_slot` | Slot collapse | Moderate (capacity) | Low | Moderate | 3e-3 | Active |
+| 8 | `L_expert` | Expert redundancy | Low / Redundant | Moderate (pairwise cos) | Low | 0.0 | Bypassed |
+| 9 | `L_ssm` | Long-context SSM precision | Redundant (SSM contractive)| Negligible | Low | 0.0 | Bypassed |
 
 ---
 
