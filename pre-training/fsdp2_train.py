@@ -643,9 +643,12 @@ def _reshard_optimizer_state(
         for key, value in entries.items():
             if isinstance(value, torch.Tensor) and tuple(value.shape) == tuple(p.shape):
                 value = value.to(device=device, dtype=p.dtype)
-                restored[key] = distribute_tensor(
-                    value, p.device_mesh, list(p.placements)
-                )
+                if hasattr(p, "device_mesh") and hasattr(p, "placements"):
+                    restored[key] = distribute_tensor(
+                        value, p.device_mesh, list(p.placements)
+                    )
+                else:
+                    restored[key] = value
             elif isinstance(value, torch.Tensor):
                 # Optimizer counters such as AdamW's scalar ``step`` are
                 # replicated local state, not parameter-shaped DTensors. The
@@ -768,6 +771,13 @@ def load_checkpoint_fsdp2(
     ckpt_path = checkpoint_dir / "model_ckpt.pth"
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    try:
+        from torch.torch_version import TorchVersion
+
+        torch.serialization.add_safe_globals([TorchVersion])
+    except Exception:
+        pass
 
     try:
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)

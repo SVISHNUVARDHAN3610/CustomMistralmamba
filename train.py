@@ -115,18 +115,18 @@ def seed_worker(worker_id: int) -> None:
 
 
 def build_training_config(vocab_size: int) -> HybridMambaMoEConfig:
-    """Default production Hybrid config (~148M trainable params, measured)."""
-    hidden_size = 512
-    num_heads = 8
+    """Default production Hybrid config (~511M trainable params, measured)."""
+    hidden_size = 768
+    num_heads = 12
     head_dim = 64
     return HybridMambaMoEConfig(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
-        num_layers=8,
+        num_layers=12,
         num_heads=num_heads,
-        num_kv_heads=8,
+        num_kv_heads=4,
         head_dim=head_dim,
-        intermediate_size=512,
+        intermediate_size=768,
         window_size=512,
         num_experts=8,
         top_k=2,
