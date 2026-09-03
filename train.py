@@ -1635,6 +1635,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
                 # Collect `accum` micro-batches for one optimizer step (T-H1)
                 micro_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+                watchdog.progress(global_step, "data_loading")
                 while len(micro_inputs) < accum:
                     try:
                         input_ids, labels = next(batches_iter)

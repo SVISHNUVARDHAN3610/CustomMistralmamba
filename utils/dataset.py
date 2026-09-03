@@ -547,22 +547,27 @@ class MmapShardDataset(Dataset):
     _warned_alignment = False
 
     def __init__(self, bin_path: str, seq_len: int):
+        self.bin_path = bin_path
         self.seq_len = seq_len
-        self.data = np.memmap(bin_path, dtype=np.uint16, mode="r")
-        self.num_sequences = len(self.data) // self.seq_len
+        self._data: np.memmap | None = None
+        file_size = os.path.getsize(bin_path)
+        total_tokens = file_size // 2  # np.uint16 is 2 bytes
+        self.num_sequences = total_tokens // self.seq_len
 
-        remainder = len(self.data) % self.seq_len
+        remainder = total_tokens % self.seq_len
         if remainder != 0 and not MmapShardDataset._warned_alignment:
-            # This is expected to be rare/zero if TOKENS_PER_SHARD (main.py)
-            # is chosen as an exact multiple of seq_len; warn once so a
-            # misconfiguration is visible instead of silently dropping
-            # tokens at every shard boundary.
             warnings.warn(
                 f"[MmapShardDataset] shard has {remainder} leftover tokens that don't "
                 f"fill a full sequence of length {seq_len} and will be dropped. Set "
                 f"TOKENS_PER_SHARD to a multiple of seq_len to avoid this."
             )
             MmapShardDataset._warned_alignment = True
+
+    @property
+    def data(self) -> np.memmap:
+        if self._data is None:
+            self._data = np.memmap(self.bin_path, dtype=np.uint16, mode="r")
+        return self._data
 
     def __len__(self) -> int:
         return self.num_sequences

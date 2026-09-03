@@ -370,6 +370,8 @@ def _sync_replicated_param_grads(
             # Another rank used this parameter. Contribute zero locally so all
             # ranks execute the same reduction and obtain the correct average.
             param.grad = torch.zeros_like(param, memory_format=torch.preserve_format)
+        elif param.grad.dtype != param.dtype:
+            param.grad = param.grad.to(dtype=param.dtype)
         active_grads.append(param.grad)
 
     bucket_cap_bytes = max(1, int(bucket_cap_mb * 1024 * 1024))
@@ -1420,6 +1422,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
                 # ---- collect `accum` micro-batches for one optimizer step --
                 micro_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+                watchdog.progress(global_step, "data_loading")
                 while len(micro_inputs) < accum:
                     try:
                         input_ids, labels = next(batches_iter)
