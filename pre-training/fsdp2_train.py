@@ -150,6 +150,12 @@ def _mean_metric_sums(
     return {name: value / count for name, value in sums.items()}
 
 
+class _FlushStreamHandler(logging.StreamHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        self.flush()
+
+
 def _setup_logging(run_dir: Path, *, level: int = logging.INFO) -> logging.Logger:
     """Console logging on every rank; the run log FILE is written by rank 0
     only (shared-filesystem multi-writer appends would interleave garbage).
@@ -164,7 +170,7 @@ def _setup_logging(run_dir: Path, *, level: int = logging.INFO) -> logging.Logge
         fmt="%(asctime)s | %(levelname)-8s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-    console = logging.StreamHandler(sys.stdout)
+    console = _FlushStreamHandler(sys.stdout)
     console.setLevel(level)
     console.setFormatter(fmt)
     logger.addHandler(console)

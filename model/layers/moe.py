@@ -249,6 +249,18 @@ class DroplessMoELayer(nn.Module):
         for expert_idx in range(self.num_experts):
             mask = sorted_expert == expert_idx
             if not mask.any():
+                if self.training:
+                    expert = self.experts[expert_idx]
+                    dummy = (
+                        self._swiglu_forward(
+                            x_flat[:1] * 0.0,
+                            local_dtensor(expert.w_gate.weight),
+                            local_dtensor(expert.w_up.weight),
+                            local_dtensor(expert.w_down.weight),
+                        )
+                        * 0.0
+                    ).sum()
+                    moe_output = moe_output + dummy
                 continue
             idx = torch.where(mask)[0]
             row_indices = sorted_token[idx]
@@ -442,6 +454,9 @@ class DroplessMoELayer(nn.Module):
         for expert_idx in range(self.num_experts):
             token_mask = topk_indices == expert_idx
             if not token_mask.any():
+                if self.training:
+                    dummy = (self.experts[expert_idx](x_flat[:1] * 0.0) * 0.0).sum()
+                    moe_output = moe_output + dummy
                 continue
 
             row_indices, k_indices = torch.where(token_mask)
