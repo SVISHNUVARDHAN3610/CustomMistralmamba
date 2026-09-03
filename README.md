@@ -239,9 +239,9 @@ graph TD
 
 ## 6. Mathematical Formulation & Multi-Task Objectives
 
-The overall training objective combines language modeling cross-entropy, MoE router stabilization losses, and eight dedicated auxiliary losses:
+The overall training objective combines language modeling cross-entropy, MoE router stabilization losses, and dedicated auxiliary losses:
 
-$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}} + \lambda_{\text{aux}}\mathcal{L}_{\text{router\_aux}} + \lambda_{z}\mathcal{L}_{\text{router\_z}} + \lambda_{\text{vocab\_z}}\mathcal{L}_{\text{vocab\_z}} + \sum_{i=1}^{8} \lambda_i \mathcal{L}_i$$
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}} + \lambda_{\text{aux}}\mathcal{L}_{\text{router\_aux}} + \lambda_{z}\mathcal{L}_{\text{router\_z}} + \lambda_{\text{vocab\_z}}\mathcal{L}_{\text{vocab\_z}} + \sum_{i} \lambda_i \mathcal{L}_i$$
 
 ```
                                     COMPOSITE OBJECTIVE
@@ -251,9 +251,10 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}} + \lambda_{\text{aux}}\ma
       ▼                      ▼                               ▼                      ▼
 Language Modeling      MoE Regularization             Memory Supervision     System Regularization
   • Causal CE            • Router Load Balance          • L_recon (0.08)       • L_fusion (8e-3)
-  • Vocab Z-Loss         • Router Z-Loss                • L_assoc (1.2e-4)     • L_ssm (1e-5)
-                                                        • L_gate (1e-3)        • L_slot (3e-3)
-                                                        • L_read (5e-3)        • L_expert (2e-3)
+  • Vocab Z-Loss         • Router Z-Loss                • L_assoc (0.0614)     • L_slot (3e-3)
+                                                        • L_assoc_norm (1e-3)  • L_ssm (0.0, bypassed)
+                                                        • L_gate (1e-3)        • L_expert (0.0, bypassed)
+                                                        • L_read (5e-3)
 ```
 
 ### Primary Objectives
@@ -265,18 +266,19 @@ Language Modeling      MoE Regularization             Memory Supervision     Sys
 3. **MoE Router Z-Loss ($\mathcal{L}_{\text{router\_z}}$):** Penalizes extreme router logit magnitudes to prevent FP16 overflow (ST-MoE):
    $$\mathcal{L}_{\text{router\_z}} = \frac{1}{N}\sum_{t=1}^{N} \left(\log \sum_{i=1}^{E} \exp(z_{t,i})\right)^2$$
 
-### The Eight Auxiliary Losses
+### The Auxiliary Losses
 
 | Symbol | Objective Name | Weight $\lambda$ | Formulation | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
 | $\mathcal{L}_{\text{recon}}$ | Compressive Reconstruction | $0.08$ | $\frac{1}{B L d} \| x - g_{\text{dec}}(s) \|_2^2$ | Forces write summary $s$ to retain recoverable chunk tokens via a lightweight 1-layer cross-attention decoder. |
-| $\mathcal{L}_{\text{assoc}}$ | Associative Retrieval | $1.2\times 10^{-4}$ | $\frac{1}{T}\sum_{t=1}^T \text{clip}(s_t, 0, 3\sigma) \| \hat{v}_t - v_t \|_2^2$ | Key-value retrieval error from post-write memory, weighted by reconstruction surprise $s_t = \|x_t - g(s)\|_2$. |
+| $\mathcal{L}_{\text{assoc}}$ | Associative Retrieval | $0.0614$ | $\frac{1}{T}\sum_{t=1}^T \text{clip}(s_t, 0, 3\sigma) \| \hat{v}_t - v_t \|_2^2$ | Key-value retrieval error from post-write memory on L2-normalized vectors ($\in [0, 4]$), weighted by surprise $s_t$. |
+| $\mathcal{L}_{\text{assoc\_norm}}$ | Assoc Norm Hinge (T-7) | $1.0\times 10^{-3}$ | $\max(0, \frac{1}{Bmd}\sum M^2 - \gamma)$ | Hinge penalty bounding post-write memory bank state entry magnitudes at calibrated 90th percentile $\gamma$. |
 | $\mathcal{L}_{\text{gate}}$ | Write-Gate Entropy | $1.0\times 10^{-3}$ | $-\frac{1}{|G|}\sum [g \log(g+\epsilon) + (1-g)\log(1-g+\epsilon)]$ | Maximizes write-gate entropy to prevent saturation at $0$ (never update) or $1$ (always overwrite). |
 | $\mathcal{L}_{\text{read}}$ | Read Utilization | $5.0\times 10^{-3}$ | $\max(0, r_{\text{min}} - r)^2, \; r = \frac{\|W_{\text{mem}}\|_F}{\|W_{\text{own}}\|_F + \|W_{\text{mem}}\|_F}$ | Hinge loss preventing linear combine layers from zeroing out the memory read pathway ($r_{\text{min}} = 0.15$). |
 | $\mathcal{L}_{\text{fusion}}$ | Fusion Balance | $8.0\times 10^{-3}$ | $\frac{1}{d} \| \bar{g}_{\text{fusion}} - 0.5 \|_2^2$ | Centers batch-mean fusion gate at $0.5$ to ensure balanced utilization between Attention and Mamba. |
-| $\mathcal{L}_{\text{expert}}$ | Expert Specialization | $2.0\times 10^{-3}$ | $\frac{1}{|T|}\sum |\cos(e_i, e_j)| - \beta \text{Var}_e(\text{Softmax}(z))$ | Penalizes cosine similarity between selected expert outputs while encouraging routing variance (Guo et al., 2025). |
-| $\mathcal{L}_{\text{ssm}}$ | SSM Norm Hinge | $1.0\times 10^{-5}$ | $\max(0, \frac{1}{T}\sum \|h_t\|_2^2 - \gamma)$ | Prevents runaway SSM state norm drift beyond initialization calibration threshold $\gamma$. |
 | $\mathcal{L}_{\text{slot}}$ | Slot Diversity | $3.0\times 10^{-3}$ | $\frac{1}{m^2}\sum_{p \neq q} \max(0, \cos(\hat{M}_p, \hat{M}_q) - \tau)^2 + \alpha \mathcal{L}_{\text{cross}}$ | Penalizes intra-bank slot cosine similarity above margin $\tau=0.3$ and cross-bank slot alignment. |
+| $\mathcal{L}_{\text{expert}}$ | Expert Specialization | $0.0$ *(bypassed)* | $\frac{1}{|T|}\sum |\cos(e_i, e_j)| - \beta \text{Var}_e(\text{Softmax}(z))$ | Disabled by default to eliminate VRAM and pairwise computation waste; router uses standard Switch MoE load balancing. |
+| $\mathcal{L}_{\text{ssm}}$ | SSM Norm Hinge | $0.0$ *(bypassed)* | $\max(0, \frac{1}{T}\sum \|h_t\|_2^2 - \gamma)$ | Disabled by default; Mamba SSM recurrence $\bar{A} = \exp(\Delta A)$ is contractive and bounded. |
 
 ---
 

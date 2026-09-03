@@ -551,7 +551,10 @@ class HybridDecoderLayer(nn.Module):
         moe_out, aux_loss, z_loss, expert_loss = self.moe_block(
             moe_in,
             compute_expert_loss=(
-                self.training and self.use_auxiliary_losses and expert_scale > 0.0
+                self.training
+                and self.use_auxiliary_losses
+                and cfg.lambda_expert > 0.0
+                and expert_scale > 0.0
             ),
             expert_var_beta=cfg.expert_var_beta,
         )
@@ -569,7 +572,7 @@ class HybridDecoderLayer(nn.Module):
                 fusion_gate, target=cfg.fusion_balance_target
             )
             ssm_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-            if ssm_state is not None:
+            if ssm_state is not None and cfg.lambda_ssm > 0.0:
                 gamma = getattr(self, "ssm_norm_gamma", None)
                 if gamma is not None:
                     ssm_loss = ssm_state_norm_loss(ssm_state, gamma)

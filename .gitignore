@@ -23,3 +23,6 @@ shard_*.bin.tmp
 
 # Tooling caches
 .ruff_cache/
+
+.agents/
+skills-lock.json

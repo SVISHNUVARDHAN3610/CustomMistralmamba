@@ -47,6 +47,7 @@ from utils.dataset import (
     TokenizedShardProducer,
     verify_tokenizer_vocab,
 )
+from utils.training_logging import format_training_log_line as _format_log_line
 from utils.validation import PackedWindowValidator, WikiTextCyclicValidator
 
 torch.set_float32_matmul_precision("high")
@@ -114,18 +115,18 @@ def seed_worker(worker_id: int) -> None:
 
 
 def build_training_config(vocab_size: int) -> HybridMambaMoEConfig:
-    """Default production Hybrid config (~148M trainable params, measured)."""
-    hidden_size = 512
-    num_heads = 8
+    """Default production Hybrid config (~511M trainable params, measured)."""
+    hidden_size = 768
+    num_heads = 12
     head_dim = 64
     return HybridMambaMoEConfig(
         vocab_size=vocab_size,
         hidden_size=hidden_size,
-        num_layers=8,
+        num_layers=12,
         num_heads=num_heads,
-        num_kv_heads=8,
+        num_kv_heads=4,
         head_dim=head_dim,
-        intermediate_size=512,
+        intermediate_size=768,
         window_size=512,
         num_experts=8,
         top_k=2,
@@ -924,7 +925,7 @@ def validate_resume_runtime_contract(
             "Checkpoint recorded use_cache=True with gradient checkpointing; "
             "correcting the training config to use_cache=False before resume."
         )
-    model.config.use_cache = not (model.training and current_gc)
+    model.config.use_cache = not model.training
 
     current = checkpoint_runtime_contract(
         model,
@@ -1297,28 +1298,6 @@ def load_checkpoint(
 # ---------------------------------------------------------------------------
 
 
-def _format_log_line(step: int, max_steps: int, record: dict[str, Any]) -> str:
-    assoc_tag = "warm" if record.get("assoc_scale") == 0.0 else "on"
-    expert_tag = "warm" if record.get("expert_scale") == 0.0 else "on"
-    smooth = record.get("ce_smooth")
-    smooth_str = f"{smooth:.6f}" if smooth is not None else "n/a"
-    val_ce = record.get("val_ce_loss")
-    val_str = f"{val_ce:.6f}" if val_ce is not None else "n/a"
-    return (
-        f"step={step}/{max_steps} "
-        f"shard={record.get('shard_idx', 0)} "
-        f"loss={record['loss']:.6f} ce={record['ce_loss']:.6f} "
-        f"ce_smooth={smooth_str} val_ce={val_str} "
-        f"router_aux={record['router_aux_loss']:.6f} "
-        f"router_z={record['router_z_loss']:.6f} "
-        f"recon={record['recon']:.6f} assoc={record['assoc']:.6f}({assoc_tag}) "
-        f"expert={record['expert']:.6f}({expert_tag}) "
-        f"grad_norm={record['grad_norm']:.4f} "
-        f"step_time={record.get('step_time_s', float('nan')):.3f}s "
-        f"muon_lr={record['muon_lr']:.2e} adam_lr={record['adam_lr']:.2e}"
-    )
-
-
 def _format_val_log_line(val_record: dict[str, Any]) -> str:
     return (
         f"validation step={val_record['step']} "
@@ -1656,6 +1635,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 
                 # Collect `accum` micro-batches for one optimizer step (T-H1)
                 micro_inputs: list[tuple[torch.Tensor, torch.Tensor]] = []
+                watchdog.progress(global_step, "data_loading")
                 while len(micro_inputs) < accum:
                     try:
                         input_ids, labels = next(batches_iter)

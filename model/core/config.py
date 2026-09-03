@@ -179,10 +179,10 @@ class HybridMambaMoEConfig(MixtralConfig):
     # attention/mamba blend; lower values let branches specialize (ablation:
     # research/Improvement-suggestions.md). Must be in (0, 1).
     fusion_balance_target: float = 0.5
-    lambda_expert: float = 2e-3
+    lambda_expert: float = 0.0
     expert_warmup_fraction: float = 0.10
     expert_var_beta: float = 0.5
-    lambda_ssm: float = 1e-5
+    lambda_ssm: float = 0.0
     lambda_slot: float = 3e-3
     slot_similarity_margin: float = 0.3
     slot_cross_bank_alpha: float = 0.1
