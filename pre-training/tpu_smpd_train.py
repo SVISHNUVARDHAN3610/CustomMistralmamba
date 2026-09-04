@@ -67,6 +67,26 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+# Crucial for TPU stability: force JAX to CPU-only mode and disable JAX in datasets.
+# Prevents JAX from running cloud_tpu_init.py or contending for libtpu with PyTorch/XLA,
+# and eliminates circular import errors (e.g. cannot import name 'tanh' from jax.numpy).
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["USE_JAX"] = "0"
+
+try:
+    import datasets.config
+
+    datasets.config.JAX_AVAILABLE = False
+except Exception:  # noqa: BLE001, S110
+    pass
+
+try:
+    import jax
+    import jax.numpy  # noqa: F401 - pre-initialize cleanly on CPU in main thread
+except Exception:  # noqa: BLE001, S110
+    pass
+
 import numpy as np
 import torch
 from torch import nn, optim
@@ -737,25 +757,41 @@ class StepProgressWatchdog:
                 since_warning = now - self._last_warning
                 step = self._step
                 phase = self._phase
+                # Initial XLA JIT compilation for step <= 0 takes 3-6 minutes on TPU
+                # for large models (~511M params). Grant an extended compilation grace period.
+                effective_timeout = (
+                    max(self.timeout_seconds * 2.5, 600.0)
+                    if step <= 0
+                    else self.timeout_seconds
+                )
                 should_warn = (
                     active
-                    and elapsed >= self.timeout_seconds
+                    and elapsed >= effective_timeout
                     and (
-                        self._last_warning == 0.0
-                        or since_warning >= self.timeout_seconds
+                        self._last_warning == 0.0 or since_warning >= effective_timeout
                     )
                 )
                 if should_warn:
                     self._last_warning = now
             if should_warn:
-                self.logger.warning(
-                    "Training watchdog: no progress for %.1fs at step=%d "
-                    "phase=%s on TPU. Common causes include XLA graph recompilation, "
-                    "HBM out-of-memory, or data starvation.",
-                    elapsed,
-                    step,
-                    phase,
-                )
+                if step <= 0:
+                    self.logger.info(
+                        "Initial XLA graph compilation is actively compiling on TPU v5e-8 "
+                        "(elapsed: %.1fs, phase=%s). First-step XLA HLO JIT compilation traces "
+                        "and fuses the forward, backward, and optimizer graphs across 8 cores. "
+                        "This cold start is normal and occurs only on step 0. Please wait...",
+                        elapsed,
+                        phase,
+                    )
+                else:
+                    self.logger.warning(
+                        "Training watchdog: no progress for %.1fs at step=%d "
+                        "phase=%s on TPU. Common causes include XLA graph recompilation, "
+                        "HBM out-of-memory, or data starvation.",
+                        elapsed,
+                        step,
+                        phase,
+                    )
 
 
 def _weighted_term_tensors(
@@ -1281,14 +1317,12 @@ def evaluate_cyclic_spmd(
     was_training = model.training
     model.eval()
 
-    totals: dict[str, float] = {
-        "loss": 0.0,
-        "ce_loss": 0.0,
-        "router_aux_loss": 0.0,
-        "router_z_loss": 0.0,
-    }
-    token_weight = 0
-    batch_count = 0
+    total_loss_t = torch.tensor(0.0, device=device, dtype=torch.float32)
+    total_ce_t = torch.tensor(0.0, device=device, dtype=torch.float32)
+    total_aux_t = torch.tensor(0.0, device=device, dtype=torch.float32)
+    total_z_t = torch.tensor(0.0, device=device, dtype=torch.float32)
+    total_tokens_t = torch.tensor(0.0, device=device, dtype=torch.float32)
+    total_batches_t = torch.tensor(0.0, device=device, dtype=torch.float32)
 
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
@@ -1310,41 +1344,65 @@ def evaluate_cyclic_spmd(
                 max_training_steps=max_training_steps,
             )
 
-        active = int((labels != ignore_index).sum().item())
-        if active == 0 or out.loss is None:
-            continue
-
+        active = (labels != ignore_index).sum().float()
         ce_val = (
-            float(out.ce_loss.item())
+            out.ce_loss.float()
             if out.ce_loss is not None
-            else float(out.loss.item())
+            else (
+                out.loss.float() if out.loss is not None else torch.zeros_like(active)
+            )
         )
-        totals["loss"] += float(out.loss.item()) * active
-        totals["ce_loss"] += ce_val * active
-        if out.router_aux_loss is not None:
-            totals["router_aux_loss"] += float(out.router_aux_loss.item())
-        if out.router_z_loss is not None:
-            totals["router_z_loss"] += float(out.router_z_loss.item())
-        token_weight += active
-        batch_count += 1
+        loss_val = out.loss.float() if out.loss is not None else ce_val
+        aux_val = (
+            out.router_aux_loss.float()
+            if out.router_aux_loss is not None
+            else torch.zeros_like(active)
+        )
+        z_val = (
+            out.router_z_loss.float()
+            if out.router_z_loss is not None
+            else torch.zeros_like(active)
+        )
+
+        total_loss_t += loss_val * active
+        total_ce_t += ce_val * active
+        total_aux_t += aux_val
+        total_z_t += z_val
+        total_tokens_t += active
+        total_batches_t += 1.0
+
+        if XLA_AVAILABLE and xm is not None:
+            xm.mark_step()
 
     if was_training:
         model.train()
 
-    denom = max(1, token_weight)
-    b_denom = max(1, batch_count)
+    summary = torch.stack(
+        [
+            total_loss_t,
+            total_ce_t,
+            total_aux_t,
+            total_z_t,
+            total_tokens_t,
+            total_batches_t,
+        ]
+    ).tolist()
+    loss_sum, ce_sum, aux_sum, z_sum, token_weight, batch_count = summary
+
+    denom = max(1.0, float(token_weight))
+    b_denom = max(1.0, float(batch_count))
     return {
         "step": global_step,
-        "val_loss": totals["loss"] / denom,
-        "val_ce_loss": totals["ce_loss"] / denom,
-        "val_router_aux_loss": totals["router_aux_loss"] / b_denom,
-        "val_router_z_loss": totals["router_z_loss"] / b_denom,
+        "val_loss": float(loss_sum) / denom,
+        "val_ce_loss": float(ce_sum) / denom,
+        "val_router_aux_loss": float(aux_sum) / b_denom,
+        "val_router_z_loss": float(z_sum) / b_denom,
         "val_rows": validator.num_rows,
         "val_batch_size": validator.batch_size,
         "val_row_start": row_start,
         "val_row_end": row_end,
         "val_cursor": validator.cursor,
-        "val_active_tokens": token_weight,
+        "val_active_tokens": int(token_weight),
     }
 
 
@@ -1370,9 +1428,9 @@ def evaluate_packed_spmd(
     was_training = model.training
     model.eval()
 
-    total_ce = 0.0
-    total_tokens = 0
-    n_windows = 0
+    total_ce_t = torch.tensor(0.0, device=device, dtype=torch.float32)
+    total_tokens_t = torch.tensor(0.0, device=device, dtype=torch.float32)
+    total_windows_t = torch.tensor(0.0, device=device, dtype=torch.float32)
 
     for input_ids, labels in loader:
         input_ids = input_ids.to(device)
@@ -1390,25 +1448,26 @@ def evaluate_packed_spmd(
                 max_training_steps=max_training_steps,
             )
 
-        if out.ce_loss is None or out.loss is None:
-            continue
+        if out.ce_loss is not None:
+            n_tokens = (labels != ignore_index).sum().float()
+            total_ce_t += out.ce_loss.float() * n_tokens
+            total_tokens_t += n_tokens
+            total_windows_t += float(input_ids.size(0))
 
-        n_tokens = int((labels != ignore_index).sum().item())
-        if n_tokens == 0:
-            continue
-
-        total_ce += float(out.ce_loss.item()) * n_tokens
-        total_tokens += n_tokens
-        n_windows += input_ids.size(0)
+        if XLA_AVAILABLE and xm is not None:
+            xm.mark_step()
 
     if was_training:
         model.train()
 
+    summary = torch.stack([total_ce_t, total_tokens_t, total_windows_t]).tolist()
+    total_ce, total_tokens, n_windows = summary
+
     return {
         "step": global_step,
         "packed_val_ce": (total_ce / total_tokens) if total_tokens > 0 else 0.0,
-        "packed_val_tokens": total_tokens,
-        "packed_val_windows": n_windows,
+        "packed_val_tokens": int(total_tokens),
+        "packed_val_windows": int(n_windows),
     }
 
 
@@ -1731,16 +1790,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                     except StopIteration:
                         break
 
-                    # Move to XLA device
-                    input_ids = input_ids.to(device)
-                    labels = labels.to(device)
-
-                    # SPMD Input Sharding: Annotate batch dim to shard over the 'data' mesh axis
-                    if XLA_AVAILABLE and xs is not None:
-                        xs.mark_sharding(input_ids, mesh, ("data", None))
-                        xs.mark_sharding(labels, mesh, ("data", None))
-
-                    # Validate token bounds periodically without per-step sync
+                    # Validate token bounds on CPU before moving to TPU device (zero XLA syncs)
                     if batches_seen == 0 or (
                         args.validate_token_interval > 0
                         and global_step % args.validate_token_interval == 0
@@ -1751,6 +1801,16 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                             labels=labels,
                             ignore_index=cfg.label_ignore_index,
                         )
+
+                    # Move to XLA device
+                    input_ids = input_ids.to(device)
+                    labels = labels.to(device)
+
+                    # SPMD Input Sharding: Annotate batch dim to shard over the 'data' mesh axis
+                    if XLA_AVAILABLE and xs is not None:
+                        xs.mark_sharding(input_ids, mesh, ("data", None))
+                        xs.mark_sharding(labels, mesh, ("data", None))
+
                     micro_inputs.append((input_ids, labels))
                     batches_seen += 1
 
@@ -1769,6 +1829,13 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 step_metric_sums: dict[str, torch.Tensor] = {}
                 step_gate_sums: dict[str, torch.Tensor] = {}
                 schedule_scales: dict[str, float] = {}
+
+                if global_step == 0:
+                    logger.info(
+                        "Starting Step 0 execution & initial XLA graph compilation on TPU v5e-8... "
+                        "(Cold-start compilation traces forward, backward, and optimizer graphs across 8 cores; "
+                        "this takes 2-4 minutes on the first step, after which all steps run at full speed)."
+                    )
 
                 for micro_idx, (m_ids, m_labels) in enumerate(micro_inputs):
                     watchdog.progress(
@@ -2028,6 +2095,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         validator is not None
                         and args.val_interval > 0
                         and global_step % args.val_interval == 0
+                        and global_step > 0
                     ):
                         watchdog.progress(global_step, "validation")
                         val_record = evaluate_cyclic_spmd(
@@ -2058,6 +2126,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         packed_validator is not None
                         and args.val_interval > 0
                         and global_step % args.val_interval == 0
+                        and global_step > 0
                     ):
                         watchdog.progress(global_step, "packed_validation")
                         packed_val_record = evaluate_packed_spmd(
@@ -2087,6 +2156,11 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                             f.write(json.dumps(record) + "\n")
 
                     logger.info(_format_log_line(global_step, args.max_steps, record))
+                    if global_step == 0:
+                        logger.info(
+                            "Initial XLA graph compilation and step 0 completed successfully! "
+                            "Compiled graphs are now cached; steady-state training is running."
+                        )
 
                 # 7. Checkpointing
                 if global_step % args.save_interval == 0 and global_step > 0:

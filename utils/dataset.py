@@ -36,6 +36,21 @@ import warnings
 from collections.abc import Callable
 from typing import Any
 
+# Enforce JAX CPU-only platform and disable JAX in Hugging Face datasets.
+# Prevents background streaming threads from hitting circular import errors
+# (e.g. "cannot import name 'tanh' from partially initialized module 'jax.numpy'")
+# and prevents JAX from attempting to acquire TPU hardware locks away from PyTorch/XLA.
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("JAX_PLATFORM_NAME", "cpu")
+os.environ.setdefault("USE_JAX", "0")
+
+try:
+    import datasets.config
+
+    datasets.config.JAX_AVAILABLE = False
+except Exception:  # noqa: BLE001, S110
+    pass
+
 import numpy as np
 import torch
 from datasets import interleave_datasets, load_dataset
