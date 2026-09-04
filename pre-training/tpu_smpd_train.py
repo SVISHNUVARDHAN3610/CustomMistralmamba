@@ -88,6 +88,13 @@ try:
     from torch_xla.distributed.spmd import Mesh
 
     XLA_AVAILABLE = True
+    # Enable SPMD immediately upon import so that no subsequent calls
+    # (e.g. seeding, device querying, model initialization) ever touch
+    # the runtime in non-SPMD single-device mode.
+    try:
+        xr.use_spmd()
+    except Exception:  # noqa: BLE001, S110
+        pass
 except ImportError:
     torch_xla = None
     xm = None
@@ -149,7 +156,7 @@ def set_seed(seed: int, *, deterministic: bool = False) -> None:
 
     if XLA_AVAILABLE and xm is not None:
         try:
-            xm.set_rng_state(seed)
+            xm.manual_seed(seed)
         except Exception:  # noqa: BLE001, S110
             pass
 
@@ -1417,11 +1424,14 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     if jsonl_path is not None:
         jsonl_path.parent.mkdir(parents=True, exist_ok=True)
 
-    set_seed(args.seed, deterministic=args.deterministic)
-
-    # 1. Initialize PyTorch/XLA SPMD Runtime
+    # 1. Initialize PyTorch/XLA SPMD Runtime & Mesh FIRST
+    # In PyTorch/XLA SPMD, xr.use_spmd() and device initialization must precede
+    # any RNG seeding or tensor allocations on the XLA device.
     device, num_devices = init_tpu_spmd(logger)
     mesh = create_device_mesh(num_devices, axis_name="data", logger=logger)
+
+    # 2. Seed all RNGs (including XLA) after SPMD runtime is fully initialized
+    set_seed(args.seed, deterministic=args.deterministic)
 
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float32
     logger.info(
@@ -1465,17 +1475,17 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         MEMORY_NAN_FIX_ID,
     )
 
-    # 2. Construct Model on XLA Device
+    # 3. Construct Model on XLA Device
     model = HybridForCausalLM(cfg).to(device)
     configure_gradient_checkpointing(model, args.gradient_checkpointing, logger)
     n_params = count_trainable_params(model)
     logger.info("trainable_params=%s (%.3fB)", f"{n_params:,}", n_params / 1e9)
 
-    # 3. Model Parameter Sharding (if FSDP mode selected)
+    # 4. Model Parameter Sharding (if FSDP mode selected)
     if args.sharding_strategy == "fsdp":
         apply_spmd_parameter_sharding(model, mesh, axis_name="data", logger=logger)
 
-    # 4. Build Optimizers & Schedulers
+    # 5. Build Optimizers & Schedulers
     optimizers, use_muon, _opt_meta = build_optimizers(
         model,
         lr=args.lr,
@@ -1500,7 +1510,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 json.dumps({"event": "optimizer_audit", "step": 0, **_lr_audit}) + "\n"
             )
 
-    # 5. Initialize Validators (with batch size aligned to TPU devices)
+    # 6. Initialize Validators (with batch size aligned to TPU devices)
     val_batch_size = args.val_batch_size
     if val_batch_size % num_devices != 0:
         val_batch_size = max(num_devices, (val_batch_size // num_devices) * num_devices)
@@ -1906,7 +1916,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                 metric_bad_cnt += (~finite).to(step_vec.dtype)
                 metric_count += 1
 
-                # 6. Single D2H Host Transfer Flush Every log_interval Steps
+                # 7. Single D2H Host Transfer Flush Every log_interval Steps
                 if global_step % args.log_interval == 0:
                     assert (
                         metric_sum is not None
@@ -2464,6 +2474,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    if XLA_AVAILABLE and xr is not None:
+        try:
+            xr.use_spmd()
+        except Exception:  # noqa: BLE001, S110
+            pass
     args = parse_args()
     logger = setup_logging(Path(args.run_dir))
     logger.info("Starting TPU SPMD pre-training with args: %s", vars(args))
