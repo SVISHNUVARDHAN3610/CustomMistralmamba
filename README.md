@@ -20,7 +20,7 @@
 | **Core Research Document** | [`research/research.md`](research/research.md) |
 | **Loss Specification** | [`research/loss-definitions.md`](research/loss-definitions.md) |
 | **Package Architecture Reference** | [`model/README.md`](model/README.md) (Comprehensive 24-section developer specification) |
-| **Optimization Stack** | Moonshot Muon + AdamW on one GPU; AdamW-only with PyTorch FSDP2 |
+| **Optimization Stack** | Moonshot Muon + AdamW for single-GPU and PyTorch FSDP2 training |
 | **Scan Acceleration** | 4-Tier Selective Scan (Fused CUDA `mamba-ssm` $\to$ Parallel $\to$ Blocked $\to$ Checkpointed) |
 | **Test Suite** | [`tests/test_model.py`](tests/test_model.py) (83 deterministic unit tests, AMP & gradient verified) |
 
@@ -355,7 +355,7 @@ python train.py \
 
 ### 2. Distributed Multi-GPU Pre-Training (`pre-training/fsdp2_train.py`)
 * **PyTorch FSDP2 (`fully_shard`):** Parameters are sharded per-layer across distributed ranks. Master weights remain in FP32 while activations and forward computations run under `torch.autocast(bfloat16)`.
-* **AdamW-only distributed optimizer:** FSDP2 deliberately uses AdamW for every parameter. Muon remains available in the single-GPU trainer, but is disabled in FSDP2 to avoid full-matrix all-gathers on every optimization step.
+* **DTensor Muon + AdamW:** Hidden 2D matrices use Muon; embeddings, heads, gains, biases, non-matrix weights, and replicated custom-math parameters use AdamW. Muon gathers each complete bf16 momentum matrix before Newton–Schulz and bounds the gathered working set with `--muon-gather-buffer-mb` (64 MiB by default). Pass `--no-muon` for the previous AdamW-only policy.
 * **Zero-Sync Telemetry:** Training metrics and auxiliary loss breakdowns are accumulated locally and all-reduced globally once per logging window, eliminating host-device synchronization stalls.
 * **Strict NaN Trilemma Guard:** Global voting mechanism halts optimization safely if any distributed rank detects non-finite gradients.
 
@@ -619,7 +619,7 @@ print(f"Generated sequence shape: {generated_ids.shape}")
 - [x] Version 2.1 reference architecture implementation and package restructuring.
 - [x] Implementation of 8-objective auxiliary loss suite with warmup schedules.
 - [x] Multi-tier Mamba scan dispatch (fused, parallel, blocked, sequential checkpointed).
-- [x] PyTorch FSDP2 distributed trainer with an AdamW-only optimizer policy.
+- [x] PyTorch FSDP2 distributed trainer with DTensor Muon + AdamW and an AdamW-only fallback.
 - [ ] Implement synthetic needle-in-a-haystack and associative retrieval evaluation benchmarks.
 - [ ] Execute the complete 3-stage falsification suite (Inference Zeroing, Gate Telemetry, Null Baseline).
 - [ ] Develop custom fused Triton kernels for batched dual-memory summary writes.

@@ -11,6 +11,11 @@ from unittest import mock
 
 import torch
 
+from utils.fsdp2_muon import (
+    MuonDTensor,
+    adjust_lr_factor,
+    zeropower_via_newtonschulz5,
+)
 from utils.training_logging import format_training_log_line
 
 
@@ -56,6 +61,86 @@ def _distributed_grad_sync_worker(rank: int, world_size: int, init_method: str) 
         torch.distributed.destroy_process_group()
 
 
+def _distributed_muon_worker(rank: int, world_size: int, init_method: str) -> None:
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard, distribute_tensor
+
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world_size,))
+        full_param = torch.arange(28, dtype=torch.float32).reshape(7, 4) / 10
+        full_grad = torch.linspace(-1.0, 1.0, 28).reshape(7, 4)
+        param = torch.nn.Parameter(distribute_tensor(full_param, mesh, [Shard(0)]))
+        param.grad = distribute_tensor(full_grad, mesh, [Shard(0)])
+
+        lr = 1e-2
+        weight_decay = 0.1
+        momentum = 0.95
+        optimizer = MuonDTensor(
+            [param],
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            ns_steps=5,
+            adjust_lr_fn="match_rms_adamw",
+            gather_buffer_size_mb=1e-5,
+        )
+        optimizer.step()
+
+        momentum_full = full_grad * (1 - momentum)
+        nesterov_update = full_grad.lerp(momentum_full, momentum)
+        orthogonal = zeropower_via_newtonschulz5(nesterov_update, 5).float()
+        expected = full_param * (1 - lr * weight_decay)
+        expected.add_(
+            orthogonal,
+            alpha=-lr * adjust_lr_factor(tuple(full_param.shape), "match_rms_adamw"),
+        )
+        actual = param.full_tensor()
+        torch.testing.assert_close(actual, expected)
+
+        if hasattr(torch.optim, "Muon"):
+            reference_param = torch.nn.Parameter(full_param.clone())
+            reference_param.grad = full_grad.clone()
+            reference_optimizer = torch.optim.Muon(
+                [reference_param],
+                lr=lr,
+                weight_decay=weight_decay,
+                momentum=momentum,
+                ns_steps=5,
+                adjust_lr_fn="match_rms_adamw",
+            )
+            reference_optimizer.step()
+            torch.testing.assert_close(actual, reference_param)
+
+        momentum_state = optimizer.state[param]["momentum_buffer"]
+        torch.testing.assert_close(momentum_state.full_tensor(), momentum_full)
+
+        full_optimizer_state = fsdp2_train._consolidate_optimizer_state(
+            optimizer, DTensor
+        )
+        restored_param = torch.nn.Parameter(
+            distribute_tensor(full_param.clone(), mesh, [Shard(0)])
+        )
+        restored_optimizer = MuonDTensor([restored_param], gather_buffer_size_mb=1.0)
+        restored_optimizer.load_state_dict(
+            fsdp2_train._reshard_optimizer_state(
+                full_optimizer_state,
+                restored_optimizer,
+                torch.device("cpu"),
+                distribute_tensor,
+            )
+        )
+        restored_momentum = restored_optimizer.state[restored_param]["momentum_buffer"]
+        torch.testing.assert_close(restored_momentum.full_tensor(), momentum_full)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
 class _SequenceSampler:
     def __init__(self, values: list[int]) -> None:
         self.values = values
@@ -80,7 +165,7 @@ class FSDP2ContractTests(unittest.TestCase):
         self.assertEqual(float(means["loss"]), 4.0)
         self.assertEqual(float(means["ce_loss"]), 2.5)
 
-    def test_fsdp2_optimizer_is_adamw_only(self) -> None:
+    def test_fsdp2_optimizer_is_adamw_only_when_disabled(self) -> None:
         model = torch.nn.Sequential(
             torch.nn.Linear(4, 4),
             torch.nn.LayerNorm(4),
@@ -92,7 +177,7 @@ class FSDP2ContractTests(unittest.TestCase):
             adam_beta2=0.95,
             adam_eps=1e-8,
             weight_decay=0.1,
-            no_muon=False,
+            no_muon=True,
             muon_lr=7.5e-4,
         )
         optimizers, use_muon, meta = fsdp2_train.build_fsdp2_optimizers(
@@ -108,6 +193,56 @@ class FSDP2ContractTests(unittest.TestCase):
             for param in group["params"]
         }
         expected = {id(param) for param in model.parameters() if param.requires_grad}
+        self.assertEqual(optimized, expected)
+
+    def test_fsdp2_optimizer_routes_hidden_matrices_to_muon(self) -> None:
+        model = torch.nn.Sequential(
+            torch.nn.Linear(4, 4),
+            torch.nn.LayerNorm(4),
+        )
+        args = argparse.Namespace(
+            lr=7.5e-4,
+            muon_lr=1e-3,
+            adam_lr=3e-4,
+            adam_beta1=0.9,
+            adam_beta2=0.95,
+            adam_eps=1e-8,
+            weight_decay=0.1,
+            no_muon=False,
+            muon_momentum=0.95,
+            no_muon_nesterov=False,
+            muon_ns_steps=5,
+            muon_adjust_lr_fn="match_rms_adamw",
+            muon_gather_buffer_mb=32.0,
+        )
+        captured: dict[str, object] = {}
+
+        def fake_muon(params, **kwargs):
+            params = list(params)
+            captured["params"] = params
+            captured["kwargs"] = kwargs
+            return torch.optim.SGD(params, lr=kwargs["lr"])
+
+        with mock.patch.object(fsdp2_train, "MuonDTensor", side_effect=fake_muon):
+            optimizers, use_muon, meta = fsdp2_train.build_fsdp2_optimizers(
+                model, args=args, logger=logging.getLogger("fsdp2-contract-test")
+            )
+
+        self.assertTrue(use_muon)
+        self.assertEqual(meta["optimizer_policy"], "fsdp2_muon_adamw")
+        self.assertEqual(len(optimizers), 2)
+        self.assertIsInstance(optimizers[0], torch.optim.SGD)
+        self.assertIsInstance(optimizers[1], torch.optim.AdamW)
+        self.assertEqual(captured["params"], [model[0].weight])
+        self.assertEqual(captured["kwargs"]["gather_buffer_size_mb"], 32.0)
+
+        optimized = {
+            id(param)
+            for optimizer in optimizers
+            for group in optimizer.param_groups
+            for param in group["params"]
+        }
+        expected = {id(param) for param in model.parameters()}
         self.assertEqual(optimized, expected)
 
     def test_replicated_params_use_model_order_not_set_order(self) -> None:
@@ -157,6 +292,16 @@ class FSDP2ContractTests(unittest.TestCase):
             init_method = (Path(tmp_dir) / "store").resolve().as_uri()
             torch.multiprocessing.spawn(
                 _distributed_grad_sync_worker,
+                args=(2, init_method),
+                nprocs=2,
+                join=True,
+            )
+
+    def test_muon_dtensor_two_process_gloo(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="fsdp2_muon_") as tmp_dir:
+            init_method = (Path(tmp_dir) / "store").resolve().as_uri()
+            torch.multiprocessing.spawn(
+                _distributed_muon_worker,
                 args=(2, init_method),
                 nprocs=2,
                 join=True,
