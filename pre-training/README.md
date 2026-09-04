@@ -8,14 +8,17 @@ This directory contains distributed pre-training implementations for the **Hybri
 
 | Script | Target Hardware | Execution Paradigm | Sharding Mechanism | Optimizer |
 | :--- | :--- | :--- | :--- | :--- |
-| [`tpu_smpd_train.py`](file:///D:/Working_Repo/CustomMistralmamba/pre-training/tpu_smpd_train.py) | **Cloud TPU** (e.g., Kaggle TPU v5e-8) | **Single-process SPMD** via PyTorch/XLA | GSPMD `Mesh` + `mark_sharding` (Data Parallel or FSDP) | **Muon + AdamW** hybrid (or AdamW-only) |
+| [`kaggle_tpu_smpd_train.py`](file:///D:/Working_Repo/CustomMistralmamba/pre-training/kaggle_tpu_smpd_train.py) | **Cloud TPU** (specifically Kaggle TPU v5e-8) | **Single-process SPMD** via PyTorch/XLA | GSPMD `Mesh` + `mark_sharding` (Data Parallel or FSDP) | **Muon + AdamW** hybrid or AdamW-only (`--no-muon`) |
 | [`fsdp2_train.py`](file:///D:/Working_Repo/CustomMistralmamba/pre-training/fsdp2_train.py) | **Multi-GPU Clusters** (e.g., 8× H100/A100) | **Process-per-GPU** via `torchrun` | PyTorch FSDP2 (`torch.distributed.fsdp.fully_shard`) | **AdamW** (decoupled weight decay) |
+
+> [!NOTE]
+> `tpu_smpd_train.py` is maintained as a backward-compatibility shim forwarding directly to `kaggle_tpu_smpd_train.py`.
 
 ---
 
-## 1. TPU SPMD Trainer (`tpu_smpd_train.py`)
+## 1. Kaggle TPU SPMD Trainer (`kaggle_tpu_smpd_train.py`)
 
-Optimized specifically for Cloud TPU environments, including **Kaggle TPU v5e-8** and Google Cloud TPU v5e pod slices.
+Optimized specifically for Cloud TPU environments, targeted directly for **Kaggle TPU v5e-8** (and Google Cloud TPU v5e pod slices).
 
 ### Architecture & Key Mechanisms
 
@@ -31,34 +34,42 @@ Optimized specifically for Cloud TPU environments, including **Kaggle TPU v5e-8*
      * `data_parallel` *(Default)*: Model weights remain replicated across TPU cores. The XLA compiler automatically handles local forward computation and AllReduces gradients across cores during backward pass. Recommended for models up to ~511M on TPU v5e-8 (128 GB aggregate HBM).
      * `fsdp`: 2D weight matrices (attention projections, Mamba projections, MoE expert layers, LM head) are sharded along dimension 0 (`('data', None)`). Custom direct-math parameters (RMSNorm gains, Mamba `A_log`/`D` vectors, dual-memory combine projections, `CompressiveMemoryBank` buffers) remain replicated to ensure DTensor stability.
 
-3. **TPU Precision:**
+3. **Kaggle Cloud & Interactive Notebook Robustness:**
+   * **In-process Shard Loading (`--num-workers 0`):** Avoids Python `fork` multiprocessing deadlocks inside Kaggle Jupyter notebook kernels; reads tokens directly via zero-copy `np.memmap`.
+   * **Pre-device SSM Calibration:** SSM norm quantile thresholds are calibrated on CPU during startup (~10ms) before placing the model on the XLA device, completely eliminating XLA quantile compilation stalls and dynamic graph breaks.
+   * **Static Shape Cross-Entropy:** Static forward CE loss avoids dynamic boolean indexing (`hidden_states[valid]`) and `.item()` device-to-host syncs, allowing XLA to compile a single fused HLO graph.
+   * **Compilation Heartbeats & Immediate Step Logging:** Periodic 30s watchdog heartbeats during Step 0 compilation, line-buffered stdout flushing (`sys.stdout.flush()`), and step-by-step reporting for early warmup steps (`global_step < 10`).
+
+4. **TPU Precision:**
    * Native `bfloat16` execution via `torch.autocast(device_type="xla", dtype=torch.bfloat16)`.
    * No CUDA `GradScaler` or loss scaling is used (bfloat16 matches the dynamic range of fp32 and must not be artificially scaled).
 
-4. **Mamba Selective Scan on TPU:**
+5. **Mamba Selective Scan on TPU:**
    * Fused CUDA kernels (`mamba-ssm`) are disabled (`cfg.use_fused_mamba_scan = False`).
    * The model automatically uses PyTorch's native Hillis-Steele parallel scan or blocked vectorized scan, which compiles directly to TPU XLA HLO.
 
-5. **Optimizers & Schedulers:**
+6. **Optimizers & Schedulers:**
    * **Muon + AdamW Hybrid:** 2D matrices are optimized with `torch.optim.Muon` (Newton-Schulz iterations compiled on TPU), and non-2D / embeddings / norms / head are optimized with `torch.optim.AdamW` (`fused=False`).
+   * **AdamW-Only Mode:** Pass `--no-muon` to train entirely with AdamW.
    * Decoupled cosine learning rate schedule with linear warmup.
    * On-device gradient clipping via `clip_grad_norm_`.
    * Host-sync-free NaN handling via `--grad-nan-guard sanitize` (`torch.nan_to_num_` in-place on device).
 
-6. **XLA Step Boundaries & Host-Sync-Free Metrics:**
+7. **XLA Step Boundaries & Host-Sync-Free Metrics:**
    * `xm.mark_step()` is invoked strictly after the optimizer and scheduler update steps, allowing XLA to fuse the forward, backward, accumulation, and optimizer graphs.
    * Metric scalars are accumulated as on-device tensors during training. A single device-to-host transfer occurs every `--log-interval` steps, preventing TPU pipeline stalls.
 
-7. **Atomic Checkpointing & True Resume:**
+8. **Atomic Checkpointing & True Resume:**
    * Serialized with `xm.save(payload, tmp_path)` to ensure XLA tensors are cleanly transferred to CPU before writing, followed by atomic file replacement (`model_ckpt.pth` + `config.json`).
    * Captures full model state, optimizer states, scheduler states, global step, shard progress, RNG states (Python, NumPy, PyTorch CPU, XLA RNG), and runtime contract metadata.
 
-### Example Launch on Kaggle TPU v5e-8
+### Example Launches on Kaggle TPU v5e-8
 
+**With Muon + AdamW (Recommended):**
 ```bash
-python pre-training/tpu_smpd_train.py \
+python pre-training/kaggle_tpu_smpd_train.py \
     --cache-dir ./data_cache \
-    --run-dir ./runs/tpu_train \
+    --run-dir ./runs/kaggle_tpu_muon \
     --batch-size 8 \
     --gradient-accumulation-steps 4 \
     --seq-len 1024 \
@@ -66,6 +77,24 @@ python pre-training/tpu_smpd_train.py \
     --adam-lr 3e-4 \
     --amp-dtype bf16 \
     --sharding-strategy data_parallel \
+    --num-workers 0 \
+    --log-interval 10 \
+    --save-interval 1000
+```
+
+**With Pure AdamW (No Muon):**
+```bash
+python pre-training/kaggle_tpu_smpd_train.py \
+    --cache-dir ./data_cache \
+    --run-dir ./runs/kaggle_tpu_adamw \
+    --no-muon \
+    --batch-size 8 \
+    --gradient-accumulation-steps 4 \
+    --seq-len 1024 \
+    --lr 3e-4 \
+    --amp-dtype bf16 \
+    --sharding-strategy data_parallel \
+    --num-workers 0 \
     --log-interval 10 \
     --save-interval 1000
 ```
@@ -124,6 +153,6 @@ torchrun --nproc_per_node=8 pre-training/fsdp2_train.py \
 > [!IMPORTANT]
 > **This repository follows strict development environment rules:**
 > * Local laptops and development machines are **development-only**.
-> * **Do NOT execute `tpu_smpd_train.py` or `fsdp2_train.py` on local machines.**
+> * **Do NOT execute `kaggle_tpu_smpd_train.py` (or `tpu_smpd_train.py`) or `fsdp2_train.py` on local machines.**
 > * Local validation should be limited to static analysis, syntax checking (`python -m py_compile`), linting (`ruff check`), formatting (`ruff format`), and lightweight hardware-independent unit tests (`tests/test_toy_train_smoke.py`, `scripts/verify_model_package.py`).
-> * Full production training runs take place in the target cloud environments: Kaggle TPU v5e-8 for `tpu_smpd_train.py` and cloud GPU clusters for `fsdp2_train.py`.
+> * Full production training runs take place in the target cloud environments: Kaggle TPU v5e-8 for `kaggle_tpu_smpd_train.py` and cloud GPU clusters for `fsdp2_train.py`.

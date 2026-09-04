@@ -139,9 +139,14 @@ class HybridModel(nn.Module):
         )
 
     def _ssm_calibration_done(self) -> bool:
-        return bool(self.ssm_gammas_calibrated.item() > 0) or bool(
+        if getattr(self, "_ssm_calibrated_flag", False):
+            return True
+        done = bool(self.ssm_gammas_calibrated.item() > 0) or bool(
             self.ssm_norm_gammas.any().item()
         )
+        if done:
+            self._ssm_calibrated_flag = True
+        return done
 
     @torch.no_grad()
     def calibrate_ssm_norm_thresholds(
@@ -224,6 +229,7 @@ class HybridModel(nn.Module):
                 layer.assoc_norm_gamma = self.assoc_norm_gammas[i]
 
         self.ssm_gammas_calibrated.fill_(1.0)
+        self._ssm_calibrated_flag = True
 
     def allocate_mamba_caches(
         self, batch_size: int, device: torch.device, dtype: torch.dtype
@@ -313,7 +319,10 @@ class HybridModel(nn.Module):
                 .expand(batch_size, -1)
             )
 
-        max_pos = int(position_ids.max().item()) if position_ids.numel() else -1
+        if position_ids.device.type == "xla":
+            max_pos = (past_seen_tokens or 0) + seq_len - 1 if seq_len > 0 else -1
+        else:
+            max_pos = int(position_ids.max().item()) if position_ids.numel() else -1
         if max_pos >= self.config.max_position_embeddings:
             raise ValueError(
                 f"position_ids max={max_pos} exceeds "
@@ -654,6 +663,24 @@ class HybridForCausalLM(nn.Module):
         labels = self._apply_label_ignore(labels, attention_mask)
         ignore_index = self.config.label_ignore_index
         zero = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+        # On XLA/TPU, avoid dynamic boolean masking hidden_states[valid] which creates
+        # dynamic tensor shapes [N_valid, H] and forces graph breaks via valid.any().
+        # Static shape lm_head + cross_entropy is compiled once by XLA and runs at peak TPU FLOPS.
+        if hidden_states.device.type == "xla":
+            logits = self.lm_head(hidden_states)
+            ce_loss = F.cross_entropy(
+                logits.view(-1, self.vocab_size),
+                labels.reshape(-1),
+                ignore_index=ignore_index,
+                reduction="mean",
+            )
+            z_loss = (
+                self._vocab_z_loss(logits)
+                if self.config.vocab_z_loss_coef > 0.0
+                else zero
+            )
+            return ce_loss, z_loss
+
         valid = labels != ignore_index
         if not valid.any():
             return zero, zero
@@ -682,9 +709,27 @@ class HybridForCausalLM(nn.Module):
         """
         labels = self._apply_label_ignore(labels, attention_mask)
         ignore_index = self.config.label_ignore_index
+        zero = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+
+        if hidden_states.device.type == "xla":
+            chunk_logits = self.lm_head(hidden_states)
+            ce_loss = F.cross_entropy(
+                chunk_logits.view(-1, self.vocab_size),
+                labels.reshape(-1),
+                ignore_index=ignore_index,
+                reduction="mean",
+            )
+            z_loss = (
+                self._vocab_z_loss(chunk_logits)
+                if self.config.vocab_z_loss_coef > 0.0
+                else zero
+            )
+            n_tokens = labels.size(0) * labels.size(1)
+            out_logits = chunk_logits if materialize_logits else None
+            return out_logits, ce_loss, n_tokens, z_loss
+
         valid = labels != ignore_index
         n_valid = int(valid.sum().item())
-        zero = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
         if n_valid == 0:
             return None, zero, 0, zero
 
