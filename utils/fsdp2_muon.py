@@ -14,10 +14,10 @@ operation is NOT row-block-separable — ``A = X @ X.mT`` couples every row
 block across ranks — so running NS independently per local shard is wrong.
 The fix here is the simple exact scheme: one all-gather per parameter per
 step (the momentum view, cast to bf16 first to halve comm volume), batched
-redundant NS on the full matrices, then a local slice back onto each rank's
-shard. NorMuon-style owner round-robin / Dion-style all-to-all are strictly
-scalability refinements of the same communication pattern and slot in behind
-:func:`batched_zeropower_via_newtonschulz5` later.
+redundant NS on bounded groups of full matrices, then a local slice back onto
+each rank's shard. NorMuon-style owner round-robin / Dion-style all-to-all are
+strictly scalability refinements of the same communication pattern and slot
+in behind :func:`batched_zeropower_via_newtonschulz5` later.
 
 This file is intentionally dependency-light (torch only, no
 datasets/transformers) so parity checks can run on CPU without the training
@@ -56,7 +56,7 @@ __all__ = [
 # singular values land in roughly [0.7, 1.3].
 _NS_A, _NS_B, _NS_C = 3.4445, -4.7750, 2.0315
 
-_VALID_ADJUST_LR_FNS = ("match_rms_adamw", "original")
+_VALID_ADJUST_LR_FNS = ("match_rms_adamw", "original", "spectral_unclamped")
 
 
 def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
@@ -74,12 +74,14 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, steps: int = 5) -> torch.Tensor
     if X.size(-2) > X.size(-1):
         X = X.mT
         transposed = True
-    # Normalize before the loop so the spectral norm starts at ~1.
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    # Match torch.optim.Muon operation ordering exactly: clamp the norm and
+    # use fused addmm calls. In bf16, algebraically equivalent decompositions
+    # can round differently enough to diverge over five polynomial steps.
+    X.div_(X.norm().clamp(min=1e-7))
     for _ in range(steps):
         A = X @ X.mT
-        B = b * A + c * (A @ A)
-        X = a * X + B @ X
+        B = torch.addmm(A, A, A, beta=b, alpha=c)
+        X = torch.addmm(X, B, X, beta=a)
     if transposed:
         X = X.mT
     return X
@@ -108,11 +110,11 @@ def batched_zeropower_via_newtonschulz5(
         transposed = X.size(-2) > X.size(-1)
         if transposed:
             X = X.transpose(-2, -1)
-        X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+        X.div_(X.norm(dim=(-2, -1), keepdim=True).clamp(min=1e-7))
         for _ in range(steps):
             A = X @ X.transpose(-2, -1)
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
+            B = torch.baddbmm(A, A, A, beta=b, alpha=c)
+            X = torch.baddbmm(X, B, X, beta=a)
         if transposed:
             X = X.transpose(-2, -1)
         X = X.to(mats[idxs[0]].dtype)
@@ -127,25 +129,73 @@ def adjust_lr_factor(shape: tuple[int, ...], fn: str | None) -> float:
     ``'match_rms_adamw'``: Moonshot RMS matching ``0.2 * sqrt(max(A, B))``
     so Muon and AdamW can share one peak LR / weight decay.
     ``'original'``: Keller's ``max(1, rows/cols)**0.5``.
-    ``None``: no scaling.
+    ``'spectral_unclamped'``: ``sqrt(rows / cols)``.
+    ``None``: the official PyTorch default, equivalent to ``'original'``.
     """
-    if fn is None:
-        return 1.0
     m, n = shape[-2], shape[-1]
     if fn == "match_rms_adamw":
         return 0.2 * math.sqrt(max(m, n))
-    if fn == "original":
+    if fn is None or fn == "original":
         return max(1.0, m / n) ** 0.5
+    if fn == "spectral_unclamped":
+        return math.sqrt(m / n)
     raise ValueError(
         f"Unknown adjust_lr_fn={fn!r}; expected one of {_VALID_ADJUST_LR_FNS} or None"
     )
 
 
-def _rank_and_world() -> tuple[int, int]:
-    """(rank, world_size) of the default process group; (0, 1) if unset."""
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_rank(), torch.distributed.get_world_size()
-    return 0, 1
+def _local_shard_from_full(full: torch.Tensor, param: DTensor) -> torch.Tensor:
+    """Return the exact dim-0 chunk owned by ``param``'s device-mesh rank.
+
+    FSDP2 normally uses the default world mesh, but deriving the coordinate
+    from the parameter makes this correct for a subset/reordered 1-D mesh too.
+    ``torch.chunk`` may return fewer than ``world_size`` chunks when rows are
+    scarce, so explicit ceil-sized offsets also handle empty trailing shards.
+    """
+    mesh = param.device_mesh
+    coordinate = mesh.get_coordinate()
+    if coordinate is None:
+        raise RuntimeError("The current rank is not part of the Muon DTensor mesh.")
+    shard_rank = int(coordinate[0])
+    shard_world = int(mesh.size(0))
+    rows = int(full.size(0))
+    chunk_rows = (rows + shard_world - 1) // shard_world
+    start = shard_rank * chunk_rows
+    local_rows = int(param.to_local().size(0))
+    expected_rows = min(chunk_rows, max(rows - start, 0))
+    if local_rows != expected_rows:
+        raise RuntimeError(
+            "Muon local-shard layout does not match FSDP2 Shard(0): "
+            f"global_rows={rows}, mesh_size={shard_world}, "
+            f"mesh_rank={shard_rank}, expected_rows={expected_rows}, "
+            f"local_rows={local_rows}."
+        )
+    return full.narrow(0, min(start, rows), local_rows)
+
+
+def _apply_pending_updates(
+    pending: list[tuple[Any, torch.Tensor]],
+    *,
+    ns_steps: int,
+    adjust_lr_fn: str | None,
+    lr: float,
+    weight_decay: float,
+) -> None:
+    """Orthogonalize and apply one bounded batch of gathered updates."""
+    if not pending:
+        return
+    orth = batched_zeropower_via_newtonschulz5(
+        [u_full for _, u_full in pending], steps=ns_steps
+    )
+    for (param, _), u_orth in zip(pending, orth):
+        factor = adjust_lr_factor(tuple(param.shape), adjust_lr_fn)
+        update_full = u_orth.to(dtype=param.dtype) * factor
+        update_local = _local_shard_from_full(update_full, param)
+        param_local = param.to_local()
+        if weight_decay != 0.0:
+            param_local.mul_(1 - lr * weight_decay)
+        param_local.add_(update_local, alpha=-lr)
+    pending.clear()
 
 
 class MuonDTensor(optim.Optimizer):
@@ -162,8 +212,8 @@ class MuonDTensor(optim.Optimizer):
          DTensor buffer, Nesterov blend ``u = g.lerp(buf, μ)``.
       2. ONE collective: ``u.bfloat16().full_tensor()`` — all-gather of the
          momentum view (bf16 halves the wire bytes; NS casts to bf16 anyway).
-      3. Redundant batched NS on the full matrices (every rank computes the
-         same result deterministically from identical gathered inputs).
+      3. Redundant batched NS on bounded groups of full matrices (every rank
+         computes the same result from identical gathered inputs).
       4. Scale by :func:`adjust_lr_factor`, slice off THIS rank's
          ``torch.chunk(dim=0)`` row block (mirrors ``Shard(0)`` splitting),
          apply decoupled weight decay and the update locally.
@@ -184,11 +234,29 @@ class MuonDTensor(optim.Optimizer):
         weight_decay: float = 0.0,
         ns_steps: int = 5,
         adjust_lr_fn: str | None = "match_rms_adamw",
+        gather_buffer_size_mb: float = 64.0,
     ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Learning rate must be >= 0; got {lr}.")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"Momentum must be in [0, 1); got {momentum}.")
+        if weight_decay < 0.0:
+            raise ValueError(f"Weight decay must be >= 0; got {weight_decay}.")
+        if isinstance(ns_steps, bool) or not isinstance(ns_steps, int):
+            raise TypeError(
+                f"ns_steps must be an integer; got {type(ns_steps).__name__}."
+            )
+        if not 0 <= ns_steps < 100:
+            raise ValueError(f"ns_steps must be in [0, 100); got {ns_steps}.")
         if adjust_lr_fn not in _VALID_ADJUST_LR_FNS and adjust_lr_fn is not None:
             raise ValueError(
                 f"adjust_lr_fn={adjust_lr_fn!r} unsupported; "
                 f"expected one of {_VALID_ADJUST_LR_FNS} or None"
+            )
+        if not math.isfinite(gather_buffer_size_mb) or gather_buffer_size_mb <= 0.0:
+            raise ValueError(
+                "gather_buffer_size_mb must be finite and > 0; "
+                f"got {gather_buffer_size_mb}."
             )
         defaults = {
             "lr": lr,
@@ -197,6 +265,7 @@ class MuonDTensor(optim.Optimizer):
             "weight_decay": weight_decay,
             "ns_steps": ns_steps,
             "adjust_lr_fn": adjust_lr_fn,
+            "gather_buffer_size_mb": gather_buffer_size_mb,
         }
         super().__init__(params, defaults)
         self._validate_params()
@@ -226,6 +295,11 @@ class MuonDTensor(optim.Optimizer):
                         "conv/1-D/embedding params to AdamW instead (see "
                         "model/core/optim.py::split_muon_adam_params)."
                     )
+                if p.is_complex():
+                    raise ValueError(
+                        "MuonDTensor does not support complex parameters; "
+                        f"got dtype={p.dtype} for shape {tuple(p.shape)}."
+                    )
 
     @torch.no_grad()
     def step(self, closure=None):  # type: ignore[override]
@@ -234,23 +308,40 @@ class MuonDTensor(optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        rank, world_size = _rank_and_world()
-
         for group in self.param_groups:
             lr = group["lr"]
             wd = group["weight_decay"]
             mu = group["momentum"]
             nesterov = group["nesterov"]
+            gather_cap_bytes = int(group["gather_buffer_size_mb"] * 1024 * 1024)
 
-            # Phase A (local): momentum EMA + Nesterov blend; gather views.
+            # Pending full bf16 views are flushed in bounded batches. Without
+            # this cap a large model would temporarily replicate every Muon
+            # matrix on every rank, erasing much of FSDP2's memory benefit.
             pending: list[tuple[Any, torch.Tensor]] = []  # (param, u_full bf16)
+            pending_bytes = 0
+
             for p in group["params"]:
+                if not p.requires_grad:
+                    continue
                 grad = p.grad
                 if grad is None:
                     # Keller's reference zero-fills missing grads so the
                     # momentum buffer keeps decaying instead of freezing.
                     p.grad = torch.zeros_like(p)
                     grad = p.grad
+                if not isinstance(grad, DTensor):
+                    raise TypeError(
+                        "MuonDTensor expected a DTensor gradient matching its "
+                        f"parameter, but got {type(grad).__name__}."
+                    )
+                if tuple(grad.placements) != tuple(p.placements):
+                    raise ValueError(
+                        "MuonDTensor gradient placement mismatch: "
+                        f"param={tuple(p.placements)}, grad={tuple(grad.placements)}."
+                    )
+                if grad.is_sparse:
+                    raise RuntimeError("MuonDTensor does not support sparse gradients.")
                 state = self.state[p]
                 buf = state.get("momentum_buffer")
                 if buf is None:
@@ -258,28 +349,39 @@ class MuonDTensor(optim.Optimizer):
                     state["momentum_buffer"] = buf
                 buf.lerp_(grad, 1 - mu)
                 u = grad.lerp(buf, mu) if nesterov else buf
-                # The single collective of the step: gather the bf16 view.
+
+                full_bytes = p.numel() * 2  # bf16 wire/storage size
+                if pending and pending_bytes + full_bytes > gather_cap_bytes:
+                    _apply_pending_updates(
+                        pending,
+                        ns_steps=group["ns_steps"],
+                        adjust_lr_fn=group["adjust_lr_fn"],
+                        lr=lr,
+                        weight_decay=wd,
+                    )
+                    pending_bytes = 0
+
+                # The single collective per parameter: gather the bf16 view.
                 u_full = u.to(torch.bfloat16).full_tensor()
                 pending.append((p, u_full))
+                pending_bytes += full_bytes
+                if pending_bytes >= gather_cap_bytes:
+                    _apply_pending_updates(
+                        pending,
+                        ns_steps=group["ns_steps"],
+                        adjust_lr_fn=group["adjust_lr_fn"],
+                        lr=lr,
+                        weight_decay=wd,
+                    )
+                    pending_bytes = 0
 
-            # Phase B (redundant, comm-free): batched NS on full matrices.
-            orth = batched_zeropower_via_newtonschulz5(
-                [u_full for _, u_full in pending], steps=group["ns_steps"]
+            _apply_pending_updates(
+                pending,
+                ns_steps=group["ns_steps"],
+                adjust_lr_fn=group["adjust_lr_fn"],
+                lr=lr,
+                weight_decay=wd,
             )
-
-            # Phase C (local): scale, slice to this rank's shard, apply.
-            for (p, _), u_orth in zip(pending, orth):
-                factor = adjust_lr_factor(tuple(p.shape), group["adjust_lr_fn"])
-                update_full = u_orth.to(dtype=p.dtype) * factor
-                # torch.chunk(dim=0) is exactly how Shard(0) splits; every
-                # rank holds an IDENTICAL update_full (deterministic kernels
-                # on bit-identical gathered inputs), so local slicing
-                # reconstructs the sharded update with zero extra comms.
-                update_local = update_full.chunk(world_size, dim=0)[rank]
-                p_local = p.to_local()
-                if wd != 0.0:
-                    p_local.mul_(1 - lr * wd)
-                p_local.add_(update_local, alpha=-lr)
 
         return loss
 
@@ -288,7 +390,8 @@ def _ns_reference_fp32(G: torch.Tensor, steps: int) -> torch.Tensor:
     """Independent straight-from-the-paper NS written in fp32 (no bf16 cast,
     no transpose shortcut) — used by :func:`run_ns_self_check` to pin the
     production implementation's coefficients/orientation/normalization."""
-    X = G.float() / (G.float().norm() + 1e-7)
+    X = G.float()
+    X = X / X.norm().clamp(min=1e-7)
     for _ in range(steps):
         A = X @ X.T
         B = _NS_B * A + _NS_C * (A @ A)
@@ -310,7 +413,8 @@ def run_ns_self_check() -> bool:
          the known approximation band;
       4. the batched path equals the single-matrix path (fusion only);
       5. tall/wide transpose handling is symmetric;
-      6. adjust_lr_factor matches the documented formulas.
+      6. adjust_lr_factor matches the documented formulas;
+      7. one-step parity with public ``torch.optim.Muon`` when available.
     """
     ok = True
 
@@ -378,8 +482,42 @@ def run_ns_self_check() -> bool:
         < 1e-12
         and abs(adjust_lr_factor((96, 256), "original") - 1.0) < 1e-12
         and abs(adjust_lr_factor((256, 96), "original") - math.sqrt(256 / 96)) < 1e-12
-        and adjust_lr_factor((8, 8), None) == 1.0,
+        and abs(adjust_lr_factor((256, 96), None) - math.sqrt(256 / 96)) < 1e-12
+        and abs(adjust_lr_factor((96, 256), "spectral_unclamped") - math.sqrt(96 / 256))
+        < 1e-12,
     )
+
+    # Public-API parity when running on a PyTorch version that ships Muon.
+    if hasattr(optim, "Muon"):
+        param = torch.randn(32, 16)
+        grad = torch.randn_like(param)
+        ref_param = torch.nn.Parameter(param.clone())
+        ref_param.grad = grad.clone()
+        ref_optim = optim.Muon(
+            [ref_param],
+            lr=1e-3,
+            weight_decay=0.1,
+            momentum=0.95,
+            nesterov=True,
+            ns_steps=5,
+            adjust_lr_fn="match_rms_adamw",
+        )
+        ref_optim.step()
+
+        momentum = grad * 0.05
+        update = grad.lerp(momentum, 0.95)
+        update = batched_zeropower_via_newtonschulz5([update], 5)[0].float()
+        expected = param * (1 - 1e-3 * 0.1)
+        expected.add_(
+            update,
+            alpha=-1e-3 * adjust_lr_factor(tuple(param.shape), "match_rms_adamw"),
+        )
+        official_diff = float((expected - ref_param.detach()).abs().max())
+        check(
+            "torch.optim.Muon one-step parity",
+            official_diff == 0.0,
+            f"maxdiff={official_diff:.2e}",
+        )
     return ok
 
 
