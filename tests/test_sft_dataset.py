@@ -1,4 +1,3 @@
-
 """Offline SFT data contracts; run with the training dependencies installed."""
 
 from __future__ import annotations
