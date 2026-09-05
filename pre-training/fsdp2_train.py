@@ -1,9 +1,11 @@
-"""FSDP2 + AdamW distributed training for Hybrid Mamba-MoE.
+"""FSDP2 + Muon/AdamW distributed training for Hybrid Mamba-MoE.
 
-Multi-GPU port of the root ``train.py`` trainer using AdamW for every
-parameter. Muon is deliberately excluded from FSDP2: global Newton--Schulz
-semantics require full-matrix all-gathers on every step, which defeats the
-communication and memory goals of parameter sharding.
+Multi-GPU port of the root ``train.py`` trainer. Hidden 2-D weights use a
+DTensor-aware Muon implementation while embeddings, heads, gains, biases,
+non-matrix weights, and deliberately replicated custom-math parameters use
+AdamW. Muon gathers each complete momentum matrix before Newton--Schulz since
+orthogonalization is not separable over FSDP2 row shards; the gathered working
+set is bounded to avoid retaining every full matrix at once.
 
 Deliberate deviations from ``train.py`` (each required by distribution):
   * ``fully_shard`` wrapping (inner-to-outer). Parameters stay FP32 under
@@ -29,8 +31,8 @@ Deliberate deviations from ``train.py`` (each required by distribution):
   * ``--grad-nan-guard=strict`` takes a GLOBAL min-vote over ranks before
     skipping: a per-rank skip would leave that rank's parameter shard
     permanently out of sync with the rest of the model.
-  * FSDP2 checkpoints use an explicit trainer family and AdamW optimizer
-    policy. Cross-trainer optimizer resume is rejected instead of relying on
+  * FSDP2 checkpoints use an explicit trainer family and optimizer policy.
+    Muon+AdamW and AdamW-only resumes are kept distinct instead of relying on
     unsafe positional state compatibility. RNG state is captured per rank.
   * Checkpoints persist an intra-shard batch cursor. The seeded sampler plus
     that offset resumes at the exact next per-rank batch for the same world
@@ -56,6 +58,7 @@ import dataclasses
 import itertools
 import json
 import logging
+import math
 import os
 import platform
 import random
@@ -79,7 +82,7 @@ if str(ROOT) not in sys.path:
 # (same rationale as model/core/optim.py).
 from model.core.builders import count_trainable_params
 from model.core.constants import MEMORY_NAN_FIX_ID
-from model.core.optim import _is_adamw_no_decay
+from model.core.optim import _is_adamw_no_decay, split_muon_adam_params
 from model.hybrid.layer import HybridDecoderLayer
 from model.hybrid.mamba import (
     MambaBlock,
@@ -91,11 +94,17 @@ from model.hybrid.mamba import (
 from model.hybrid.memory import CompressiveMemoryBank
 from model.layers.moe import DroplessMoELayer
 from model.layers.norm import RMSNorm
+from utils.fsdp2_muon import MuonDTensor
 from utils.training_logging import format_training_log_line
 
 FSDP2_CHECKPOINT_FAMILY = "fsdp2"
-FSDP2_OPTIMIZER_POLICY = "fsdp2_adamw"
+FSDP2_MUON_OPTIMIZER_POLICY = "fsdp2_muon_adamw"
+FSDP2_ADAMW_OPTIMIZER_POLICY = "fsdp2_adamw"
 FSDP2_REPLICATED_GRAD_BUCKET_CAP_MB = 25.0
+
+
+def _fsdp2_optimizer_policy(use_muon: bool) -> str:
+    return FSDP2_MUON_OPTIMIZER_POLICY if use_muon else FSDP2_ADAMW_OPTIMIZER_POLICY
 
 
 def _runtime_environment(world_size: int) -> dict[str, Any]:
@@ -612,7 +621,11 @@ def _consolidate_optimizer_state(
     for idx, entries in sd["state"].items():
         consolidated[idx] = {
             key: (
-                value.full_tensor().cpu() if isinstance(value, dtensor_cls) else value
+                value.full_tensor().detach().cpu()
+                if isinstance(value, dtensor_cls)
+                else value.detach().cpu()
+                if isinstance(value, torch.Tensor)
+                else value
             )
             for key, value in entries.items()
         }
@@ -672,9 +685,10 @@ def save_checkpoint_fsdp2(
     checkpoint_dir: Path,
     logger: logging.Logger,
     validator: Any | None = None,
+    use_muon: bool = False,
     extra_payload: dict[str, Any] | None = None,
 ) -> None:
-    """Consolidated checkpoint in the FSDP2/AdamW checkpoint family.
+    """Consolidated checkpoint in the FSDP2 optimizer-policy family.
 
     Model/optimizer state is gathered to full CPU tensors via public APIs
     (every rank participates in those collectives); rank 0 alone writes the
@@ -697,7 +711,7 @@ def save_checkpoint_fsdp2(
     )
 
     payload: dict[str, Any] = {
-        "checkpoint_schema_version": 2,
+        "checkpoint_schema_version": 3,
         "model_state_dict": model_sd,
         "config": config,
         "global_step": global_step,
@@ -705,12 +719,12 @@ def save_checkpoint_fsdp2(
         "current_batch_idx": current_batch_idx,
         "rng_state": _gather_rng_payload(rank, torch.distributed.get_world_size()),
         "memory_nan_fix_id": MEMORY_NAN_FIX_ID,
-        "use_muon": False,
+        "use_muon": use_muon,
         "training_runtime": train_mod.checkpoint_runtime_contract(
             model,
             distributed_strategy="fsdp2",
             checkpoint_family=FSDP2_CHECKPOINT_FAMILY,
-            optimizer_policy=FSDP2_OPTIMIZER_POLICY,
+            optimizer_policy=_fsdp2_optimizer_policy(use_muon),
         ),
         "runtime_environment": _runtime_environment(torch.distributed.get_world_size()),
     }
@@ -718,10 +732,25 @@ def save_checkpoint_fsdp2(
         # The cyclic cursor advances identically on every rank (replicated
         # params scoring the same fixed rows), so rank0's view is canonical.
         payload["validator_state_dict"] = validator.state_dict
+    expected_count = 2 if use_muon else 1
+    if len(optimizers) != expected_count or len(schedulers) != expected_count:
+        raise RuntimeError(
+            "FSDP2 checkpoint optimizer layout mismatch: "
+            f"use_muon={use_muon}, optimizers={len(optimizers)}, "
+            f"schedulers={len(schedulers)}, expected={expected_count}."
+        )
+    if use_muon:
+        payload["muon_optimizer_state_dict"] = _consolidate_optimizer_state(
+            optimizers[0], api["DTensor"]
+        )
+        payload["muon_scheduler_state_dict"] = schedulers[0].state_dict()
+        adam_idx = 1
+    else:
+        adam_idx = 0
     payload["adam_optimizer_state_dict"] = _consolidate_optimizer_state(
-        optimizers[0], api["DTensor"]
+        optimizers[adam_idx], api["DTensor"]
     )
-    payload["adam_scheduler_state_dict"] = schedulers[0].state_dict()
+    payload["adam_scheduler_state_dict"] = schedulers[adam_idx].state_dict()
     if extra_payload:
         payload.update(extra_payload)
 
@@ -754,9 +783,10 @@ def load_checkpoint_fsdp2(
     logger: logging.Logger,
     data_runtime: dict[str, Any],
     validator: Any | None = None,
+    use_muon: bool = False,
     dl_generator: torch.Generator | None = None,
 ) -> tuple[int, int, int]:
-    """Resume from an AdamW-only FSDP2 consolidated checkpoint.
+    """Resume from a policy-compatible FSDP2 consolidated checkpoint.
 
     Every rank reads the shared file and re-shards locally through the
     public state-dict APIs. weights_only-first loading mirrors train.py;
@@ -796,7 +826,7 @@ def load_checkpoint_fsdp2(
         logger,
         distributed_strategy="fsdp2",
         checkpoint_family=FSDP2_CHECKPOINT_FAMILY,
-        optimizer_policy=FSDP2_OPTIMIZER_POLICY,
+        optimizer_policy=_fsdp2_optimizer_policy(use_muon),
     )
 
     if "current_batch_idx" not in checkpoint:
@@ -833,31 +863,69 @@ def load_checkpoint_fsdp2(
     ckpt_use_muon = bool(
         checkpoint.get("use_muon", "muon_optimizer_state_dict" in checkpoint)
     )
-    if ckpt_use_muon:
+    if ckpt_use_muon != use_muon:
         raise RuntimeError(
-            "FSDP2 is AdamW-only, but this checkpoint contains Muon optimizer "
-            "state. Start a fresh distributed run; automatic optimizer-state "
-            "conversion is intentionally unsupported."
+            f"Checkpoint was saved with use_muon={ckpt_use_muon} but this run "
+            f"uses use_muon={use_muon}; FSDP2 optimizer states are incompatible. "
+            "Start fresh or rerun with the matching --no-muon setting."
         )
 
     required_state = ["adam_optimizer_state_dict", "adam_scheduler_state_dict"]
+    if ckpt_use_muon:
+        required_state.extend(
+            ["muon_optimizer_state_dict", "muon_scheduler_state_dict"]
+        )
     train_mod._require_resume_keys(checkpoint, required_state)
 
-    optimizers[0].load_state_dict(
+    expected_count = 2 if ckpt_use_muon else 1
+    if len(optimizers) != expected_count or len(schedulers) != expected_count:
+        raise RuntimeError(
+            "FSDP2 resume optimizer layout mismatch: "
+            f"use_muon={ckpt_use_muon}, optimizers={len(optimizers)}, "
+            f"schedulers={len(schedulers)}, expected={expected_count}."
+        )
+
+    if ckpt_use_muon:
+        optimizers[0].load_state_dict(
+            _reshard_optimizer_state(
+                checkpoint["muon_optimizer_state_dict"],
+                optimizers[0],
+                device,
+                api["distribute_tensor"],
+            )
+        )
+        schedulers[0].load_state_dict(checkpoint["muon_scheduler_state_dict"])
+        adam_idx = 1
+    else:
+        adam_idx = 0
+
+    optimizers[adam_idx].load_state_dict(
         _reshard_optimizer_state(
             checkpoint["adam_optimizer_state_dict"],
-            optimizers[0],
+            optimizers[adam_idx],
             device,
             api["distribute_tensor"],
         )
     )
-    schedulers[0].load_state_dict(checkpoint["adam_scheduler_state_dict"])
+    schedulers[adam_idx].load_state_dict(checkpoint["adam_scheduler_state_dict"])
 
     optimizer_state_counts = [len(opt.state) for opt in optimizers]
-    saved_optimizer_counts = [
-        len(checkpoint["adam_optimizer_state_dict"].get("state", {}))
-    ]
-    saved_scheduler_epochs = [checkpoint["adam_scheduler_state_dict"].get("last_epoch")]
+    if ckpt_use_muon:
+        saved_optimizer_counts = [
+            len(checkpoint["muon_optimizer_state_dict"].get("state", {})),
+            len(checkpoint["adam_optimizer_state_dict"].get("state", {})),
+        ]
+        saved_scheduler_epochs = [
+            checkpoint["muon_scheduler_state_dict"].get("last_epoch"),
+            checkpoint["adam_scheduler_state_dict"].get("last_epoch"),
+        ]
+    else:
+        saved_optimizer_counts = [
+            len(checkpoint["adam_optimizer_state_dict"].get("state", {}))
+        ]
+        saved_scheduler_epochs = [
+            checkpoint["adam_scheduler_state_dict"].get("last_epoch")
+        ]
     scheduler_epochs = [sched.last_epoch for sched in schedulers]
     if optimizer_state_counts != saved_optimizer_counts:
         raise RuntimeError(
@@ -938,7 +1006,7 @@ def load_checkpoint_fsdp2(
         current_shard_idx,
         current_batch_idx,
         ckpt_fix_id if ckpt_fix_id is not None else "unknown",
-        FSDP2_OPTIMIZER_POLICY,
+        _fsdp2_optimizer_policy(use_muon),
     )
     return global_step, current_shard_idx, current_batch_idx
 
@@ -954,35 +1022,61 @@ def build_fsdp2_optimizers(
     args: argparse.Namespace,
     logger: logging.Logger,
 ) -> tuple[list[torch.optim.Optimizer], bool, dict[str, Any]]:
-    """Build one unfused AdamW over all managed and replicated parameters.
+    """Build DTensor Muon + unfused AdamW, or an AdamW-only fallback.
 
     FSDP2 parameters are DTensors while deliberately ignored custom-math
     parameters are ordinary replicated tensors. Stock unfused AdamW provides
-    local elementwise updates for both. Muon is excluded because correct
-    Newton--Schulz updates require gathering every global matrix.
+    local elementwise updates for both. :class:`MuonDTensor` owns only sharded
+    hidden 2-D matrices and gathers each complete momentum matrix before
+    Newton--Schulz orthogonalization.
     """
-    adam_params = [p for p in model.parameters() if p.requires_grad]
-    adam_names = [name for name, p in model.named_parameters() if p.requires_grad]
+    adam_params, muon_params, inventory = split_muon_adam_params(model)
     total_params = sum(p.numel() for p in model.parameters())
     adam_count = sum(p.numel() for p in adam_params)
+    muon_count = sum(p.numel() for p in muon_params)
+    enable_muon = not args.no_muon and bool(muon_params)
 
     shared_lr = args.lr
+    resolved_muon_lr = args.muon_lr if args.muon_lr is not None else shared_lr
     resolved_adam_lr = args.adam_lr if args.adam_lr is not None else shared_lr
 
     meta: dict[str, Any] = {
-        "enable_muon": False,
-        "optimizer_policy": FSDP2_OPTIMIZER_POLICY,
-        "inventory": {"adamw": adam_names, "muon": []},
+        "enable_muon": enable_muon,
+        "optimizer_policy": _fsdp2_optimizer_policy(enable_muon),
+        "adam_param_count": adam_count if enable_muon else total_params,
+        "muon_param_count": muon_count if enable_muon else 0,
+        "adam_pct": 100.0
+        * (adam_count if enable_muon else total_params)
+        / max(total_params, 1),
+        "muon_pct": 100.0 * (muon_count if enable_muon else 0) / max(total_params, 1),
+        "total_params": total_params,
+        "muon_lr": resolved_muon_lr if enable_muon else None,
+        "adam_lr": resolved_adam_lr,
+        "weight_decay": args.weight_decay,
+        "muon_momentum": args.muon_momentum if enable_muon else None,
+        "muon_adjust_lr_fn": args.muon_adjust_lr_fn if enable_muon else None,
+        "muon_gather_buffer_mb": (args.muon_gather_buffer_mb if enable_muon else None),
+        "inventory": inventory,
     }
 
     logger.info(
-        "optimizer split: adamw=100.00%% (%d tensors, %s params) "
-        "muon=0.00%% (0 tensors, 0 params) total=%.3fB",
-        len(adam_names),
-        f"{adam_count:,}",
+        "optimizer split: adamw=%.2f%% (%d tensors, %s params) "
+        "muon=%.2f%% (%d tensors, %s params) total=%.3fB",
+        meta["adam_pct"],
+        len(inventory["adamw"]) if enable_muon else len(list(model.parameters())),
+        f"{meta['adam_param_count']:,}",
+        meta["muon_pct"],
+        len(inventory["muon"]) if enable_muon else 0,
+        f"{meta['muon_param_count']:,}",
         total_params / 1e9,
     )
-    logger.debug("AdamW params: %s", adam_names)
+    logger.debug(
+        "AdamW params: %s",
+        inventory["adamw"]
+        if enable_muon
+        else [name for name, _ in model.named_parameters()],
+    )
+    logger.debug("Muon params: %s", inventory["muon"] if enable_muon else [])
 
     def _adamw(params_list: list[torch.nn.Parameter]) -> torch.optim.AdamW:
         adam_decay = [p for p in params_list if not _is_adamw_no_decay(p)]
@@ -1009,10 +1103,42 @@ def build_fsdp2_optimizers(
             foreach=False,  # groups mix DTensors and replicated plain tensors
         )
 
-    if not args.no_muon or args.muon_lr is not None:
+    if enable_muon:
+        if args.adam_lr is None and resolved_adam_lr >= 5e-4:
+            logger.warning(
+                "Muon and AdamW are both running at lr=%.3e. AdamW owns the "
+                "embeddings and LM head; consider --adam-lr 3e-4 if this "
+                "shared rate is unstable.",
+                resolved_adam_lr,
+            )
+        muon_optim = MuonDTensor(
+            muon_params,
+            lr=resolved_muon_lr,
+            weight_decay=args.weight_decay,
+            momentum=args.muon_momentum,
+            nesterov=not args.no_muon_nesterov,
+            ns_steps=args.muon_ns_steps,
+            adjust_lr_fn=args.muon_adjust_lr_fn,
+            gather_buffer_size_mb=args.muon_gather_buffer_mb,
+        )
+        adam_optim = _adamw(adam_params)
+        logger.info(
+            "MuonDTensor(lr=%.3e, wd=%.3g, momentum=%.3g, nesterov=%s, "
+            "ns_steps=%d, adjust_lr_fn=%s, gather_buffer=%.1f MiB) + AdamW",
+            resolved_muon_lr,
+            args.weight_decay,
+            args.muon_momentum,
+            not args.no_muon_nesterov,
+            args.muon_ns_steps,
+            args.muon_adjust_lr_fn,
+            args.muon_gather_buffer_mb,
+        )
+        return [muon_optim, adam_optim], True, meta
+
+    if not args.no_muon and not muon_params:
         logger.warning(
-            "FSDP2 optimizer policy is AdamW-only; Muon CLI options are ignored. "
-            "Use --adam-lr (or --lr) for the distributed learning rate."
+            "Muon requested, but no eligible hidden 2-D matrices were found; "
+            "falling back to AdamW for all parameters."
         )
 
     logger.info("Muon disabled — AdamW-only fallback for all parameters")
@@ -1197,7 +1323,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
         layer_reshard_after_forward,
     )
 
-    optimizers, _, opt_meta = build_fsdp2_optimizers(model, args=args, logger=logger)
+    optimizers, use_muon, opt_meta = build_fsdp2_optimizers(
+        model, args=args, logger=logger
+    )
 
     validator: Any | None = None
     if not args.no_validation:
@@ -1237,8 +1365,9 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
     ]
     if is_rank0:
         logger.info(
-            "LR schedule: peak=%g warmup=%d%s cosine_floor=%.2f",
-            args.lr,
+            "LR schedule: muon_peak=%s adam_peak=%g warmup=%d%s cosine_floor=%.2f",
+            f"{opt_meta['muon_lr']:g}" if use_muon else "disabled",
+            opt_meta["adam_lr"],
             warmup_steps,
             " (auto)" if args.warmup_steps <= 0 else "",
             args.min_lr_ratio,
@@ -1265,6 +1394,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
             logger=logger,
             data_runtime=data_runtime,
             validator=validator,
+            use_muon=use_muon,
             dl_generator=dl_generator,
         )
         # LambdaLR.load_state_dict restores `_last_lr` but not
@@ -1324,9 +1454,12 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
             checkpoint_dir=ckpt_dir,
             logger=logger,
             validator=validator,
+            use_muon=use_muon,
             extra_payload={
                 "dl_generator_state": dl_generator.get_state(),
                 "optimizer_policy": opt_meta.get("optimizer_policy"),
+                "muon_adjust_lr_fn": opt_meta.get("muon_adjust_lr_fn"),
+                "muon_gather_buffer_mb": opt_meta.get("muon_gather_buffer_mb"),
                 "data_runtime": data_runtime,
             },
         )
@@ -1708,10 +1841,12 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
                         "assoc_scale": assoc_scale_sum / window,
                         "expert_scale": expert_scale_sum / window,
                         "ce_smooth": ce_smooth.mean,
-                        "adam_lr": float(schedulers[0].get_last_lr()[0]),
+                        "adam_lr": float(schedulers[-1].get_last_lr()[0]),
                         "step_time_s": step_time_s,
                         "gate_stats": dict(zip(metric_gate_names, values[n_main:])),
                     }
+                    if use_muon:
+                        record["muon_lr"] = float(schedulers[0].get_last_lr()[0])
                     bad_names = {
                         name: int(cnt)
                         for name, cnt in list(
@@ -1865,7 +2000,7 @@ def train(args: argparse.Namespace, logger: logging.Logger) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="FSDP2 multi-GPU training for Hybrid Mamba-MoE "
-        "(AdamW-only; launch under torchrun).",
+        "(DTensor Muon + AdamW; launch under torchrun).",
     )
     parser.add_argument(
         "--run-dir",
@@ -1942,19 +2077,19 @@ def parse_args() -> argparse.Namespace:
         "--lr",
         type=float,
         default=1e-3,
-        help="AdamW peak LR when --adam-lr is unset.",
+        help="Shared peak LR when optimizer-specific overrides are unset.",
     )
     parser.add_argument(
         "--weight-decay",
         type=float,
         default=0.1,
-        help="Decoupled AdamW weight decay.",
+        help="Decoupled Muon/AdamW weight decay.",
     )
     parser.add_argument(
         "--muon-lr",
         type=float,
         default=None,
-        help="Deprecated compatibility option; ignored because FSDP2 is AdamW-only.",
+        help="Optional Muon base-LR override (default: --lr).",
     )
     parser.add_argument(
         "--adam-lr", type=float, default=None, help="Optional AdamW LR override."
@@ -1963,25 +2098,32 @@ def parse_args() -> argparse.Namespace:
         "--muon-momentum",
         type=float,
         default=0.95,
-        help="Deprecated compatibility option; ignored by FSDP2.",
+        help="Muon momentum coefficient.",
     )
     parser.add_argument(
         "--no-muon-nesterov",
         action="store_true",
-        help="Deprecated compatibility option; ignored by FSDP2.",
+        help="Disable Muon's Nesterov momentum blend.",
     )
     parser.add_argument(
         "--muon-ns-steps",
         type=int,
         default=5,
-        help="Deprecated compatibility option; ignored by FSDP2.",
+        help="Newton-Schulz orthogonalization iterations.",
     )
     parser.add_argument(
         "--muon-adjust-lr-fn",
         type=str,
         default="match_rms_adamw",
-        choices=("match_rms_adamw", "original"),
-        help="Deprecated compatibility option; ignored by FSDP2.",
+        choices=("match_rms_adamw", "original", "spectral_unclamped"),
+        help="Per-matrix Muon learning-rate adjustment.",
+    )
+    parser.add_argument(
+        "--muon-gather-buffer-mb",
+        type=float,
+        default=64.0,
+        help="Approximate cap for simultaneously retained full bf16 Muon "
+        "momentum matrices per rank; a single larger matrix may exceed it.",
     )
     parser.add_argument("--adam-beta1", type=float, default=0.9)
     parser.add_argument("--adam-beta2", type=float, default=0.95)
@@ -1989,7 +2131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-muon",
         action="store_true",
-        help="Deprecated no-op retained for command compatibility; FSDP2 is AdamW-only.",
+        help="Disable Muon and optimize every parameter with AdamW.",
     )
     parser.add_argument("--max-steps", type=int, default=100_000)
     parser.add_argument(
@@ -2101,6 +2243,23 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.step_watchdog_seconds < 0:
         parser.error("--step-watchdog-seconds must be >= 0")
+    for option, value in (
+        ("--lr", args.lr),
+        ("--muon-lr", args.muon_lr),
+        ("--adam-lr", args.adam_lr),
+        ("--weight-decay", args.weight_decay),
+    ):
+        if value is not None and (not math.isfinite(value) or value < 0.0):
+            parser.error(f"{option} must be finite and >= 0")
+    if not 0.0 <= args.muon_momentum < 1.0:
+        parser.error("--muon-momentum must be in [0, 1)")
+    if not 0 <= args.muon_ns_steps < 100:
+        parser.error("--muon-ns-steps must be in [0, 100)")
+    if (
+        not math.isfinite(args.muon_gather_buffer_mb)
+        or args.muon_gather_buffer_mb <= 0.0
+    ):
+        parser.error("--muon-gather-buffer-mb must be finite and > 0")
     if not args.log_jsonl:
         args.log_jsonl = str(Path(args.run_dir) / "metrics.jsonl")
     return args
