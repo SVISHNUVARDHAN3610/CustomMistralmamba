@@ -28,6 +28,9 @@ import sys
 from datetime import timedelta
 from pathlib import Path
 
+# Disable JAX in Hugging Face datasets to prevent background worker circular imports
+os.environ["USE_JAX"] = "0"
+
 import torch
 
 HERE = Path(__file__).resolve().parent

@@ -40,6 +40,15 @@ import threading
 import time
 from pathlib import Path
 
+# Disable JAX in Hugging Face datasets to prevent background worker circular imports
+os.environ["USE_JAX"] = "0"
+try:
+    import datasets.config
+
+    datasets.config.JAX_AVAILABLE = False
+except (ImportError, AttributeError):
+    pass
+
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler, Subset
