@@ -29,6 +29,7 @@ reads a SEPARATE directory of held-out SFT shards, scoring assistant tokens only
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import itertools
 import json
@@ -488,10 +489,35 @@ def evaluate(model, args, backend):
 
 def run_training(args, backend, logger):
     pretrain.set_seed(args.seed)
-    checkpoint = read_checkpoint(args.resume or args.pretrained_checkpoint)
-    cfg = HybridMambaMoEConfig.from_dict(checkpoint["config"])
-    if cfg.label_ignore_index != IGNORE_INDEX:
-        raise ValueError("SFT shards require config.label_ignore_index=-100")
+    model = None
+    checkpoint = None
+    cfg = None
+    for rank_turn in range(backend.world):
+        if backend.rank == rank_turn:
+            checkpoint = read_checkpoint(args.resume or args.pretrained_checkpoint)
+            cfg = HybridMambaMoEConfig.from_dict(checkpoint["config"])
+            if cfg.label_ignore_index != IGNORE_INDEX:
+                raise ValueError("SFT shards require config.label_ignore_index=-100")
+            # If not resuming, prune optimizer/RNG states immediately to conserve host RAM
+            if not args.resume and isinstance(checkpoint, dict):
+                checkpoint.pop("optimizers", None)
+                checkpoint.pop("schedulers", None)
+                checkpoint.pop("rng_state", None)
+                gc.collect()
+            if model is None:
+                model = HybridForCausalLM(cfg)
+            model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+            checkpoint.pop("model_state_dict", None)
+            if not args.resume:
+                del checkpoint
+                checkpoint = None
+            gc.collect()
+        if (
+            backend.world > 1
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            torch.distributed.barrier()
     args.seq_len = args.seq_len or cfg.max_position_embeddings
     if args.seq_len > cfg.max_position_embeddings:
         raise ValueError("--seq-len exceeds the pretrained model's supported context")
@@ -519,8 +545,6 @@ def run_training(args, backend, logger):
         sources = json.loads(Path(args.dataset_config).read_text(encoding="utf-8"))
     elif getattr(args, "exclude_topics", None):
         sources = get_dataset_configs(exclude_topics=args.exclude_topics)
-    model = HybridForCausalLM(cfg)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     pretrain.configure_gradient_checkpointing(
         model, args.gradient_checkpointing, logger
     )
@@ -537,7 +561,8 @@ def run_training(args, backend, logger):
         step, shard, offset = restore_training_state(
             checkpoint, contract, optimizers, schedulers, backend
         )
-    del checkpoint
+        del checkpoint
+        gc.collect()
     if backend.rank == 0:
         TokenizedShardProducer._atomic_json(
             str(Path(args.run_dir) / "sft_config.json"), contract

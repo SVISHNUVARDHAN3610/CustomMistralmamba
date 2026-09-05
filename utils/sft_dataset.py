@@ -282,10 +282,14 @@ def _oasst_conversations(rows) -> Iterator[list[dict]]:
     This one small source is indexed in RAM. Emit one full path per assistant
     leaf; missing/deleted/rejected ancestors invalidate the entire path.
     """
-    nodes = {row["message_id"]: row for row in rows}
     valid = {
-        key: row
-        for key, row in nodes.items()
+        row["message_id"]: {
+            "message_id": row["message_id"],
+            "parent_id": row.get("parent_id"),
+            "role": row.get("role", ""),
+            "text": _text(row.get("text")),
+        }
+        for row in rows
         if not row.get("deleted")
         and row.get("review_result") is not False
         and _text(row.get("text")).strip()
