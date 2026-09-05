@@ -29,6 +29,7 @@ reads a SEPARATE directory of held-out SFT shards, scoring assistant tokens only
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import itertools
 import json
@@ -38,6 +39,15 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+# Disable JAX in Hugging Face datasets to prevent background worker circular imports
+os.environ["USE_JAX"] = "0"
+try:
+    import datasets.config
+
+    datasets.config.JAX_AVAILABLE = False
+except (ImportError, AttributeError):
+    pass
 
 import numpy as np
 import torch
@@ -56,6 +66,7 @@ from utils.sft_dataset import (
     IGNORE_INDEX,
     MmapShardDataset,
     TokenizedShardProducer,
+    get_dataset_configs,
     verify_tokenizer_vocab,
 )
 
@@ -196,6 +207,7 @@ class ShardFeed:
                 dataset_configs=sources,
                 expected_vocab_size=cfg.vocab_size,
                 log_fn=logger.info,
+                oversized_behavior=getattr(args, "oversized_behavior", "filter"),
             )
             state_path = self.producer.state_path
             if Path(state_path).exists():
@@ -285,11 +297,17 @@ def runtime_contract(args, cfg, sources, backend, use_muon, tokenizer):
         "sources": sources,
         "tokens_per_shard": args.tokens_per_shard,
         "cache_dir": str(Path(args.cache_dir).resolve()),
+        "oversized_behavior": getattr(args, "oversized_behavior", "filter"),
     }
 
 
 def restore_training_state(checkpoint, contract, optimizers, schedulers, backend):
-    if checkpoint.get("sft_runtime") != contract:
+    saved_contract = dict(checkpoint.get("sft_runtime", {}))
+    if "oversized_behavior" not in saved_contract:
+        saved_contract["oversized_behavior"] = contract.get(
+            "oversized_behavior", "filter"
+        )
+    if saved_contract != contract:
         raise ValueError(
             "SFT resume contract mismatch (model, data, optimizer, schedule or world size); use --pretrained-checkpoint for a fresh weights-only run"
         )
@@ -480,10 +498,35 @@ def evaluate(model, args, backend):
 
 def run_training(args, backend, logger):
     pretrain.set_seed(args.seed)
-    checkpoint = read_checkpoint(args.resume or args.pretrained_checkpoint)
-    cfg = HybridMambaMoEConfig.from_dict(checkpoint["config"])
-    if cfg.label_ignore_index != IGNORE_INDEX:
-        raise ValueError("SFT shards require config.label_ignore_index=-100")
+    model = None
+    checkpoint = None
+    cfg = None
+    for rank_turn in range(backend.world):
+        if backend.rank == rank_turn:
+            checkpoint = read_checkpoint(args.resume or args.pretrained_checkpoint)
+            cfg = HybridMambaMoEConfig.from_dict(checkpoint["config"])
+            if cfg.label_ignore_index != IGNORE_INDEX:
+                raise ValueError("SFT shards require config.label_ignore_index=-100")
+            # If not resuming, prune optimizer/RNG states immediately to conserve host RAM
+            if not args.resume and isinstance(checkpoint, dict):
+                checkpoint.pop("optimizers", None)
+                checkpoint.pop("schedulers", None)
+                checkpoint.pop("rng_state", None)
+                gc.collect()
+            if model is None:
+                model = HybridForCausalLM(cfg)
+            model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+            checkpoint.pop("model_state_dict", None)
+            if not args.resume:
+                del checkpoint
+                checkpoint = None
+            gc.collect()
+        if (
+            backend.world > 1
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            torch.distributed.barrier()
     args.seq_len = args.seq_len or cfg.max_position_embeddings
     if args.seq_len > cfg.max_position_embeddings:
         raise ValueError("--seq-len exceeds the pretrained model's supported context")
@@ -509,8 +552,8 @@ def run_training(args, backend, logger):
     sources = DATASET_CONFIGS
     if args.dataset_config:
         sources = json.loads(Path(args.dataset_config).read_text(encoding="utf-8"))
-    model = HybridForCausalLM(cfg)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    elif getattr(args, "exclude_topics", None):
+        sources = get_dataset_configs(exclude_topics=args.exclude_topics)
     pretrain.configure_gradient_checkpointing(
         model, args.gradient_checkpointing, logger
     )
@@ -527,7 +570,8 @@ def run_training(args, backend, logger):
         step, shard, offset = restore_training_state(
             checkpoint, contract, optimizers, schedulers, backend
         )
-    del checkpoint
+        del checkpoint
+        gc.collect()
     if backend.rank == 0:
         TokenizedShardProducer._atomic_json(
             str(Path(args.run_dir) / "sft_config.json"), contract
@@ -637,6 +681,18 @@ def parse_args(argv=None, *, distributed=False, description=None):
     parser.add_argument("--tokenizer-name", default="UIC-AI-lab/llama2-tokenizer")
     parser.add_argument(
         "--dataset-config", help="JSON list of weighted SFT source configs"
+    )
+    parser.add_argument(
+        "--exclude-topics",
+        nargs="*",
+        default=None,
+        help="Topics to exclude from default SFT mixture (e.g. --exclude-topics long_context)",
+    )
+    parser.add_argument(
+        "--oversized-behavior",
+        choices=["filter", "truncate", "error"],
+        default="filter",
+        help="Action when conversation tokens exceed seq_len (default: filter)",
     )
     parser.add_argument("--offline-shards", action="store_true")
     parser.add_argument(
