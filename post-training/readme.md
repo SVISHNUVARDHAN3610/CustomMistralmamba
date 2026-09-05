@@ -133,9 +133,21 @@ The serialization uses ordinary `role:\n` headers, an optional BOS at conversati
 
 Complete conversations can share a packed window. They share causal attention and are not isolated by a block-diagonal attention mask. A conversation never crosses a storage-window boundary; unused space is padded. The reader returns already shifted `(input_ids, labels)` tensors, so the trainer must not shift labels again.
 
-### Customize sources
+### Customize sources and sequence handling
 
 `--dataset-config path/to/mix.json` replaces the default mixture with a JSON list using the source schema from `utils/sft_dataset.py`. Each weight must be positive and finite, and the weights must sum to one.
+
+`--exclude-topics` allows excluding specific topics from the default mixture without writing a custom JSON file. The remaining topic weights are automatically re-normalized to sum to 1.0:
+```text
+# Exclude long_context for standard 4096-context training to avoid streaming 64k-token samples:
+torchrun --standalone --nproc_per_node=2 post-training/sft_fsdp2_post_train.py \
+    --pretrained-checkpoint model_ckpt --exclude-topics long_context
+```
+
+`--oversized-behavior {filter,truncate,error}` controls how conversations longer than `--seq-len` are handled:
+* `filter` (default): Skips the conversation, logs progress, and continues without interrupting training. Recommended for robust training on open datasets.
+* `truncate`: Truncates tokens and loss mask to `seq_len` (skipping the sample if no supervised assistant tokens remain after truncation).
+* `error`: Raises an explicit `ValueError` (legacy behavior).
 
 For example, this is a **replacement general-instruction mix**, not the eight-topic default:
 

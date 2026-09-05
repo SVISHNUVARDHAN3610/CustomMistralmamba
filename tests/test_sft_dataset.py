@@ -74,6 +74,13 @@ class TestSFTAdapters(unittest.TestCase):
         configs[0]["weight"] = 0
         self.assertNotEqual(DATASET_CONFIGS[0]["weight"], 0)
 
+    def test_get_dataset_configs_exclude_topics(self):
+        configs = get_dataset_configs(exclude_topics=["long_context"])
+        self.assertFalse(any(c["topic"] == "long_context" for c in configs))
+        self.assertAlmostEqual(sum(c["weight"] for c in configs), 1.0)
+        with self.assertRaisesRegex(ValueError, "Cannot exclude all"):
+            get_dataset_configs(exclude_topics=list(TOPIC_WEIGHTS.keys()))
+
     def test_every_declared_adapter_has_an_offline_fixture(self):
         for cfg in DATASET_CONFIGS:
             if cfg.get("adapter") == "oasst":
@@ -313,13 +320,26 @@ class TestSFTShards(unittest.TestCase):
 
     def test_oversize_and_out_of_vocab_are_explicit_errors(self):
         with tempfile.TemporaryDirectory() as directory:
-            producer = self.producer(directory)
+            producer_filter = self.producer(directory, oversized_behavior="filter")
+            producer_filter._append_conversation(conversation("q" * 100))
+            self.assertEqual(producer_filter.skipped_oversized_samples, 1)
+            self.assertEqual(producer_filter.cumulative_samples, 1)
+            self.assertEqual(len(producer_filter.token_buffer), 0)
+
+            producer_err = self.producer(directory, oversized_behavior="error")
             with self.assertRaisesRegex(ValueError, "exceeding seq_len"):
-                producer._append_conversation(conversation("q" * 100))
-            self.assertEqual(producer.cumulative_samples, 0)
-            producer.vocab_size = 1000
+                producer_err._append_conversation(conversation("q" * 100))
+            self.assertEqual(producer_err.cumulative_samples, 0)
+            producer_err.vocab_size = 1000
             with self.assertRaisesRegex(ValueError, "vocabulary"):
-                producer._append_conversation(conversation(answer="~"))
+                producer_err._append_conversation(conversation(answer="~"))
+
+    def test_oversize_truncate_behavior(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(directory, oversized_behavior="truncate")
+            producer._append_conversation(conversation("q" * 100, "a" * 10))
+            self.assertLessEqual(len(producer.token_buffer), 64)
+            self.assertEqual(producer.cumulative_samples, 1)
 
     def test_checkpoint_incompatible_settings_and_corruption_fail(self):
         with tempfile.TemporaryDirectory() as directory:

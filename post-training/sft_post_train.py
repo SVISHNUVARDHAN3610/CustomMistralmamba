@@ -56,6 +56,7 @@ from utils.sft_dataset import (
     IGNORE_INDEX,
     MmapShardDataset,
     TokenizedShardProducer,
+    get_dataset_configs,
     verify_tokenizer_vocab,
 )
 
@@ -196,6 +197,7 @@ class ShardFeed:
                 dataset_configs=sources,
                 expected_vocab_size=cfg.vocab_size,
                 log_fn=logger.info,
+                oversized_behavior=getattr(args, "oversized_behavior", "filter"),
             )
             state_path = self.producer.state_path
             if Path(state_path).exists():
@@ -285,11 +287,17 @@ def runtime_contract(args, cfg, sources, backend, use_muon, tokenizer):
         "sources": sources,
         "tokens_per_shard": args.tokens_per_shard,
         "cache_dir": str(Path(args.cache_dir).resolve()),
+        "oversized_behavior": getattr(args, "oversized_behavior", "filter"),
     }
 
 
 def restore_training_state(checkpoint, contract, optimizers, schedulers, backend):
-    if checkpoint.get("sft_runtime") != contract:
+    saved_contract = dict(checkpoint.get("sft_runtime", {}))
+    if "oversized_behavior" not in saved_contract:
+        saved_contract["oversized_behavior"] = contract.get(
+            "oversized_behavior", "filter"
+        )
+    if saved_contract != contract:
         raise ValueError(
             "SFT resume contract mismatch (model, data, optimizer, schedule or world size); use --pretrained-checkpoint for a fresh weights-only run"
         )
@@ -509,6 +517,8 @@ def run_training(args, backend, logger):
     sources = DATASET_CONFIGS
     if args.dataset_config:
         sources = json.loads(Path(args.dataset_config).read_text(encoding="utf-8"))
+    elif getattr(args, "exclude_topics", None):
+        sources = get_dataset_configs(exclude_topics=args.exclude_topics)
     model = HybridForCausalLM(cfg)
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     pretrain.configure_gradient_checkpointing(
@@ -637,6 +647,18 @@ def parse_args(argv=None, *, distributed=False, description=None):
     parser.add_argument("--tokenizer-name", default="UIC-AI-lab/llama2-tokenizer")
     parser.add_argument(
         "--dataset-config", help="JSON list of weighted SFT source configs"
+    )
+    parser.add_argument(
+        "--exclude-topics",
+        nargs="*",
+        default=None,
+        help="Topics to exclude from default SFT mixture (e.g. --exclude-topics long_context)",
+    )
+    parser.add_argument(
+        "--oversized-behavior",
+        choices=["filter", "truncate", "error"],
+        default="filter",
+        help="Action when conversation tokens exceed seq_len (default: filter)",
     )
     parser.add_argument("--offline-shards", action="store_true")
     parser.add_argument(

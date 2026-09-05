@@ -141,10 +141,27 @@ TOPIC_SOURCES = {
 }
 
 
-def get_dataset_configs() -> list[dict[str, Any]]:
-    """Return independently editable configs with absolute sampling weights."""
+def get_dataset_configs(
+    exclude_topics: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return independently editable configs with absolute sampling weights.
+
+    If exclude_topics is specified, those topics are excluded and the remaining
+    topic weights are re-normalized so they sum to 1.0.
+    """
+    exclude = set(exclude_topics or [])
+    filtered_weights = {k: v for k, v in TOPIC_WEIGHTS.items() if k not in exclude}
+    if not filtered_weights:
+        raise ValueError("Cannot exclude all topics from dataset configs")
+    total_weight = sum(filtered_weights.values())
+    normalized_topic_weights = {
+        k: v / total_weight for k, v in filtered_weights.items()
+    }
+
     configs = []
     for topic, sources in TOPIC_SOURCES.items():
+        if topic in exclude:
+            continue
         for source in sources:
             cfg = deepcopy(source)
             names = [cfg["name"]] + cfg.pop("extra_names", [])
@@ -154,7 +171,9 @@ def get_dataset_configs() -> list[dict[str, Any]]:
                         cfg,
                         name=name,
                         topic=topic,
-                        weight=TOPIC_WEIGHTS[topic] / len(sources) / len(names),
+                        weight=normalized_topic_weights[topic]
+                        / len(sources)
+                        / len(names),
                     )
                 )
     return configs
@@ -166,6 +185,8 @@ _ROLES = {
     "human": "user",
     "prompter": "user",
     "gpt": "assistant",
+    "model": "assistant",
+    "bot": "assistant",
     "function": "tool",
     "observation": "tool",
 }
@@ -369,10 +390,17 @@ class TokenizedShardProducer:
         dataset_configs: list[dict] | None = None,
         tokenizer=None,
         expected_vocab_size: int | None = None,
+        oversized_behavior: str = "filter",
     ):
         if seq_len < 2 or max_buffered_files < 1:
             raise ValueError("seq_len must be >=2 and max_buffered_files >=1")
+        if oversized_behavior not in {"filter", "truncate", "error"}:
+            raise ValueError(
+                f"Invalid oversized_behavior {oversized_behavior!r}; expected 'filter', 'truncate', or 'error'"
+            )
         self.seq_len = seq_len
+        self.oversized_behavior = oversized_behavior
+        self.skipped_oversized_samples = 0
         self.tokens_per_shard = (
             tokens_per_shard if tokens_per_shard is not None else seq_len * 8
         )
@@ -433,6 +461,7 @@ class TokenizedShardProducer:
             "eos_id": self.tokenizer.eos_token_id,
             "pad_id": self.pad_id,
             "dataset_configs": self.dataset_configs,
+            "oversized_behavior": self.oversized_behavior,
         }
 
     def save_checkpoint(self, checkpoint_path: str):
@@ -441,6 +470,7 @@ class TokenizedShardProducer:
                 "settings": self._settings(),
                 "current_shard_idx": self.current_shard_idx,
                 "cumulative_samples": self.cumulative_samples,
+                "skipped_oversized_samples": self.skipped_oversized_samples,
                 "finished": self.finished,
                 "token_buffer_b64": base64.b64encode(
                     np.asarray(self.token_buffer, dtype="<u4").tobytes()
@@ -455,7 +485,11 @@ class TokenizedShardProducer:
         with self._lock:
             with open(checkpoint_path, encoding="utf-8") as handle:
                 state = json.load(handle)
-            if state.get("settings") != self._settings():
+            loaded_settings = dict(state.get("settings", {}))
+            current_settings = self._settings()
+            if "oversized_behavior" not in loaded_settings:
+                loaded_settings["oversized_behavior"] = self.oversized_behavior
+            if loaded_settings != current_settings:
                 raise ValueError("SFT checkpoint settings/tokenizer/mix do not match")
             tokens = np.frombuffer(
                 base64.b64decode(state["token_buffer_b64"], validate=True), dtype="<u4"
@@ -467,6 +501,7 @@ class TokenizedShardProducer:
             self.token_buffer, self.loss_mask_buffer = tokens, mask
             self.current_shard_idx = state["current_shard_idx"]
             self.cumulative_samples = state["cumulative_samples"]
+            self.skipped_oversized_samples = state.get("skipped_oversized_samples", 0)
             self.finished = state["finished"]
         self.log(
             f"[SFT Producer] Restored {self.cumulative_samples} conversations; deterministic replay required"
@@ -528,12 +563,43 @@ class TokenizedShardProducer:
         ids, mask = tokenize_messages(self.tokenizer, messages)
         self._validate_tokens(ids)
         if len(ids) > self.seq_len:
-            raise ValueError(
-                f"SFT conversation has {len(ids)} tokens, exceeding seq_len={self.seq_len}. "
-                "Increase seq_len within the model's supported context; no silent truncation is applied."
-            )
+            if self.oversized_behavior == "error":
+                raise ValueError(
+                    f"SFT conversation has {len(ids)} tokens, exceeding seq_len={self.seq_len}. "
+                    "Increase seq_len within the model's supported context; no silent truncation is applied."
+                )
+            elif self.oversized_behavior == "truncate":
+                ids = ids[: self.seq_len]
+                mask = mask[: self.seq_len]
+                if not any(mask[1:]):
+                    with self._lock:
+                        self.cumulative_samples += 1
+                        self.skipped_oversized_samples += 1
+                    return
+            elif self.oversized_behavior == "filter":
+                with self._lock:
+                    self.cumulative_samples += 1
+                    self.skipped_oversized_samples += 1
+                if (
+                    self.skipped_oversized_samples <= 5
+                    or self.skipped_oversized_samples % 100 == 0
+                ):
+                    self.log(
+                        f"[SFT Producer] Skipped oversized conversation ({len(ids)} tokens > "
+                        f"seq_len={self.seq_len}; total skipped: {self.skipped_oversized_samples})"
+                    )
+                return
+            else:
+                raise ValueError(
+                    f"Unknown oversized_behavior: {self.oversized_behavior}"
+                )
         if not any(mask[1:]):
-            raise ValueError("Conversation contains no supervised next-token target")
+            with self._lock:
+                self.cumulative_samples += 1
+            self.log(
+                "[SFT Producer] Skipping conversation with no supervised next-token target"
+            )
+            return
         with self._lock:
             used = len(self.token_buffer) % self.seq_len
             if used and used + len(ids) > self.seq_len:
