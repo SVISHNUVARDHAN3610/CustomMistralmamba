@@ -21,6 +21,7 @@
 | **Loss Specification** | [`research/loss-definitions.md`](research/loss-definitions.md) |
 | **Package Architecture Reference** | [`model/README.md`](model/README.md) (Comprehensive 24-section developer specification) |
 | **Optimization Stack** | Moonshot Muon + AdamW for single-GPU and PyTorch FSDP2 training |
+| **Supervised Post-Training** | [`post-training/readme.md`](post-training/readme.md) — SFT pipeline, single-GPU/FSDP2 launch commands, validation, and resume |
 | **Scan Acceleration** | 4-Tier Selective Scan (Fused CUDA `mamba-ssm` $\to$ Parallel $\to$ Blocked $\to$ Checkpointed) |
 | **Test Suite** | [`tests/test_model.py`](tests/test_model.py) (83 deterministic unit tests, AMP & gradient verified) |
 
@@ -373,6 +374,19 @@ torchrun --nproc_per_node=8 pre-training/fsdp2_train.py \
   --grad-nan-guard strict
 ```
 
+### 3. Supervised Post-Training (`post-training/`)
+
+After pretraining, use [`sft_post_train.py`](post-training/sft_post_train.py) for
+single-GPU SFT or [`sft_fsdp2_post_train.py`](post-training/sft_fsdp2_post_train.py)
+under `torchrun` for FSDP2 with MuonDTensor/AdamW. Both load the saved model
+architecture and weights and consume the weighted conversation mixture from
+[`utils/sft_dataset.py`](utils/sft_dataset.py), with assistant-only target labels.
+
+The [post-training guide](post-training/readme.md) covers launch commands, topic
+weights, context limits, held-out validation, and exact SFT resume requirements.
+SFT uses its own uint32 token/mask shard format; retain its dedicated cache when
+resuming a run. Whole conversations must fit the pretrained model's context.
+
 ---
 
 ## 10. Inference, Incremental Decoding & State Threading
@@ -481,10 +495,16 @@ CustomMistralmamba/
 │   └── Improvement-suggestions.md  # Architectural backlog & scaling suggestions
 │
 ├── pre-training/                   # Distributed multi-GPU training
-│   └── fsdp2_train.py              # PyTorch FSDP2 + AdamW distributed trainer
+│   └── fsdp2_train.py              # PyTorch FSDP2 + MuonDTensor/AdamW trainer
+│
+├── post-training/                  # Supervised fine-tuning from pretrained weights
+│   ├── readme.md                   # SFT pipeline, launch commands, validation & resume
+│   ├── sft_post_train.py           # Single-GPU SFT & shared training loop
+│   └── sft_fsdp2_post_train.py     # Distributed FSDP2 SFT backend
 │
 ├── utils/                          # Dataset streaming & validation utilities
 │   ├── dataset.py                  # TokenizedShardProducer, MmapShardDataset
+│   ├── sft_dataset.py              # Weighted conversations & assistant-masked SFT shards
 │   ├── fsdp2_muon.py               # MuonDTensor implementation & Newton-Schulz checks
 │   └── validation.py               # WikiTextCyclicValidator for periodic evaluation
 │
@@ -496,7 +516,9 @@ CustomMistralmamba/
 │
 └── tests/                          # Comprehensive unit test suite
     ├── test_model.py               # 83 rigorous tests covering forward, backward, caches
-    └── test_toy_train_smoke.py     # Integration smoke test for toy training loop
+    ├── test_toy_train_smoke.py     # Integration smoke test for toy training loop
+    ├── test_sft_dataset.py         # SFT adapters, masking, shards & replay
+    └── test_sft_post_train.py      # CPU SFT integration & distributed adapter contracts
 ```
 
 ---
