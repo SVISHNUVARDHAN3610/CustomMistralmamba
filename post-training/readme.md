@@ -180,7 +180,7 @@ runs/sft/
   config.json          # Saved model configuration
   sft_config.json      # Resolved SFT runtime contract
   train.log            # Startup, progress, validation and failure diagnostics
-  metrics.jsonl        # Logged training CE, assistant-token count, norm and LRs
+  metrics.jsonl        # Logged training losses, smoothed CE, auxiliary regularizers, norm, tokens, and LRs
 
 data_cache/sft/
   producer_state.json  # Stream position and buffered tokens/masks

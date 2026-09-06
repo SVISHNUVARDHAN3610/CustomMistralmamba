@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 # Disable JAX in Hugging Face datasets to prevent background worker circular imports
 os.environ["USE_JAX"] = "0"
@@ -60,6 +61,7 @@ if str(ROOT) not in sys.path:
 
 import train as pretrain
 from model.core.config import HybridMambaMoEConfig
+from model.hybrid.losses import _aux_loss_schedule, _expert_loss_schedule
 from model.hybrid.model import HybridForCausalLM
 from utils.sft_dataset import (
     DATASET_CONFIGS,
@@ -69,6 +71,7 @@ from utils.sft_dataset import (
     get_dataset_configs,
     verify_tokenizer_vocab,
 )
+from utils.training_logging import format_training_log_line
 
 
 def read_checkpoint(path):
@@ -411,6 +414,14 @@ def accumulated_loss(output, count, global_count, world, microbatches):
     )
 
 
+def _as_double(v: Any) -> torch.Tensor | float:
+    if isinstance(v, torch.Tensor):
+        return v.detach().to(dtype=torch.float64).reshape(())
+    if v is None:
+        return 0.0
+    return float(v)
+
+
 def train_window(model, batches, optimizers, args, backend, step):
     counts = [validate_batch(x, y, model.config.vocab_size) for x, y in batches]
     total = backend.sum(
@@ -418,7 +429,22 @@ def train_window(model, batches, optimizers, args, backend, step):
     )
     for optimizer in optimizers:
         optimizer.zero_grad(set_to_none=True)
-    metrics = torch.zeros(2, device=backend.device, dtype=torch.float64)
+    # sums layout (accumulated on-device, reduced in one collective):
+    #  0: token-weighted CE loss (ce_loss * count)
+    #  1: count of assistant tokens
+    #  2: non-CE regularization terms (loss - ce_loss)
+    #  3: router load-balancing auxiliary loss
+    #  4: router z-loss
+    #  5: memory reconstruction loss (recon)
+    #  6: associative recall auxiliary loss (assoc)
+    #  7: associative key norm regularizer (assoc_norm)
+    #  8: expert specialization loss (expert)
+    #  9: write-gate entropy regularizer (gate)
+    # 10: memory read loss (read)
+    # 11: memory fusion loss (fusion)
+    # 12: SSM state regularization loss (ssm)
+    # 13: memory slot regularization loss (slot)
+    sums = torch.zeros(14, device=backend.device, dtype=torch.float64)
     for i, ((inputs, labels), count) in enumerate(zip(batches, counts)):
         backend.sync_backward(model, i == len(batches) - 1)
         inputs, labels = inputs.to(backend.device), labels.to(backend.device)
@@ -441,15 +467,49 @@ def train_window(model, batches, optimizers, args, backend, step):
         if int(finite) != backend.world:
             raise FloatingPointError("Non-finite SFT loss; optimizer step aborted")
         loss.backward()
-        metrics[0] += output.ce_loss.detach().double() * count
-        metrics[1] += count
+        aux = output.auxiliary_losses
+        sums[0] += _as_double(output.ce_loss) * count
+        sums[1] += count
+        if output.loss is not None and output.ce_loss is not None:
+            sums[2] += _as_double(output.loss - output.ce_loss)
+        sums[3] += _as_double(output.router_aux_loss)
+        sums[4] += _as_double(output.router_z_loss)
+        if aux is not None:
+            sums[5] += _as_double(aux.recon)
+            sums[6] += _as_double(aux.assoc)
+            sums[7] += _as_double(aux.assoc_norm)
+            sums[8] += _as_double(aux.expert)
+            sums[9] += _as_double(aux.gate)
+            sums[10] += _as_double(aux.read)
+            sums[11] += _as_double(aux.fusion)
+            sums[12] += _as_double(aux.ssm)
+            sums[13] += _as_double(aux.slot)
     norm = backend.clip(model, args.max_grad_norm)
     if not torch.isfinite(norm):
         raise FloatingPointError("Non-finite SFT gradient norm; optimizer step aborted")
     for optimizer in optimizers:
         optimizer.step()
-    metrics = backend.sum(metrics)
-    return float(metrics[0] / metrics[1]), int(metrics[1]), float(norm)
+    sums = backend.sum(sums)
+    token_total = max(float(sums[1].item()), 1.0)
+    ce = float(sums[0].item() / token_total)
+    tokens = int(sums[1].item())
+    micro_total = len(batches) * backend.world
+    aux_means = (sums[2:] / micro_total).tolist()
+    scalars = {
+        "loss": float(ce + aux_means[0]),
+        "router_aux_loss": float(aux_means[1]),
+        "router_z_loss": float(aux_means[2]),
+        "recon": float(aux_means[3]),
+        "assoc": float(aux_means[4]),
+        "assoc_norm": float(aux_means[5]),
+        "expert": float(aux_means[6]),
+        "gate": float(aux_means[7]),
+        "read": float(aux_means[8]),
+        "fusion": float(aux_means[9]),
+        "ssm": float(aux_means[10]),
+        "slot": float(aux_means[11]),
+    }
+    return ce, tokens, float(norm), scalars
 
 
 @torch.no_grad()
@@ -572,6 +632,7 @@ def run_training(args, backend, logger):
         )
         del checkpoint
         gc.collect()
+    ce_smooth = pretrain.RollingAverage(getattr(args, "smooth_window", 20))
     if backend.rank == 0:
         TokenizedShardProducer._atomic_json(
             str(Path(args.run_dir) / "sft_config.json"), contract
@@ -596,40 +657,68 @@ def run_training(args, backend, logger):
                     batches = list(itertools.islice(iterator, args.grad_accum_steps))
                     if not batches:
                         break
-                    ce, tokens, norm = train_window(
+                    step_start = time.perf_counter()
+                    ce, tokens, norm, scalars = train_window(
                         model, batches, optimizers, args, backend, step
                     )
                     for scheduler in schedulers:
                         scheduler.step()
                     step += 1
                     offset += len(batches)
+                    step_time_s = time.perf_counter() - step_start
+                    ce_smooth.update(ce)
+                    val_ce = None
+                    if args.validation_dir and step % args.val_interval == 0:
+                        val_ce = evaluate(model, args, backend)
+                        logger.info(
+                            "SFT validation step=%d assistant_ce=%.5f",
+                            step,
+                            val_ce,
+                        )
                     if backend.rank == 0 and (
                         step == 1 or step % args.log_interval == 0
                     ):
                         record = {
                             "step": step,
+                            "shard_idx": shard,
+                            "loss": scalars["loss"],
                             "ce_loss": ce,
-                            "assistant_tokens": tokens,
+                            "ce_smooth": ce_smooth.mean,
+                            "val_ce_loss": val_ce,
+                            "router_aux_loss": scalars["router_aux_loss"],
+                            "router_z_loss": scalars["router_z_loss"],
+                            "recon": scalars["recon"],
+                            "assoc": scalars["assoc"],
+                            "assoc_scale": _aux_loss_schedule(
+                                step, args.max_steps, cfg.assoc_warmup_fraction
+                            ),
+                            "assoc_norm": scalars["assoc_norm"],
+                            "expert": scalars["expert"],
+                            "expert_scale": _expert_loss_schedule(
+                                step, args.max_steps, cfg.expert_warmup_fraction
+                            ),
                             "grad_norm": norm,
+                            "step_time_s": step_time_s,
+                            "assistant_tokens": tokens,
+                            "adam_lr": float(schedulers[-1].get_last_lr()[0]),
                             "lr": [s.get_last_lr() for s in schedulers],
+                            "gate": scalars["gate"],
+                            "read": scalars["read"],
+                            "fusion": scalars["fusion"],
+                            "ssm": scalars["ssm"],
+                            "slot": scalars["slot"],
                         }
+                        if use_muon:
+                            record["muon_lr"] = float(schedulers[0].get_last_lr()[0])
                         logger.info(
-                            "SFT step=%d ce=%.5f assistant_tokens=%d grad_norm=%.4f",
-                            step,
-                            ce,
+                            "SFT %s tokens=%d",
+                            format_training_log_line(step, args.max_steps, record),
                             tokens,
-                            norm,
                         )
                         with (Path(args.run_dir) / "metrics.jsonl").open(
                             "a", encoding="utf-8"
                         ) as handle:
                             handle.write(json.dumps(record) + "\n")
-                    if args.validation_dir and step % args.val_interval == 0:
-                        logger.info(
-                            "SFT validation step=%d assistant_ce=%.5f",
-                            step,
-                            evaluate(model, args, backend),
-                        )
                     if step % args.save_interval == 0:
                         save_checkpoint(
                             model,
@@ -743,6 +832,12 @@ def parse_args(argv=None, *, distributed=False, description=None):
     parser.add_argument("--save-interval", type=int, default=100)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument(
+        "--smooth-window",
+        type=int,
+        default=20,
+        help="Window size for rolling-average smoothed CE loss (default: 20)",
+    )
+    parser.add_argument(
         "--validation-dir", help="Separate held-out SFT shard directory"
     )
     parser.add_argument("--val-interval", type=int, default=100)
@@ -758,6 +853,7 @@ def parse_args(argv=None, *, distributed=False, description=None):
         "grad_accum_steps",
         "save_interval",
         "log_interval",
+        "smooth_window",
         "val_interval",
         "val_batches",
         "max_buffered_files",

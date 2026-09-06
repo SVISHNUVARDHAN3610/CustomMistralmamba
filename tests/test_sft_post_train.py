@@ -179,6 +179,33 @@ class TestSFTTraining(unittest.TestCase):
                 )
             )
             self.assertTrue((root / "cache" / "shard_000000.bin").exists())
+            metrics_file = root / "run" / "metrics.jsonl"
+            self.assertTrue(metrics_file.exists())
+            records = [
+                json.loads(line)
+                for line in metrics_file.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(records), 1)
+            rec = records[0]
+            self.assertEqual(rec["step"], 1)
+            for key in (
+                "loss",
+                "ce_loss",
+                "ce_smooth",
+                "router_aux_loss",
+                "router_z_loss",
+                "recon",
+                "assoc",
+                "assoc_norm",
+                "expert",
+                "grad_norm",
+                "step_time_s",
+                "assistant_tokens",
+                "adam_lr",
+            ):
+                self.assertIn(key, rec)
+                self.assertIsNotNone(rec[key])
 
     def test_interrupted_resume_matches_uninterrupted_training(self):
         with tempfile.TemporaryDirectory() as directory:
