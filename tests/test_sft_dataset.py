@@ -679,6 +679,151 @@ class TestSFTConversationChunking(unittest.TestCase):
             self.assertEqual(p1.loss_mask_buffer, p2.loss_mask_buffer)
             self.assertNotEqual(p1.token_buffer, p3.token_buffer)
 
+    def test_budget_small_conversation_keep_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(directory, seq_len=200, keep_all_threshold=8)
+            self.assertEqual(producer._calculate_chunk_budget(3), 3)
+            messages = []
+            for i in range(3):
+                messages.append({"role": "user", "content": f"Turn {i} " + "u" * 50})
+                messages.append(
+                    {"role": "assistant", "content": f"Ans {i} " + "a" * 50}
+                )
+            producer._append_conversation(messages)
+            self.assertEqual(producer.stats["conversations_chunked"], 1)
+            self.assertEqual(producer.stats["conversations_keep_all"], 1)
+            self.assertEqual(producer.stats["conversations_sampled"], 0)
+            self.assertEqual(producer.stats["chunks_created"], 3)
+            self.assertEqual(producer.stats["chunks_emitted"], 3)
+            self.assertEqual(producer.stats["chunks_dropped"], 0)
+
+    def test_budget_medium_conversation_keep_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(directory, seq_len=200, keep_all_threshold=8)
+            self.assertEqual(producer._calculate_chunk_budget(6), 6)
+            messages = []
+            for i in range(6):
+                messages.append({"role": "user", "content": f"Turn {i} " + "u" * 50})
+                messages.append(
+                    {"role": "assistant", "content": f"Ans {i} " + "a" * 50}
+                )
+            producer._append_conversation(messages)
+            self.assertEqual(producer.stats["conversations_chunked"], 1)
+            self.assertEqual(producer.stats["conversations_keep_all"], 1)
+            self.assertEqual(producer.stats["conversations_sampled"], 0)
+            self.assertEqual(producer.stats["chunks_created"], 6)
+            self.assertEqual(producer.stats["chunks_emitted"], 6)
+            self.assertEqual(producer.stats["chunks_dropped"], 0)
+
+    def test_budget_larger_conversation_retention_ratio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(
+                directory,
+                seq_len=200,
+                retention_ratio=0.25,
+                min_chunks_per_conversation=4,
+                max_chunks_per_conversation=32,
+                keep_all_threshold=8,
+            )
+            self.assertEqual(producer._calculate_chunk_budget(40), 10)
+            messages = []
+            for i in range(40):
+                messages.append({"role": "user", "content": f"Turn {i} " + "u" * 50})
+                messages.append(
+                    {"role": "assistant", "content": f"Ans {i} " + "a" * 50}
+                )
+            producer._append_conversation(messages)
+            self.assertEqual(producer.stats["conversations_chunked"], 1)
+            self.assertEqual(producer.stats["conversations_keep_all"], 0)
+            self.assertEqual(producer.stats["conversations_sampled"], 1)
+            self.assertEqual(producer.stats["conversations_hit_max_cap"], 0)
+            self.assertEqual(producer.stats["chunks_created"], 40)
+            self.assertEqual(producer.stats["chunks_emitted"], 10)
+            self.assertEqual(producer.stats["chunks_dropped"], 30)
+
+    def test_budget_extreme_conversation_hit_max_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(
+                directory,
+                seq_len=200,
+                retention_ratio=0.25,
+                max_chunks_per_conversation=32,
+                keep_all_threshold=8,
+            )
+            self.assertEqual(producer._calculate_chunk_budget(200), 32)
+            messages = []
+            for i in range(200):
+                messages.append({"role": "user", "content": f"Turn {i} " + "u" * 50})
+                messages.append(
+                    {"role": "assistant", "content": f"Ans {i} " + "a" * 50}
+                )
+            producer._append_conversation(messages)
+            self.assertEqual(producer.stats["conversations_chunked"], 1)
+            self.assertEqual(producer.stats["conversations_keep_all"], 0)
+            self.assertEqual(producer.stats["conversations_sampled"], 1)
+            self.assertEqual(producer.stats["conversations_hit_max_cap"], 1)
+            self.assertEqual(producer.stats["chunks_created"], 200)
+            self.assertEqual(producer.stats["chunks_emitted"], 32)
+            self.assertEqual(producer.stats["chunks_dropped"], 168)
+
+    def test_stratified_selection_covers_beginning_middle_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(directory, seed=42)
+            total_chunks = 100
+            target_chunks = 8
+            indices = producer._stratified_sample_indices(total_chunks, target_chunks)
+            self.assertEqual(len(indices), target_chunks)
+            self.assertLess(indices[0], 12)
+            self.assertGreaterEqual(indices[0], 0)
+            self.assertGreaterEqual(indices[-1], 87)
+            self.assertLess(indices[-1], 100)
+            for i in range(target_chunks):
+                start = i * total_chunks // target_chunks
+                end = (i + 1) * total_chunks // target_chunks
+                self.assertTrue(
+                    start <= indices[i] < end,
+                    f"Index {indices[i]} not in stratum [{start}, {end})",
+                )
+
+    def test_stratified_selection_strictly_sorted_and_unique(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(directory, seed=123)
+            for total, target in [(10, 4), (50, 12), (100, 32), (500, 32), (6, 6)]:
+                indices = producer._stratified_sample_indices(total, target)
+                self.assertEqual(len(indices), target)
+                self.assertEqual(indices, sorted(indices))
+                self.assertEqual(len(set(indices)), len(indices))
+                if target > 1:
+                    for j in range(len(indices) - 1):
+                        self.assertLess(indices[j], indices[j + 1])
+
+    def test_chunking_consecutive_conversations_advance_rng(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(directory, seed=42)
+            ind1 = producer._stratified_sample_indices(100, 10)
+            ind2 = producer._stratified_sample_indices(100, 10)
+            self.assertNotEqual(ind1, ind2)
+
+    def test_budget_legacy_fixed_cap_behavior(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(
+                directory,
+                seq_len=200,
+                budget_strategy="fixed",
+                max_chunks_per_conversation=4,
+            )
+            self.assertEqual(producer._calculate_chunk_budget(20), 4)
+            messages = []
+            for i in range(20):
+                messages.append({"role": "user", "content": f"Turn {i} " + "u" * 50})
+                messages.append(
+                    {"role": "assistant", "content": f"Ans {i} " + "a" * 50}
+                )
+            producer._append_conversation(messages)
+            self.assertEqual(producer.stats["conversations_chunked"], 1)
+            self.assertEqual(producer.stats["chunks_emitted"], 4)
+            self.assertEqual(producer.stats["chunks_dropped"], 16)
+
 
 if __name__ == "__main__":
     unittest.main()

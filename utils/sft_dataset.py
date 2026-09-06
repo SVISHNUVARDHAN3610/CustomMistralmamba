@@ -393,6 +393,9 @@ def _default_stats() -> dict[str, int]:
         "conversations_kept_whole": 0,
         "conversations_chunked": 0,
         "conversations_filtered": 0,
+        "conversations_keep_all": 0,
+        "conversations_sampled": 0,
+        "conversations_hit_max_cap": 0,
         "chunks_created": 0,
         "chunks_emitted": 0,
         "chunks_dropped": 0,
@@ -415,12 +418,19 @@ def format_stats_summary(stats: dict[str, int]) -> str:
     retained = stats.get("tokens_retained", 0)
     dropped = max(0, seen - retained)
     rate = (retained / max(seen, 1)) * 100.0
+    chunked = stats.get("conversations_chunked", 0)
+    keep_all = stats.get("conversations_keep_all", 0)
+    sampled = stats.get("conversations_sampled", 0)
+    hit_max = stats.get("conversations_hit_max_cap", 0)
     return (
         "SFT Dataset Statistics\n"
         "----------------------\n"
         f"Conversations seen:       {stats.get('conversations_seen', 0)}\n"
         f"Kept whole:               {stats.get('conversations_kept_whole', 0)}\n"
-        f"Chunked:                  {stats.get('conversations_chunked', 0)}\n"
+        f"Chunked:                  {chunked}\n"
+        f"  - Keep all chunks:      {keep_all}\n"
+        f"  - Sampled:              {sampled}\n"
+        f"  - Hit max cap:          {hit_max}\n"
         f"Filtered:                 {stats.get('conversations_filtered', 0)}\n"
         f"Chunks emitted:           {stats.get('chunks_emitted', 0)}\n"
         f"Tokens retained:        {_format_count(retained)}\n"
@@ -448,7 +458,12 @@ class TokenizedShardProducer:
         expected_vocab_size: int | None = None,
         oversized_behavior: str = "chunk",
         overlap_turns: int = 1,
-        max_chunks_per_conversation: int = 4,
+        budget_strategy: str = "retention_ratio",
+        retention_ratio: float = 0.25,
+        keep_all_threshold: int = 8,
+        min_chunks_per_conversation: int = 4,
+        max_chunks_per_conversation: int = 32,
+        sampling_strategy: str = "stratified",
         min_assistant_tokens: int = 16,
         min_chunk_tokens: int = 128,
     ):
@@ -458,10 +473,24 @@ class TokenizedShardProducer:
             raise ValueError(
                 f"Invalid oversized_behavior {oversized_behavior!r}; expected 'chunk', 'filter', 'truncate', or 'error'"
             )
-        if overlap_turns < 0:
-            raise ValueError("overlap_turns must be non-negative")
+        if budget_strategy not in {"retention_ratio", "fixed"}:
+            raise ValueError(
+                f"Invalid budget_strategy {budget_strategy!r}; expected 'retention_ratio' or 'fixed'"
+            )
+        if sampling_strategy not in {"stratified", "random"}:
+            raise ValueError(
+                f"Invalid sampling_strategy {sampling_strategy!r}; expected 'stratified' or 'random'"
+            )
+        if not (0.0 < retention_ratio <= 1.0):
+            raise ValueError("retention_ratio must be in (0.0, 1.0]")
+        if keep_all_threshold < 1:
+            raise ValueError("keep_all_threshold must be >=1")
+        if min_chunks_per_conversation < 1:
+            raise ValueError("min_chunks_per_conversation must be >=1")
         if max_chunks_per_conversation < 1:
             raise ValueError("max_chunks_per_conversation must be >=1")
+        if overlap_turns < 0:
+            raise ValueError("overlap_turns must be non-negative")
         if min_assistant_tokens < 1:
             raise ValueError("min_assistant_tokens must be >=1")
         if min_chunk_tokens < 1:
@@ -469,7 +498,12 @@ class TokenizedShardProducer:
         self.seq_len = seq_len
         self.oversized_behavior = oversized_behavior
         self.overlap_turns = overlap_turns
+        self.budget_strategy = budget_strategy
+        self.retention_ratio = retention_ratio
+        self.keep_all_threshold = keep_all_threshold
+        self.min_chunks_per_conversation = min_chunks_per_conversation
         self.max_chunks_per_conversation = max_chunks_per_conversation
+        self.sampling_strategy = sampling_strategy
         self.min_assistant_tokens = min_assistant_tokens
         self.min_chunk_tokens = min_chunk_tokens
         self.skipped_oversized_samples = 0
@@ -540,7 +574,12 @@ class TokenizedShardProducer:
             "dataset_configs": self.dataset_configs,
             "oversized_behavior": self.oversized_behavior,
             "overlap_turns": self.overlap_turns,
+            "budget_strategy": self.budget_strategy,
+            "retention_ratio": self.retention_ratio,
+            "keep_all_threshold": self.keep_all_threshold,
+            "min_chunks_per_conversation": self.min_chunks_per_conversation,
             "max_chunks_per_conversation": self.max_chunks_per_conversation,
+            "sampling_strategy": self.sampling_strategy,
             "min_assistant_tokens": self.min_assistant_tokens,
             "min_chunk_tokens": self.min_chunk_tokens,
         }
@@ -572,7 +611,12 @@ class TokenizedShardProducer:
             for key in (
                 "oversized_behavior",
                 "overlap_turns",
+                "budget_strategy",
+                "retention_ratio",
+                "keep_all_threshold",
+                "min_chunks_per_conversation",
                 "max_chunks_per_conversation",
+                "sampling_strategy",
                 "min_assistant_tokens",
                 "min_chunk_tokens",
             ):
@@ -591,7 +635,9 @@ class TokenizedShardProducer:
             self.current_shard_idx = state["current_shard_idx"]
             self.cumulative_samples = state["cumulative_samples"]
             self.skipped_oversized_samples = state.get("skipped_oversized_samples", 0)
-            self.stats = state.get("stats", _default_stats())
+            loaded_stats = _default_stats()
+            loaded_stats.update(state.get("stats", {}))
+            self.stats = loaded_stats
             self.finished = state["finished"]
         self.log(
             f"[SFT Producer] Restored {self.cumulative_samples} conversations; deterministic replay required"
@@ -878,6 +924,33 @@ class TokenizedShardProducer:
 
         return valid_chunks
 
+    def _calculate_chunk_budget(self, total_chunks: int) -> int:
+        if self.budget_strategy == "fixed":
+            return min(total_chunks, self.max_chunks_per_conversation)
+        if total_chunks <= self.keep_all_threshold:
+            return total_chunks
+        target = math.ceil(total_chunks * self.retention_ratio)
+        effective_min = min(
+            self.min_chunks_per_conversation, self.max_chunks_per_conversation
+        )
+        target = max(target, effective_min)
+        target = min(target, self.max_chunks_per_conversation)
+        return min(target, total_chunks)
+
+    def _stratified_sample_indices(
+        self, total_chunks: int, target_chunks: int
+    ) -> list[int]:
+        if target_chunks >= total_chunks:
+            return list(range(total_chunks))
+        if target_chunks <= 0:
+            return []
+        indices: list[int] = []
+        for i in range(target_chunks):
+            start = i * total_chunks // target_chunks
+            end = (i + 1) * total_chunks // target_chunks
+            indices.append(int(self.rng.randint(start, end)))
+        return indices
+
     def _append_conversation(self, messages):
         ids, mask = tokenize_messages(self.tokenizer, messages)
         self._validate_tokens(ids)
@@ -930,9 +1003,7 @@ class TokenizedShardProducer:
             elif self.oversized_behavior == "chunk":
                 self.stats["conversations_chunked"] += 1
                 # Chunk generation preserves dataset/topic mixture weighting because sampling
-                # occurs at the conversation level in _build_stream() before chunking. Capping
-                # chunks per conversation via max_chunks_per_conversation prevents single long
-                # conversations from flooding the shard buffer or biasing topic distributions.
+                # occurs at the conversation level in _build_stream() before chunking.
                 chunks = self._chunk_conversation(
                     messages, original_ids=ids, original_mask=mask
                 )
@@ -947,22 +1018,48 @@ class TokenizedShardProducer:
                         self.skipped_oversized_samples += 1
                     return
 
-                if len(chunks) > self.max_chunks_per_conversation:
-                    self.log(
-                        f"[SFT Producer] Capped chunks for conversation "
-                        f"({len(chunks)} created -> {self.max_chunks_per_conversation} emitted, "
-                        f"max_chunks_per_conversation={self.max_chunks_per_conversation})"
-                    )
-                    selected_indices = sorted(
-                        self.rng.choice(
-                            len(chunks),
-                            size=self.max_chunks_per_conversation,
-                            replace=False,
+                target_chunks = self._calculate_chunk_budget(chunks_created)
+
+                if target_chunks < chunks_created:
+                    self.stats["conversations_sampled"] += 1
+                    if (
+                        target_chunks == self.max_chunks_per_conversation
+                        and chunks_created > self.max_chunks_per_conversation
+                    ):
+                        self.stats["conversations_hit_max_cap"] += 1
+                        self.log(
+                            f"[SFT Producer] Capped chunks for conversation "
+                            f"({chunks_created} created -> {target_chunks} emitted, "
+                            f"max_chunks_per_conversation={self.max_chunks_per_conversation})"
                         )
-                    )
-                    dropped_count = len(chunks) - self.max_chunks_per_conversation
+                    else:
+                        self.log(
+                            f"[SFT Producer] Sampled chunks for conversation "
+                            f"({chunks_created} created -> {target_chunks} emitted, "
+                            f"budget_strategy={self.budget_strategy}, sampling_strategy={self.sampling_strategy})"
+                        )
+
+                    if self.sampling_strategy == "stratified":
+                        selected_indices = self._stratified_sample_indices(
+                            chunks_created, target_chunks
+                        )
+                    elif self.sampling_strategy == "random":
+                        selected_indices = sorted(
+                            self.rng.choice(
+                                chunks_created,
+                                size=target_chunks,
+                                replace=False,
+                            )
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unknown sampling_strategy: {self.sampling_strategy}"
+                        )
+                    dropped_count = chunks_created - len(selected_indices)
                     self.stats["chunks_dropped"] += dropped_count
                     chunks = [chunks[i] for i in selected_indices]
+                else:
+                    self.stats["conversations_keep_all"] += 1
 
                 with self._lock:
                     for c_ids, c_mask in chunks:
@@ -981,11 +1078,16 @@ class TokenizedShardProducer:
                 self.stats["tokens_dropped"] += tokens_dropped_conv
                 self.stats["assistant_tokens_retained"] += asst_retained_conv
 
+                retention_pct = (len(chunks) / max(chunks_created, 1)) * 100.0
                 self.log(
                     f"[SFT Producer] Chunked conversation:\n"
                     f"  original_tokens={len(ids)}\n"
                     f"  chunks_created={chunks_created}\n"
+                    f"  budget_strategy={self.budget_strategy}\n"
+                    f"  target_chunks={len(chunks)}\n"
                     f"  chunks_emitted={len(chunks)}\n"
+                    f"  retention_ratio={retention_pct:.1f}%\n"
+                    f"  sampling_strategy={self.sampling_strategy}\n"
                     f"  tokens_retained={tokens_retained_conv}\n"
                     f"  tokens_dropped={tokens_dropped_conv}\n"
                     f"  assistant_tokens_retained={asst_retained_conv}"

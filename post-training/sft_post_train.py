@@ -212,9 +212,16 @@ class ShardFeed:
                 log_fn=logger.info,
                 oversized_behavior=getattr(args, "oversized_behavior", "chunk"),
                 overlap_turns=getattr(args, "overlap_turns", 1),
-                max_chunks_per_conversation=getattr(
-                    args, "max_chunks_per_conversation", 4
+                budget_strategy=getattr(args, "budget_strategy", "retention_ratio"),
+                retention_ratio=getattr(args, "retention_ratio", 0.25),
+                keep_all_threshold=getattr(args, "keep_all_threshold", 8),
+                min_chunks_per_conversation=getattr(
+                    args, "min_chunks_per_conversation", 4
                 ),
+                max_chunks_per_conversation=getattr(
+                    args, "max_chunks_per_conversation", 32
+                ),
+                sampling_strategy=getattr(args, "sampling_strategy", "stratified"),
                 min_assistant_tokens=getattr(args, "min_assistant_tokens", 16),
                 min_chunk_tokens=getattr(args, "min_chunk_tokens", 128),
             )
@@ -308,7 +315,12 @@ def runtime_contract(args, cfg, sources, backend, use_muon, tokenizer):
         "cache_dir": str(Path(args.cache_dir).resolve()),
         "oversized_behavior": getattr(args, "oversized_behavior", "chunk"),
         "overlap_turns": getattr(args, "overlap_turns", 1),
-        "max_chunks_per_conversation": getattr(args, "max_chunks_per_conversation", 4),
+        "budget_strategy": getattr(args, "budget_strategy", "retention_ratio"),
+        "retention_ratio": getattr(args, "retention_ratio", 0.25),
+        "keep_all_threshold": getattr(args, "keep_all_threshold", 8),
+        "min_chunks_per_conversation": getattr(args, "min_chunks_per_conversation", 4),
+        "max_chunks_per_conversation": getattr(args, "max_chunks_per_conversation", 32),
+        "sampling_strategy": getattr(args, "sampling_strategy", "stratified"),
         "min_assistant_tokens": getattr(args, "min_assistant_tokens", 16),
         "min_chunk_tokens": getattr(args, "min_chunk_tokens", 128),
     }
@@ -319,7 +331,12 @@ def restore_training_state(checkpoint, contract, optimizers, schedulers, backend
     for key, default_val in (
         ("oversized_behavior", "chunk"),
         ("overlap_turns", 1),
-        ("max_chunks_per_conversation", 4),
+        ("budget_strategy", "retention_ratio"),
+        ("retention_ratio", 0.25),
+        ("keep_all_threshold", 8),
+        ("min_chunks_per_conversation", 4),
+        ("max_chunks_per_conversation", 32),
+        ("sampling_strategy", "stratified"),
         ("min_assistant_tokens", 16),
         ("min_chunk_tokens", 128),
     ):
@@ -805,10 +822,40 @@ def parse_args(argv=None, *, distributed=False, description=None):
         help="Number of context turns to overlap between chunks (default: 1)",
     )
     parser.add_argument(
-        "--max-chunks-per-conversation",
+        "--budget-strategy",
+        choices=["retention_ratio", "fixed"],
+        default="retention_ratio",
+        help="Chunk budgeting strategy: retention_ratio or fixed (default: retention_ratio)",
+    )
+    parser.add_argument(
+        "--retention-ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of chunks to retain for oversized conversations (default: 0.25)",
+    )
+    parser.add_argument(
+        "--keep-all-threshold",
+        type=int,
+        default=8,
+        help="Maximum chunk count for which all chunks are retained (default: 8)",
+    )
+    parser.add_argument(
+        "--min-chunks-per-conversation",
         type=int,
         default=4,
-        help="Maximum chunks to retain per oversized conversation (default: 4)",
+        help="Minimum chunks retained when sub-sampling (default: 4)",
+    )
+    parser.add_argument(
+        "--max-chunks-per-conversation",
+        type=int,
+        default=32,
+        help="Maximum chunks to retain per oversized conversation (default: 32)",
+    )
+    parser.add_argument(
+        "--sampling-strategy",
+        choices=["stratified", "random"],
+        default="stratified",
+        help="Chunk sub-sampling strategy: stratified or random (default: stratified)",
     )
     parser.add_argument(
         "--min-assistant-tokens",
@@ -898,12 +945,16 @@ def parse_args(argv=None, *, distributed=False, description=None):
         "max_buffered_files",
         "shard_timeout",
         "max_grad_norm",
+        "keep_all_threshold",
+        "min_chunks_per_conversation",
         "max_chunks_per_conversation",
         "min_assistant_tokens",
         "min_chunk_tokens",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if not (0.0 < args.retention_ratio <= 1.0):
+        parser.error("--retention-ratio must be in (0.0, 1.0]")
     if args.overlap_turns < 0:
         parser.error("--overlap-turns must be non-negative")
     if args.seq_len is not None and args.seq_len < 1:

@@ -152,7 +152,12 @@ torchrun --standalone --nproc_per_node=2 post-training/sft_fsdp2_post_train.py \
 
 When `--oversized-behavior chunk` is enabled, additional options fine-tune chunk generation:
 * `--overlap-turns` (default: `1`): Number of interaction turns to overlap between consecutive chunks to preserve conversational context.
-* `--max-chunks-per-conversation` (default: `4`): Maximum number of chunks retained per oversized conversation, selected deterministically using `--seed`. Prevents single long conversations from dominating shard buffers or skewing topic mixture weights.
+* `--budget-strategy` (default: `retention_ratio`): Chunk budgeting strategy: `retention_ratio` (adaptive) or `fixed` (legacy).
+* `--retention-ratio` (default: `0.25`): Fraction of chunks retained for conversations exceeding `keep_all_threshold`.
+* `--keep-all-threshold` (default: `8`): Conversations yielding $\le$ this number of chunks retain 100% of their chunks without downsampling.
+* `--min-chunks-per-conversation` (default: `4`): Minimum chunks retained when downsampling.
+* `--max-chunks-per-conversation` (default: `32`): Upper bound cap on chunks retained per conversation to prevent massive outlier conversations from dominating shard buffers.
+* `--sampling-strategy` (default: `stratified`): Selection strategy when downsampling: `stratified` (divides the conversation into equal strata and samples representative chunks across beginning, middle, and end) or `random`.
 * `--min-assistant-tokens` (default: `16`): Minimum number of supervised assistant tokens required for a chunk to be kept; chunks without assistant supervision are dropped.
 * `--min-chunk-tokens` (default: `128`): Minimum total tokens required for a chunk; small final turns are expanded backwards into preceding context to avoid emitting micro-fragments.
 * Message-level splitting: If an individual assistant message exceeds `seq_len`, it is split across chunks with continuation headers (`assistant:\n`) while preserving prompt context and assistant loss supervision.
@@ -236,7 +241,12 @@ The scripts do not create a validation split automatically. Choose held-out sour
 | `--save-interval` / `--log-interval` | `100` / `10` | Checkpoint and training-log intervals. |
 | `--oversized-behavior` | `chunk` | Oversized conversation action: `chunk`, `filter`, `truncate`, or `error`. |
 | `--overlap-turns` | `1` | Interaction turns to overlap between consecutive chunks. |
-| `--max-chunks-per-conversation` | `4` | Maximum chunks kept per oversized conversation. |
+| `--budget-strategy` | `retention_ratio` | Chunk budgeting strategy: `retention_ratio` or `fixed`. |
+| `--retention-ratio` | `0.25` | Fraction of chunks retained for conversations exceeding `keep_all_threshold`. |
+| `--keep-all-threshold` | `8` | Maximum chunks for which all chunks are retained without downsampling. |
+| `--min-chunks-per-conversation` | `4` | Minimum chunks retained when downsampling. |
+| `--max-chunks-per-conversation` | `32` | Maximum chunks kept per oversized conversation. |
+| `--sampling-strategy` | `stratified` | Chunk downsampling strategy: `stratified` or `random`. |
 | `--min-assistant-tokens` | `16` | Minimum supervised assistant tokens required per chunk. |
 | `--min-chunk-tokens` | `128` | Minimum total tokens required per chunk. |
 | `--seed` | `42` | Training and source/sampler seed. |
