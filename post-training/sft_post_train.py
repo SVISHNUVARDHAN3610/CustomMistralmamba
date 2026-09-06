@@ -213,7 +213,16 @@ class ShardFeed:
                 oversized_behavior=getattr(args, "oversized_behavior", "chunk"),
                 overlap_turns=getattr(args, "overlap_turns", 1),
                 budget_strategy=getattr(args, "budget_strategy", "retention_ratio"),
-                retention_ratio=getattr(args, "retention_ratio", 0.25),
+                retention_ratio=getattr(
+                    args,
+                    "chunk_retention_ratio",
+                    getattr(args, "retention_ratio", 0.25),
+                ),
+                chunk_retention_ratio=getattr(
+                    args,
+                    "chunk_retention_ratio",
+                    getattr(args, "retention_ratio", 0.25),
+                ),
                 keep_all_threshold=getattr(args, "keep_all_threshold", 8),
                 min_chunks_per_conversation=getattr(
                     args, "min_chunks_per_conversation", 4
@@ -223,7 +232,7 @@ class ShardFeed:
                 ),
                 sampling_strategy=getattr(args, "sampling_strategy", "stratified"),
                 min_assistant_tokens=getattr(args, "min_assistant_tokens", 16),
-                min_chunk_tokens=getattr(args, "min_chunk_tokens", 128),
+                min_chunk_tokens=getattr(args, "min_chunk_tokens", 64),
             )
             state_path = self.producer.state_path
             if Path(state_path).exists():
@@ -316,13 +325,18 @@ def runtime_contract(args, cfg, sources, backend, use_muon, tokenizer):
         "oversized_behavior": getattr(args, "oversized_behavior", "chunk"),
         "overlap_turns": getattr(args, "overlap_turns", 1),
         "budget_strategy": getattr(args, "budget_strategy", "retention_ratio"),
-        "retention_ratio": getattr(args, "retention_ratio", 0.25),
+        "retention_ratio": getattr(
+            args, "chunk_retention_ratio", getattr(args, "retention_ratio", 0.25)
+        ),
+        "chunk_retention_ratio": getattr(
+            args, "chunk_retention_ratio", getattr(args, "retention_ratio", 0.25)
+        ),
         "keep_all_threshold": getattr(args, "keep_all_threshold", 8),
         "min_chunks_per_conversation": getattr(args, "min_chunks_per_conversation", 4),
         "max_chunks_per_conversation": getattr(args, "max_chunks_per_conversation", 32),
         "sampling_strategy": getattr(args, "sampling_strategy", "stratified"),
         "min_assistant_tokens": getattr(args, "min_assistant_tokens", 16),
-        "min_chunk_tokens": getattr(args, "min_chunk_tokens", 128),
+        "min_chunk_tokens": getattr(args, "min_chunk_tokens", 64),
     }
 
 
@@ -333,15 +347,35 @@ def restore_training_state(checkpoint, contract, optimizers, schedulers, backend
         ("overlap_turns", 1),
         ("budget_strategy", "retention_ratio"),
         ("retention_ratio", 0.25),
+        ("chunk_retention_ratio", 0.25),
         ("keep_all_threshold", 8),
         ("min_chunks_per_conversation", 4),
         ("max_chunks_per_conversation", 32),
         ("sampling_strategy", "stratified"),
         ("min_assistant_tokens", 16),
-        ("min_chunk_tokens", 128),
+        ("min_chunk_tokens", 64),
     ):
         if key not in saved_contract:
-            saved_contract[key] = contract.get(key, default_val)
+            if key == "chunk_retention_ratio":
+                saved_contract[key] = saved_contract.get(
+                    "retention_ratio", contract.get(key, default_val)
+                )
+            elif key == "retention_ratio":
+                saved_contract[key] = saved_contract.get(
+                    "chunk_retention_ratio", contract.get(key, default_val)
+                )
+            else:
+                saved_contract[key] = contract.get(key, default_val)
+    if (
+        "chunk_retention_ratio" in saved_contract
+        and "retention_ratio" not in saved_contract
+    ):
+        saved_contract["retention_ratio"] = saved_contract["chunk_retention_ratio"]
+    if (
+        "retention_ratio" in saved_contract
+        and "chunk_retention_ratio" not in saved_contract
+    ):
+        saved_contract["chunk_retention_ratio"] = saved_contract["retention_ratio"]
     if saved_contract != contract:
         raise ValueError(
             "SFT resume contract mismatch (model, data, optimizer, schedule or world size); use --pretrained-checkpoint for a fresh weights-only run"
@@ -828,7 +862,9 @@ def parse_args(argv=None, *, distributed=False, description=None):
         help="Chunk budgeting strategy: retention_ratio or fixed (default: retention_ratio)",
     )
     parser.add_argument(
+        "--chunk-retention-ratio",
         "--retention-ratio",
+        dest="chunk_retention_ratio",
         type=float,
         default=0.25,
         help="Fraction of chunks to retain for oversized conversations (default: 0.25)",
@@ -866,8 +902,8 @@ def parse_args(argv=None, *, distributed=False, description=None):
     parser.add_argument(
         "--min-chunk-tokens",
         type=int,
-        default=128,
-        help="Minimum total tokens required per chunk (default: 128)",
+        default=64,
+        help="Minimum total tokens required per chunk (default: 64)",
     )
     parser.add_argument("--offline-shards", action="store_true")
     parser.add_argument(
@@ -953,8 +989,9 @@ def parse_args(argv=None, *, distributed=False, description=None):
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
-    if not (0.0 < args.retention_ratio <= 1.0):
-        parser.error("--retention-ratio must be in (0.0, 1.0]")
+    args.retention_ratio = args.chunk_retention_ratio
+    if not (0.0 < args.chunk_retention_ratio <= 1.0):
+        parser.error("--chunk-retention-ratio must be in (0.0, 1.0]")
     if args.overlap_turns < 0:
         parser.error("--overlap-turns must be non-negative")
     if args.seq_len is not None and args.seq_len < 1:

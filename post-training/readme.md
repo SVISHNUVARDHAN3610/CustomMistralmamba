@@ -153,14 +153,15 @@ torchrun --standalone --nproc_per_node=2 post-training/sft_fsdp2_post_train.py \
 When `--oversized-behavior chunk` is enabled, additional options fine-tune chunk generation:
 * `--overlap-turns` (default: `1`): Number of interaction turns to overlap between consecutive chunks to preserve conversational context.
 * `--budget-strategy` (default: `retention_ratio`): Chunk budgeting strategy: `retention_ratio` (adaptive) or `fixed` (legacy).
-* `--retention-ratio` (default: `0.25`): Fraction of chunks retained for conversations exceeding `keep_all_threshold`.
+* `--chunk-retention-ratio` (alias `--retention-ratio`, default: `0.25`): Fraction of chunks retained for conversations exceeding `keep_all_threshold`.
 * `--keep-all-threshold` (default: `8`): Conversations yielding $\le$ this number of chunks retain 100% of their chunks without downsampling.
 * `--min-chunks-per-conversation` (default: `4`): Minimum chunks retained when downsampling.
 * `--max-chunks-per-conversation` (default: `32`): Upper bound cap on chunks retained per conversation to prevent massive outlier conversations from dominating shard buffers.
-* `--sampling-strategy` (default: `stratified`): Selection strategy when downsampling: `stratified` (divides the conversation into equal strata and samples representative chunks across beginning, middle, and end) or `random`.
+* `--sampling-strategy` (default: `stratified`): Selection strategy when downsampling: `stratified` (always preserves the first chunk `0` and final chunk `total_chunks - 1`, and stratifies remaining samples evenly across the interior) or `random`.
 * `--min-assistant-tokens` (default: `16`): Minimum number of supervised assistant tokens required for a chunk to be kept; chunks without assistant supervision are dropped.
-* `--min-chunk-tokens` (default: `128`): Minimum total tokens required for a chunk; small final turns are expanded backwards into preceding context to avoid emitting micro-fragments.
+* `--min-chunk-tokens` (default: `64`): Minimum total tokens required for a chunk; small final turns are expanded backwards into preceding context to avoid emitting micro-fragments.
 * Message-level splitting: If an individual assistant message exceeds `seq_len`, it is split across chunks with continuation headers (`assistant:\n`) while preserving prompt context and assistant loss supervision.
+* Accurate token accounting: Shard statistics and conversation logs separate unique source tokens retained from emitted training tokens, correctly reporting duplicate overlap tokens and preventing artificial zeroing of dropped tokens.
 
 For example, this is a **replacement general-instruction mix**, not the eight-topic default:
 

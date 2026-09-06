@@ -387,6 +387,25 @@ def tokenize_messages(tokenizer, messages: list[dict]) -> tuple[list[int], list[
     return ids, mask
 
 
+def _compute_message_spans(tokenizer, messages: list[dict]) -> list[tuple[int, int]]:
+    """Compute (start_token_idx, end_token_idx) in tokenize_messages output for each message."""
+    spans = []
+    curr = 1 if tokenizer.bos_token_id is not None else 0
+    for index, msg in enumerate(messages):
+        header = ("\n" if index else "") + msg["role"] + ":\n"
+        header_ids = tokenizer.encode(header, add_special_tokens=False)
+        body_ids = tokenizer.encode(msg["content"], add_special_tokens=False)
+        assistant = msg["role"] == "assistant"
+        length = (
+            len(header_ids)
+            + len(body_ids)
+            + (1 if (assistant and tokenizer.eos_token_id is not None) else 0)
+        )
+        spans.append((curr, curr + length))
+        curr += length
+    return spans
+
+
 def _default_stats() -> dict[str, int]:
     return {
         "conversations_seen": 0,
@@ -401,6 +420,9 @@ def _default_stats() -> dict[str, int]:
         "chunks_dropped": 0,
         "tokens_seen": 0,
         "tokens_retained": 0,
+        "unique_source_tokens_retained": 0,
+        "training_tokens_emitted": 0,
+        "overlap_tokens": 0,
         "tokens_dropped": 0,
         "assistant_tokens_retained": 0,
     }
@@ -415,9 +437,13 @@ def format_stats_summary(stats: dict[str, int]) -> str:
         return str(num)
 
     seen = stats.get("tokens_seen", 0)
-    retained = stats.get("tokens_retained", 0)
-    dropped = max(0, seen - retained)
-    rate = (retained / max(seen, 1)) * 100.0
+    unique_retained = stats.get(
+        "unique_source_tokens_retained", stats.get("tokens_retained", 0)
+    )
+    emitted = stats.get("training_tokens_emitted", unique_retained)
+    overlap = stats.get("overlap_tokens", max(0, emitted - unique_retained))
+    dropped = stats.get("tokens_dropped", max(0, seen - unique_retained))
+    rate = (unique_retained / max(seen, 1)) * 100.0
     chunked = stats.get("conversations_chunked", 0)
     keep_all = stats.get("conversations_keep_all", 0)
     sampled = stats.get("conversations_sampled", 0)
@@ -432,11 +458,16 @@ def format_stats_summary(stats: dict[str, int]) -> str:
         f"  - Sampled:              {sampled}\n"
         f"  - Hit max cap:          {hit_max}\n"
         f"Filtered:                 {stats.get('conversations_filtered', 0)}\n"
+        f"Chunks created:           {stats.get('chunks_created', 0)}\n"
         f"Chunks emitted:           {stats.get('chunks_emitted', 0)}\n"
-        f"Tokens retained:        {_format_count(retained)}\n"
-        f"Tokens dropped:         {_format_count(dropped)}\n"
+        f"Chunks dropped:           {stats.get('chunks_dropped', 0)}\n"
+        f"Original source tokens:   {_format_count(seen)}\n"
+        f"Unique source tokens kept: {_format_count(unique_retained)}\n"
+        f"Training tokens emitted:  {_format_count(emitted)}\n"
+        f"Overlap tokens:           {_format_count(overlap)}\n"
+        f"Tokens dropped:           {_format_count(dropped)}\n"
         f"Retention rate:            {rate:.1f}%\n"
-        f"Assistant tokens:       {_format_count(stats.get('assistant_tokens_retained', 0))}"
+        f"Assistant tokens:         {_format_count(stats.get('assistant_tokens_retained', 0))}"
     )
 
 
@@ -460,12 +491,13 @@ class TokenizedShardProducer:
         overlap_turns: int = 1,
         budget_strategy: str = "retention_ratio",
         retention_ratio: float = 0.25,
+        chunk_retention_ratio: float | None = None,
         keep_all_threshold: int = 8,
         min_chunks_per_conversation: int = 4,
         max_chunks_per_conversation: int = 32,
         sampling_strategy: str = "stratified",
         min_assistant_tokens: int = 16,
-        min_chunk_tokens: int = 128,
+        min_chunk_tokens: int = 64,
     ):
         if seq_len < 2 or max_buffered_files < 1:
             raise ValueError("seq_len must be >=2 and max_buffered_files >=1")
@@ -481,8 +513,15 @@ class TokenizedShardProducer:
             raise ValueError(
                 f"Invalid sampling_strategy {sampling_strategy!r}; expected 'stratified' or 'random'"
             )
-        if not (0.0 < retention_ratio <= 1.0):
-            raise ValueError("retention_ratio must be in (0.0, 1.0]")
+        effective_retention = (
+            chunk_retention_ratio
+            if chunk_retention_ratio is not None
+            else retention_ratio
+        )
+        if not (0.0 < effective_retention <= 1.0):
+            raise ValueError(
+                "retention_ratio/chunk_retention_ratio must be in (0.0, 1.0]"
+            )
         if keep_all_threshold < 1:
             raise ValueError("keep_all_threshold must be >=1")
         if min_chunks_per_conversation < 1:
@@ -499,7 +538,8 @@ class TokenizedShardProducer:
         self.oversized_behavior = oversized_behavior
         self.overlap_turns = overlap_turns
         self.budget_strategy = budget_strategy
-        self.retention_ratio = retention_ratio
+        self.retention_ratio = effective_retention
+        self.chunk_retention_ratio = effective_retention
         self.keep_all_threshold = keep_all_threshold
         self.min_chunks_per_conversation = min_chunks_per_conversation
         self.max_chunks_per_conversation = max_chunks_per_conversation
@@ -576,6 +616,7 @@ class TokenizedShardProducer:
             "overlap_turns": self.overlap_turns,
             "budget_strategy": self.budget_strategy,
             "retention_ratio": self.retention_ratio,
+            "chunk_retention_ratio": self.chunk_retention_ratio,
             "keep_all_threshold": self.keep_all_threshold,
             "min_chunks_per_conversation": self.min_chunks_per_conversation,
             "max_chunks_per_conversation": self.max_chunks_per_conversation,
@@ -613,6 +654,7 @@ class TokenizedShardProducer:
                 "overlap_turns",
                 "budget_strategy",
                 "retention_ratio",
+                "chunk_retention_ratio",
                 "keep_all_threshold",
                 "min_chunks_per_conversation",
                 "max_chunks_per_conversation",
@@ -621,7 +663,16 @@ class TokenizedShardProducer:
                 "min_chunk_tokens",
             ):
                 if key not in loaded_settings:
-                    loaded_settings[key] = current_settings[key]
+                    if key == "chunk_retention_ratio":
+                        loaded_settings[key] = loaded_settings.get(
+                            "retention_ratio", current_settings[key]
+                        )
+                    elif key == "retention_ratio":
+                        loaded_settings[key] = loaded_settings.get(
+                            "chunk_retention_ratio", current_settings[key]
+                        )
+                    else:
+                        loaded_settings[key] = current_settings[key]
             if loaded_settings != current_settings:
                 raise ValueError("SFT checkpoint settings/tokenizer/mix do not match")
             tokens = np.frombuffer(
@@ -637,6 +688,20 @@ class TokenizedShardProducer:
             self.skipped_oversized_samples = state.get("skipped_oversized_samples", 0)
             loaded_stats = _default_stats()
             loaded_stats.update(state.get("stats", {}))
+            if "unique_source_tokens_retained" not in state.get("stats", {}):
+                loaded_stats["unique_source_tokens_retained"] = loaded_stats.get(
+                    "tokens_retained", 0
+                )
+            if "training_tokens_emitted" not in state.get("stats", {}):
+                loaded_stats["training_tokens_emitted"] = loaded_stats.get(
+                    "tokens_retained", 0
+                )
+            if "overlap_tokens" not in state.get("stats", {}):
+                loaded_stats["overlap_tokens"] = max(
+                    0,
+                    loaded_stats["training_tokens_emitted"]
+                    - loaded_stats["unique_source_tokens_retained"],
+                )
             self.stats = loaded_stats
             self.finished = state["finished"]
         self.log(
@@ -699,19 +764,31 @@ class TokenizedShardProducer:
         self,
         system_msg: dict | None,
         turn_msgs: list[dict],
-    ) -> list[tuple[list[int], list[int]]]:
+        spans: list[tuple[int, int]] | None = None,
+        system_idx: int | None = None,
+        turn_idxs: list[int] | None = None,
+    ) -> list[tuple[list[int], list[int], set[int]]]:
         """Dedicated split path for turns where an individual message exceeds seq_len.
 
         Preserves as much complete context as possible, splits the oversized
         message at token boundaries, preserves the assistant loss mask, and
         guarantees that all generated chunks remain valid training examples.
         """
-        chunks: list[tuple[list[int], list[int]]] = []
+        chunks: list[tuple[list[int], list[int], set[int]]] = []
         if not turn_msgs:
             return chunks
 
         assistant_msg = turn_msgs[-1]
         prefix_msgs = ([system_msg] if system_msg else []) + turn_msgs[:-1]
+        prefix_indices = (
+            [system_idx] if system_msg is not None and system_idx is not None else []
+        ) + (turn_idxs[:-1] if turn_idxs else [])
+        ast_idx = turn_idxs[-1] if turn_idxs else None
+        ast_span = (
+            spans[ast_idx]
+            if (spans is not None and ast_idx is not None and ast_idx < len(spans))
+            else None
+        )
 
         # Tokenize prompt context (system + user + tools)
         if prefix_msgs:
@@ -769,13 +846,30 @@ class TokenizedShardProducer:
         c1_ids = prefix_ids + ast_header_ids + slice_1
         c1_mask = prefix_mask + [0] * len(ast_header_ids) + [1] * len(slice_1)
         self._validate_tokens(c1_ids)
+
+        c1_cov: set[int] = set()
+        if spans is not None:
+            if self.tokenizer.bos_token_id is not None:
+                c1_cov.add(0)
+            if prefix_indices:
+                for p_idx in prefix_indices:
+                    if p_idx < len(spans):
+                        c1_cov.update(range(spans[p_idx][0], spans[p_idx][1]))
+            if ast_span:
+                ast_start, ast_end = ast_span
+                h_len = len(ast_header_ids)
+                c1_cov.update(
+                    range(ast_start, min(ast_end, ast_start + h_len + len(slice_1)))
+                )
+
         if sum(c1_mask) >= self.min_assistant_tokens:
-            chunks.append((c1_ids, c1_mask))
+            chunks.append((c1_ids, c1_mask, c1_cov))
 
         # Subsequent chunks for remaining assistant body tokens
         cont_header = "assistant:\n"
         cont_header_ids = self.tokenizer.encode(cont_header, add_special_tokens=False)
         room_cont = self.seq_len - len(cont_header_ids)
+        ast_body_offset = len(slice_1)
 
         while rem_tokens:
             slice_k = rem_tokens[:room_cont]
@@ -783,8 +877,21 @@ class TokenizedShardProducer:
             ck_ids = cont_header_ids + slice_k
             ck_mask = [0] * len(cont_header_ids) + [1] * len(slice_k)
             self._validate_tokens(ck_ids)
+
+            ck_cov: set[int] = set()
+            if spans is not None:
+                if self.tokenizer.bos_token_id is not None:
+                    ck_cov.add(0)
+                if ast_span:
+                    ast_start, ast_end = ast_span
+                    h_len = len(ast_header_ids)
+                    cov_start = ast_start + h_len + ast_body_offset
+                    cov_end = min(ast_end, cov_start + len(slice_k))
+                    ck_cov.update(range(cov_start, cov_end))
+
+            ast_body_offset += len(slice_k)
             if sum(ck_mask) >= self.min_assistant_tokens:
-                chunks.append((ck_ids, ck_mask))
+                chunks.append((ck_ids, ck_mask, ck_cov))
 
         return chunks
 
@@ -793,34 +900,73 @@ class TokenizedShardProducer:
         messages: list[dict],
         original_ids: list[int] | None = None,
         original_mask: list[int] | None = None,
-    ) -> list[tuple[list[int], list[int]]]:
+        *,
+        return_coverage: bool = False,
+    ):
         """Boundary-aware chunking: splits conversations at message/turn boundaries."""
         if not messages:
-            return []
+            return ([], []) if return_coverage else []
 
         if messages[0].get("role") in {"system", "developer"}:
             system_msg = messages[0]
             chat_messages = messages[1:]
+            system_msg_idx = 0
+            chat_start_idx = 1
         else:
             system_msg = None
             chat_messages = messages
+            system_msg_idx = None
+            chat_start_idx = 0
 
         # Group chat_messages into turns ending with an assistant message
         turns: list[list[dict]] = []
+        turn_msg_indices: list[list[int]] = []
         current_turn: list[dict] = []
-        for msg in chat_messages:
+        current_indices: list[int] = []
+        for i, msg in enumerate(chat_messages):
+            orig_idx = chat_start_idx + i
             current_turn.append(msg)
+            current_indices.append(orig_idx)
             if msg.get("role") == "assistant":
                 turns.append(current_turn)
+                turn_msg_indices.append(current_indices)
                 current_turn = []
+                current_indices = []
         if current_turn:
             if turns:
                 turns[-1].extend(current_turn)
+                turn_msg_indices[-1].extend(current_indices)
             else:
                 turns.append(current_turn)
+                turn_msg_indices.append(current_indices)
 
         if not turns:
-            return []
+            return ([], []) if return_coverage else []
+
+        spans = (
+            _compute_message_spans(self.tokenizer, messages)
+            if (original_ids is not None or return_coverage)
+            else None
+        )
+
+        def _get_coverage_for_slice(sys_m, start_t, end_t) -> set[int]:
+            if spans is None:
+                return set()
+            cov: set[int] = set()
+            if self.tokenizer.bos_token_id is not None:
+                cov.add(0)
+            if (
+                sys_m is not None
+                and system_msg_idx is not None
+                and system_msg_idx < len(spans)
+            ):
+                cov.update(range(spans[system_msg_idx][0], spans[system_msg_idx][1]))
+            for t in range(start_t, end_t + 1):
+                if t < len(turn_msg_indices):
+                    for m_idx in turn_msg_indices[t]:
+                        if m_idx < len(spans):
+                            cov.update(range(spans[m_idx][0], spans[m_idx][1]))
+            return cov
 
         # Check if system message fits within window budget
         system_msg_to_use = system_msg
@@ -835,21 +981,27 @@ class TokenizedShardProducer:
             )
             return tokenize_messages(self.tokenizer, msgs)
 
-        raw_chunks: list[tuple[list[int], list[int]]] = []
+        raw_chunks: list[tuple[list[int], list[int], set[int]]] = []
         turn_start = 0
 
         while turn_start < len(turns):
             # Check if turn_start itself exceeds seq_len
             test_ids, _ = _tokenize_turn_slice(system_msg_to_use, [turns[turn_start]])
             sys_for_turn = system_msg_to_use
+            sys_idx_for_turn = system_msg_idx if sys_for_turn is not None else None
             if len(test_ids) > self.seq_len and system_msg_to_use is not None:
                 test_ids, _ = _tokenize_turn_slice(None, [turns[turn_start]])
                 sys_for_turn = None
+                sys_idx_for_turn = None
 
             if len(test_ids) > self.seq_len:
                 # Single turn is oversized -> use dedicated message split
                 split_chunks = self._split_oversized_message(
-                    sys_for_turn, turns[turn_start]
+                    sys_for_turn,
+                    turns[turn_start],
+                    spans=spans,
+                    system_idx=sys_idx_for_turn,
+                    turn_idxs=turn_msg_indices[turn_start],
                 )
                 raw_chunks.extend(split_chunks)
                 turn_start += 1
@@ -871,6 +1023,7 @@ class TokenizedShardProducer:
                 else:
                     break
 
+            active_start = turn_start
             # Handle small final chunk by expanding backward if possible
             if (
                 turn_end == len(turns) - 1
@@ -887,8 +1040,10 @@ class TokenizedShardProducer:
                         best_ids, best_mask = cand_ids, cand_mask
                     else:
                         break
+                active_start = expand_start
 
-            raw_chunks.append((best_ids, best_mask))
+            cov = _get_coverage_for_slice(sys_for_turn, active_start, turn_end)
+            raw_chunks.append((best_ids, best_mask, cov))
 
             if turn_end >= len(turns) - 1:
                 break
@@ -900,7 +1055,7 @@ class TokenizedShardProducer:
             turn_start = next_start
 
         # Validate and filter chunks: require min_assistant_tokens
-        valid_chunks: list[tuple[list[int], list[int]]] = []
+        valid_chunks: list[tuple[list[int], list[int], set[int]]] = []
         eff_min_chunk = (
             min(self.min_chunk_tokens, max(1, self.seq_len // 2))
             if self.min_chunk_tokens >= self.seq_len
@@ -911,7 +1066,7 @@ class TokenizedShardProducer:
             if self.min_assistant_tokens >= self.seq_len
             else self.min_assistant_tokens
         )
-        for c_ids, c_mask in raw_chunks:
+        for c_ids, c_mask, c_cov in raw_chunks:
             if len(c_ids) > self.seq_len:
                 continue
             if sum(c_mask) < eff_min_asst:
@@ -920,9 +1075,14 @@ class TokenizedShardProducer:
             if len(c_ids) < eff_min_chunk and len(raw_chunks) > 1:
                 self.stats["chunks_dropped"] += 1
                 continue
-            valid_chunks.append((c_ids, c_mask))
+            valid_chunks.append((c_ids, c_mask, c_cov))
 
-        return valid_chunks
+        if return_coverage:
+            return (
+                [(c[0], c[1]) for c in valid_chunks],
+                [c[2] for c in valid_chunks],
+            )
+        return [(c[0], c[1]) for c in valid_chunks]
 
     def _calculate_chunk_budget(self, total_chunks: int) -> int:
         if self.budget_strategy == "fixed":
@@ -944,12 +1104,21 @@ class TokenizedShardProducer:
             return list(range(total_chunks))
         if target_chunks <= 0:
             return []
-        indices: list[int] = []
-        for i in range(target_chunks):
-            start = i * total_chunks // target_chunks
-            end = (i + 1) * total_chunks // target_chunks
-            indices.append(int(self.rng.randint(start, end)))
-        return indices
+        if target_chunks == 1:
+            return [0]
+        if target_chunks == 2:
+            return [0, total_chunks - 1]
+
+        # Explicitly protect beginning (0) and end (total_chunks - 1)
+        # and stratify remaining (target_chunks - 2) samples across the interior [1, total_chunks - 1)
+        k = target_chunks - 2
+        interior_total = total_chunks - 2
+        interior_indices: list[int] = []
+        for i in range(k):
+            start = 1 + (i * interior_total // k)
+            end = 1 + ((i + 1) * interior_total // k)
+            interior_indices.append(int(self.rng.randint(start, end)))
+        return [0] + interior_indices + [total_chunks - 1]
 
     def _append_conversation(self, messages):
         ids, mask = tokenize_messages(self.tokenizer, messages)
@@ -964,6 +1133,7 @@ class TokenizedShardProducer:
                     "Increase seq_len within the model's supported context; no silent truncation is applied."
                 )
             elif self.oversized_behavior == "truncate":
+                orig_len = len(ids)
                 ids = ids[: self.seq_len]
                 mask = mask[: self.seq_len]
                 if not any(mask[1:]):
@@ -971,7 +1141,7 @@ class TokenizedShardProducer:
                         self.cumulative_samples += 1
                         self.skipped_oversized_samples += 1
                         self.stats["conversations_filtered"] += 1
-                        self.stats["tokens_dropped"] += len(ids)
+                        self.stats["tokens_dropped"] += orig_len
                     return
                 with self._lock:
                     used = len(self.token_buffer) % self.seq_len
@@ -982,7 +1152,10 @@ class TokenizedShardProducer:
                     self.cumulative_samples += 1
                 self.stats["conversations_kept_whole"] += 1
                 self.stats["chunks_emitted"] += 1
+                self.stats["unique_source_tokens_retained"] += len(ids)
                 self.stats["tokens_retained"] += len(ids)
+                self.stats["training_tokens_emitted"] += len(ids)
+                self.stats["tokens_dropped"] += max(0, orig_len - len(ids))
                 self.stats["assistant_tokens_retained"] += sum(mask)
                 return
             elif self.oversized_behavior == "filter":
@@ -1004,8 +1177,8 @@ class TokenizedShardProducer:
                 self.stats["conversations_chunked"] += 1
                 # Chunk generation preserves dataset/topic mixture weighting because sampling
                 # occurs at the conversation level in _build_stream() before chunking.
-                chunks = self._chunk_conversation(
-                    messages, original_ids=ids, original_mask=mask
+                chunks, coverages = self._chunk_conversation(
+                    messages, original_ids=ids, original_mask=mask, return_coverage=True
                 )
                 chunks_created = len(chunks)
                 self.stats["chunks_created"] += chunks_created
@@ -1058,6 +1231,7 @@ class TokenizedShardProducer:
                     dropped_count = chunks_created - len(selected_indices)
                     self.stats["chunks_dropped"] += dropped_count
                     chunks = [chunks[i] for i in selected_indices]
+                    coverages = [coverages[i] for i in selected_indices]
                 else:
                     self.stats["conversations_keep_all"] += 1
 
@@ -1070,15 +1244,29 @@ class TokenizedShardProducer:
                         self.loss_mask_buffer.extend(c_mask)
                     self.cumulative_samples += 1
 
-                tokens_retained_conv = sum(len(c_ids) for c_ids, _ in chunks)
+                covered_indices: set[int] = set()
+                for cov in coverages:
+                    covered_indices.update(cov)
+                unique_source_tokens_conv = len(covered_indices)
+                training_tokens_emitted_conv = sum(len(c_ids) for c_ids, _ in chunks)
+                overlap_tokens_conv = max(
+                    0, training_tokens_emitted_conv - unique_source_tokens_conv
+                )
+                tokens_dropped_conv = max(0, len(ids) - unique_source_tokens_conv)
                 asst_retained_conv = sum(sum(c_mask) for _, c_mask in chunks)
-                tokens_dropped_conv = max(0, len(ids) - tokens_retained_conv)
+
                 self.stats["chunks_emitted"] += len(chunks)
-                self.stats["tokens_retained"] += tokens_retained_conv
+                self.stats["unique_source_tokens_retained"] += unique_source_tokens_conv
+                self.stats["tokens_retained"] += unique_source_tokens_conv
+                self.stats["training_tokens_emitted"] += training_tokens_emitted_conv
+                self.stats["overlap_tokens"] += overlap_tokens_conv
                 self.stats["tokens_dropped"] += tokens_dropped_conv
                 self.stats["assistant_tokens_retained"] += asst_retained_conv
 
-                retention_pct = (len(chunks) / max(chunks_created, 1)) * 100.0
+                chunk_retention_pct = (len(chunks) / max(chunks_created, 1)) * 100.0
+                token_retention_pct = (
+                    unique_source_tokens_conv / max(len(ids), 1)
+                ) * 100.0
                 self.log(
                     f"[SFT Producer] Chunked conversation:\n"
                     f"  original_tokens={len(ids)}\n"
@@ -1086,10 +1274,13 @@ class TokenizedShardProducer:
                     f"  budget_strategy={self.budget_strategy}\n"
                     f"  target_chunks={len(chunks)}\n"
                     f"  chunks_emitted={len(chunks)}\n"
-                    f"  retention_ratio={retention_pct:.1f}%\n"
+                    f"  chunk_retention_ratio={chunk_retention_pct:.1f}%\n"
                     f"  sampling_strategy={self.sampling_strategy}\n"
-                    f"  tokens_retained={tokens_retained_conv}\n"
+                    f"  unique_source_tokens_retained={unique_source_tokens_conv}\n"
+                    f"  training_tokens_emitted={training_tokens_emitted_conv}\n"
+                    f"  overlap_tokens={overlap_tokens_conv}\n"
                     f"  tokens_dropped={tokens_dropped_conv}\n"
+                    f"  token_retention_rate={token_retention_pct:.1f}%\n"
                     f"  assistant_tokens_retained={asst_retained_conv}"
                 )
                 return
@@ -1118,7 +1309,9 @@ class TokenizedShardProducer:
 
         self.stats["conversations_kept_whole"] += 1
         self.stats["chunks_emitted"] += 1
+        self.stats["unique_source_tokens_retained"] += len(ids)
         self.stats["tokens_retained"] += len(ids)
+        self.stats["training_tokens_emitted"] += len(ids)
         self.stats["assistant_tokens_retained"] += sum(mask)
 
     def _write_shard(self, count):

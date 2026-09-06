@@ -378,6 +378,96 @@ class TestSFTTraining(unittest.TestCase):
             self.assertEqual(backend.build_optimizers("model", "args"), "result")
             build.assert_called_once_with("model", args="args", logger=self.logger)
 
+    def test_chunk_retention_ratio_cli_and_alias(self):
+        args1 = sft.parse_args(
+            [
+                "--pretrained-checkpoint",
+                "fake_ckpt.pt",
+                "--cache-dir",
+                "cache",
+                "--run-dir",
+                "run",
+                "--chunk-retention-ratio",
+                "0.40",
+            ]
+        )
+        self.assertEqual(args1.chunk_retention_ratio, 0.40)
+        self.assertEqual(args1.retention_ratio, 0.40)
+        self.assertEqual(args1.min_chunk_tokens, 64)
+
+        args2 = sft.parse_args(
+            [
+                "--pretrained-checkpoint",
+                "fake_ckpt.pt",
+                "--cache-dir",
+                "cache",
+                "--run-dir",
+                "run",
+                "--retention-ratio",
+                "0.40",
+            ]
+        )
+        self.assertEqual(args2.chunk_retention_ratio, 0.40)
+        self.assertEqual(args2.retention_ratio, 0.40)
+
+    def test_restore_training_state_retention_ratio_alias_compatibility(self):
+        contract = {
+            "model_architecture": "test",
+            "model_config": {},
+            "seq_len": 128,
+            "max_steps": 10,
+            "batch_size": 1,
+            "grad_accum_steps": 1,
+            "effective_batch_tokens": 128,
+            "optimizer": "adamw",
+            "world_size": 1,
+            "lr": 1e-4,
+            "min_lr": 1e-5,
+            "weight_decay": 0.01,
+            "warmup_steps": 1,
+            "lr_schedule": "cosine",
+            "seed": 0,
+            "amp": True,
+            "tokenizer": "test",
+            "vocab_hash": "hash",
+            "sources": [],
+            "tokens_per_shard": None,
+            "cache_dir": "cache",
+            "oversized_behavior": "chunk",
+            "overlap_turns": 1,
+            "budget_strategy": "retention_ratio",
+            "chunk_retention_ratio": 0.25,
+            "retention_ratio": 0.25,
+            "keep_all_threshold": 8,
+            "min_chunks_per_conversation": 4,
+            "max_chunks_per_conversation": 32,
+            "sampling_strategy": "stratified",
+            "min_assistant_tokens": 16,
+            "min_chunk_tokens": 64,
+        }
+        # Checkpoint saved with legacy 'retention_ratio' only
+        legacy_contract = dict(contract)
+        del legacy_contract["chunk_retention_ratio"]
+
+        ckpt = {
+            "sft_runtime": legacy_contract,
+            "optimizers": [],
+            "schedulers": [],
+            "rng_state": None,
+            "global_step": 0,
+            "current_shard_idx": 0,
+            "current_batch_idx": 0,
+        }
+        backend = SimpleNamespace(
+            restore_optimizer=lambda o, s: None,
+            restore_rng=lambda r: None,
+        )
+        # Should succeed without ValueError
+        step, _shard, _batch = sft.restore_training_state(
+            ckpt, contract, [], [], backend
+        )
+        self.assertEqual(step, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

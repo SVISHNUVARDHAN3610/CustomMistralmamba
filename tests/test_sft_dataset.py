@@ -773,17 +773,90 @@ class TestSFTConversationChunking(unittest.TestCase):
             target_chunks = 8
             indices = producer._stratified_sample_indices(total_chunks, target_chunks)
             self.assertEqual(len(indices), target_chunks)
-            self.assertLess(indices[0], 12)
-            self.assertGreaterEqual(indices[0], 0)
-            self.assertGreaterEqual(indices[-1], 87)
-            self.assertLess(indices[-1], 100)
-            for i in range(target_chunks):
-                start = i * total_chunks // target_chunks
-                end = (i + 1) * total_chunks // target_chunks
+            # Explicitly protect beginning (0) and end (total_chunks - 1)
+            self.assertEqual(indices[0], 0)
+            self.assertEqual(indices[-1], total_chunks - 1)
+            k = target_chunks - 2
+            interior_total = total_chunks - 2
+            for i in range(k):
+                start = 1 + (i * interior_total // k)
+                end = 1 + ((i + 1) * interior_total // k)
                 self.assertTrue(
-                    start <= indices[i] < end,
-                    f"Index {indices[i]} not in stratum [{start}, {end})",
+                    start <= indices[1 + i] < end,
+                    f"Interior index {indices[1 + i]} not in stratum [{start}, {end})",
                 )
+
+    def test_token_retention_statistics_with_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(
+                directory,
+                seq_len=200,
+                overlap_turns=1,
+                min_chunk_tokens=30,
+            )
+            messages = [
+                {"role": "system", "content": "You are a helpful AI assistant."},
+                {"role": "user", "content": "Question 1: " + "q" * 40},
+                {"role": "assistant", "content": "Answer 1: " + "a" * 40},
+                {"role": "user", "content": "Question 2: " + "q" * 40},
+                {"role": "assistant", "content": "Answer 2: " + "a" * 40},
+                {"role": "user", "content": "Question 3: " + "q" * 40},
+                {"role": "assistant", "content": "Answer 3: " + "a" * 40},
+            ]
+            ids, _ = tokenize_messages(TinyTokenizer(), messages)
+            orig_len = len(ids)
+            self.assertGreater(orig_len, 200)
+
+            producer._append_conversation(messages)
+            stats = producer.stats
+
+            self.assertEqual(stats["conversations_chunked"], 1)
+            self.assertGreater(stats["chunks_emitted"], 1)
+            self.assertEqual(stats["tokens_seen"], orig_len)
+
+            # Training tokens emitted must exceed unique source tokens due to overlap
+            self.assertGreater(
+                stats["training_tokens_emitted"],
+                stats["unique_source_tokens_retained"],
+            )
+            self.assertEqual(
+                stats["overlap_tokens"],
+                stats["training_tokens_emitted"]
+                - stats["unique_source_tokens_retained"],
+            )
+            # Tokens dropped must equal tokens_seen minus unique_source_tokens_retained
+            self.assertEqual(
+                stats["tokens_dropped"],
+                stats["tokens_seen"] - stats["unique_source_tokens_retained"],
+            )
+            # Unique source tokens retained cannot exceed tokens seen
+            self.assertLessEqual(stats["unique_source_tokens_retained"], orig_len)
+
+            summary = producer.get_stats_summary()
+            self.assertIn("Original source tokens:", summary)
+            self.assertIn("Unique source tokens kept:", summary)
+            self.assertIn("Training tokens emitted:", summary)
+            self.assertIn("Overlap tokens:", summary)
+            self.assertIn("Tokens dropped:", summary)
+            self.assertIn("Retention rate:", summary)
+
+    def test_chunk_retention_ratio_parameter_and_alias(self):
+        with (
+            tempfile.TemporaryDirectory() as dir1,
+            tempfile.TemporaryDirectory() as dir2,
+        ):
+            p1 = self.producer(dir1, chunk_retention_ratio=0.35)
+            self.assertEqual(p1.chunk_retention_ratio, 0.35)
+            self.assertEqual(p1.retention_ratio, 0.35)
+
+            p2 = self.producer(dir2, retention_ratio=0.35)
+            self.assertEqual(p2.chunk_retention_ratio, 0.35)
+            self.assertEqual(p2.retention_ratio, 0.35)
+
+    def test_min_chunk_tokens_default_is_64(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(directory)
+            self.assertEqual(producer.min_chunk_tokens, 64)
 
     def test_stratified_selection_strictly_sorted_and_unique(self):
         with tempfile.TemporaryDirectory() as directory:
