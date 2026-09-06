@@ -210,7 +210,13 @@ class ShardFeed:
                 dataset_configs=sources,
                 expected_vocab_size=cfg.vocab_size,
                 log_fn=logger.info,
-                oversized_behavior=getattr(args, "oversized_behavior", "filter"),
+                oversized_behavior=getattr(args, "oversized_behavior", "chunk"),
+                overlap_turns=getattr(args, "overlap_turns", 1),
+                max_chunks_per_conversation=getattr(
+                    args, "max_chunks_per_conversation", 4
+                ),
+                min_assistant_tokens=getattr(args, "min_assistant_tokens", 16),
+                min_chunk_tokens=getattr(args, "min_chunk_tokens", 128),
             )
             state_path = self.producer.state_path
             if Path(state_path).exists():
@@ -300,16 +306,25 @@ def runtime_contract(args, cfg, sources, backend, use_muon, tokenizer):
         "sources": sources,
         "tokens_per_shard": args.tokens_per_shard,
         "cache_dir": str(Path(args.cache_dir).resolve()),
-        "oversized_behavior": getattr(args, "oversized_behavior", "filter"),
+        "oversized_behavior": getattr(args, "oversized_behavior", "chunk"),
+        "overlap_turns": getattr(args, "overlap_turns", 1),
+        "max_chunks_per_conversation": getattr(args, "max_chunks_per_conversation", 4),
+        "min_assistant_tokens": getattr(args, "min_assistant_tokens", 16),
+        "min_chunk_tokens": getattr(args, "min_chunk_tokens", 128),
     }
 
 
 def restore_training_state(checkpoint, contract, optimizers, schedulers, backend):
     saved_contract = dict(checkpoint.get("sft_runtime", {}))
-    if "oversized_behavior" not in saved_contract:
-        saved_contract["oversized_behavior"] = contract.get(
-            "oversized_behavior", "filter"
-        )
+    for key, default_val in (
+        ("oversized_behavior", "chunk"),
+        ("overlap_turns", 1),
+        ("max_chunks_per_conversation", 4),
+        ("min_assistant_tokens", 16),
+        ("min_chunk_tokens", 128),
+    ):
+        if key not in saved_contract:
+            saved_contract[key] = contract.get(key, default_val)
     if saved_contract != contract:
         raise ValueError(
             "SFT resume contract mismatch (model, data, optimizer, schedule or world size); use --pretrained-checkpoint for a fresh weights-only run"
@@ -779,9 +794,33 @@ def parse_args(argv=None, *, distributed=False, description=None):
     )
     parser.add_argument(
         "--oversized-behavior",
-        choices=["filter", "truncate", "error"],
-        default="filter",
-        help="Action when conversation tokens exceed seq_len (default: filter)",
+        choices=["chunk", "filter", "truncate", "error"],
+        default="chunk",
+        help="Action when conversation tokens exceed seq_len (default: chunk)",
+    )
+    parser.add_argument(
+        "--overlap-turns",
+        type=int,
+        default=1,
+        help="Number of context turns to overlap between chunks (default: 1)",
+    )
+    parser.add_argument(
+        "--max-chunks-per-conversation",
+        type=int,
+        default=4,
+        help="Maximum chunks to retain per oversized conversation (default: 4)",
+    )
+    parser.add_argument(
+        "--min-assistant-tokens",
+        type=int,
+        default=16,
+        help="Minimum supervised assistant tokens required per chunk (default: 16)",
+    )
+    parser.add_argument(
+        "--min-chunk-tokens",
+        type=int,
+        default=128,
+        help="Minimum total tokens required per chunk (default: 128)",
     )
     parser.add_argument("--offline-shards", action="store_true")
     parser.add_argument(
@@ -859,9 +898,14 @@ def parse_args(argv=None, *, distributed=False, description=None):
         "max_buffered_files",
         "shard_timeout",
         "max_grad_norm",
+        "max_chunks_per_conversation",
+        "min_assistant_tokens",
+        "min_chunk_tokens",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.overlap_turns < 0:
+        parser.error("--overlap-turns must be non-negative")
     if args.seq_len is not None and args.seq_len < 1:
         parser.error("--seq-len must be positive")
     if args.tokens_per_shard is not None and args.tokens_per_shard < 2:

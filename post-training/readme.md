@@ -144,10 +144,18 @@ torchrun --standalone --nproc_per_node=2 post-training/sft_fsdp2_post_train.py \
     --pretrained-checkpoint model_ckpt --exclude-topics long_context
 ```
 
-`--oversized-behavior {filter,truncate,error}` controls how conversations longer than `--seq-len` are handled:
-* `filter` (default): Skips the conversation, logs progress, and continues without interrupting training. Recommended for robust training on open datasets.
+`--oversized-behavior {chunk,filter,truncate,error}` controls how conversations longer than `--seq-len` are handled:
+* `chunk` (default): Boundary-aware conversation chunking. Splits oversized conversations at message/turn boundaries into valid training chunks (each `<= seq_len`), preserves assistant supervision, and applies configurable turn overlap and chunk-capping.
+* `filter`: Skips the conversation, logs progress, and continues without interrupting training.
 * `truncate`: Truncates tokens and loss mask to `seq_len` (skipping the sample if no supervised assistant tokens remain after truncation).
 * `error`: Raises an explicit `ValueError` (legacy behavior).
+
+When `--oversized-behavior chunk` is enabled, additional options fine-tune chunk generation:
+* `--overlap-turns` (default: `1`): Number of interaction turns to overlap between consecutive chunks to preserve conversational context.
+* `--max-chunks-per-conversation` (default: `4`): Maximum number of chunks retained per oversized conversation, selected deterministically using `--seed`. Prevents single long conversations from dominating shard buffers or skewing topic mixture weights.
+* `--min-assistant-tokens` (default: `16`): Minimum number of supervised assistant tokens required for a chunk to be kept; chunks without assistant supervision are dropped.
+* `--min-chunk-tokens` (default: `128`): Minimum total tokens required for a chunk; small final turns are expanded backwards into preceding context to avoid emitting micro-fragments.
+* Message-level splitting: If an individual assistant message exceeds `seq_len`, it is split across chunks with continuation headers (`assistant:\n`) while preserving prompt context and assistant loss supervision.
 
 For example, this is a **replacement general-instruction mix**, not the eight-topic default:
 
@@ -226,6 +234,11 @@ The scripts do not create a validation split automatically. Choose held-out sour
 | `--muon-gather-buffer-mb` | `64` | Distributed Muon gathered working-set cap in MiB. |
 | `--max-buffered-files` / `--shard-timeout` | `3` / `1800` | Read-ahead limit and shard wait timeout in seconds. |
 | `--save-interval` / `--log-interval` | `100` / `10` | Checkpoint and training-log intervals. |
+| `--oversized-behavior` | `chunk` | Oversized conversation action: `chunk`, `filter`, `truncate`, or `error`. |
+| `--overlap-turns` | `1` | Interaction turns to overlap between consecutive chunks. |
+| `--max-chunks-per-conversation` | `4` | Maximum chunks kept per oversized conversation. |
+| `--min-assistant-tokens` | `16` | Minimum supervised assistant tokens required per chunk. |
+| `--min-chunk-tokens` | `128` | Minimum total tokens required per chunk. |
 | `--seed` | `42` | Training and source/sampler seed. |
 
 See both CLIs for all options:

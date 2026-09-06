@@ -388,5 +388,297 @@ class TestSFTShards(unittest.TestCase):
                 self.assertEqual(set(first[0]), {"conversation_json"})
 
 
+class TestSFTConversationChunking(unittest.TestCase):
+    def producer(self, directory, seq_len=513, **kwargs):
+        defaults = {
+            "seq_len": seq_len,
+            "tokens_per_shard": seq_len * 4,
+            "max_buffered_files": 100,
+            "oversized_behavior": "chunk",
+            "overlap_turns": 1,
+            "max_chunks_per_conversation": 4,
+            "min_assistant_tokens": 16,
+            "min_chunk_tokens": 64,
+            "log_fn": lambda msg: None,
+        }
+        defaults.update(kwargs)
+        return TokenizedShardProducer(
+            directory,
+            tokenizer=TinyTokenizer(),
+            **defaults,
+        )
+
+    def test_chunking_normal_conversation_not_oversized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(directory, seq_len=513)
+            messages = [
+                {"role": "user", "content": "What is the capital of France?"},
+                {"role": "assistant", "content": "The capital of France is Paris."},
+            ]
+            producer._append_conversation(messages)
+            self.assertEqual(producer.stats["conversations_seen"], 1)
+            self.assertEqual(producer.stats["conversations_kept_whole"], 1)
+            self.assertEqual(producer.stats["conversations_chunked"], 0)
+            self.assertEqual(producer.stats["conversations_filtered"], 0)
+            self.assertEqual(producer.stats["chunks_created"], 0)
+            self.assertEqual(producer.stats["chunks_emitted"], 1)
+            self.assertEqual(producer.stats["chunks_dropped"], 0)
+            self.assertGreater(producer.stats["tokens_retained"], 0)
+            self.assertEqual(producer.stats["tokens_dropped"], 0)
+            self.assertGreater(producer.stats["assistant_tokens_retained"], 0)
+            self.assertLessEqual(len(producer.token_buffer), 513)
+
+    def test_chunking_slightly_oversized_553_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(directory, seq_len=513, min_chunk_tokens=64)
+            messages = [
+                {"role": "user", "content": "u" * 180},
+                {"role": "assistant", "content": "a" * 140},
+                {"role": "user", "content": "u" * 95},
+                {"role": "assistant", "content": "a" * 95},
+            ]
+            ids, _ = tokenize_messages(TinyTokenizer(), messages)
+            self.assertGreater(len(ids), 513)
+            self.assertLess(len(ids), 600)
+
+            producer._append_conversation(messages)
+            self.assertEqual(producer.stats["conversations_seen"], 1)
+            self.assertEqual(producer.stats["conversations_kept_whole"], 0)
+            self.assertEqual(producer.stats["conversations_chunked"], 1)
+            self.assertEqual(producer.stats["chunks_created"], 2)
+            self.assertEqual(producer.stats["chunks_emitted"], 2)
+            self.assertEqual(producer.stats["chunks_dropped"], 0)
+            self.assertGreater(producer.stats["assistant_tokens_retained"], 0)
+
+            chunks = producer._chunk_conversation(messages)
+            self.assertEqual(len(chunks), 2)
+            for c_ids, c_mask in chunks:
+                self.assertLessEqual(len(c_ids), 513)
+                self.assertGreaterEqual(sum(c_mask), producer.min_assistant_tokens)
+
+    def test_chunking_moderate_conversation_2733_tokens(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = []
+            producer = self.producer(
+                directory,
+                seq_len=513,
+                max_chunks_per_conversation=4,
+                log_fn=logs.append,
+            )
+            messages = []
+            for i in range(10):
+                messages.append(
+                    {"role": "user", "content": f"User turn {i}: " + "u" * 110}
+                )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"Assistant turn {i}: " + "a" * 125,
+                    }
+                )
+
+            ids, _ = tokenize_messages(TinyTokenizer(), messages)
+            self.assertGreater(len(ids), 2500)
+            self.assertLess(len(ids), 3000)
+
+            producer._append_conversation(messages)
+            self.assertEqual(producer.stats["conversations_chunked"], 1)
+            self.assertGreater(producer.stats["chunks_created"], 4)
+            self.assertEqual(producer.stats["chunks_emitted"], 4)
+            self.assertEqual(
+                producer.stats["chunks_dropped"],
+                producer.stats["chunks_created"] - 4,
+            )
+            self.assertGreater(producer.stats["tokens_retained"], 0)
+            self.assertGreater(producer.stats["tokens_dropped"], 0)
+            self.assertGreater(producer.stats["assistant_tokens_retained"], 0)
+            self.assertTrue(any("Capped chunks for conversation" in m for m in logs))
+            self.assertTrue(
+                any("[SFT Producer] Chunked conversation:" in m for m in logs)
+            )
+
+    def test_chunking_very_long_conversation_64545_tokens_capped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = []
+            producer = self.producer(
+                directory,
+                seq_len=513,
+                max_chunks_per_conversation=4,
+                log_fn=logs.append,
+            )
+            messages = []
+            for i in range(100):
+                messages.append({"role": "user", "content": "u" * 300})
+                messages.append({"role": "assistant", "content": "a" * 320})
+
+            ids, _ = tokenize_messages(TinyTokenizer(), messages)
+            self.assertGreater(len(ids), 60000)
+
+            producer._append_conversation(messages)
+            self.assertEqual(producer.stats["conversations_chunked"], 1)
+            self.assertGreater(producer.stats["chunks_created"], 50)
+            self.assertEqual(producer.stats["chunks_emitted"], 4)
+            self.assertEqual(
+                producer.stats["chunks_dropped"],
+                producer.stats["chunks_created"] - 4,
+            )
+            self.assertTrue(any("Capped chunks for conversation" in m for m in logs))
+
+    def test_chunking_oversized_assistant_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            logs = []
+            producer = self.producer(
+                directory,
+                seq_len=513,
+                min_assistant_tokens=16,
+                log_fn=logs.append,
+            )
+            messages = [
+                {"role": "user", "content": "Tell me a long story."},
+                {"role": "assistant", "content": "w" * 1200},
+            ]
+            producer._append_conversation(messages)
+            self.assertEqual(producer.stats["conversations_chunked"], 1)
+            self.assertGreaterEqual(producer.stats["chunks_emitted"], 2)
+            self.assertTrue(
+                any(
+                    "Message-level splitting required for oversized assistant message"
+                    in m
+                    for m in logs
+                )
+            )
+
+            chunks = producer._chunk_conversation(messages)
+            self.assertGreaterEqual(len(chunks), 2)
+            for c_ids, c_mask in chunks:
+                self.assertLessEqual(len(c_ids), 513)
+                self.assertGreaterEqual(sum(c_mask), 16)
+                self.assertIn(1, c_mask)
+
+    def test_chunking_no_assistant_chunk_discarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(
+                directory,
+                seq_len=100,
+                min_assistant_tokens=50,
+                overlap_turns=0,
+            )
+            messages = [
+                {"role": "user", "content": "u" * 10},
+                {"role": "assistant", "content": "a" * 5},
+                {"role": "user", "content": "u" * 10},
+                {"role": "assistant", "content": "a" * 60},
+            ]
+            chunks = producer._chunk_conversation(messages)
+            for _, c_mask in chunks:
+                self.assertGreaterEqual(sum(c_mask), 50)
+            self.assertGreaterEqual(producer.stats["chunks_dropped"], 1)
+
+    def test_chunking_oasst1_tree_reconstruction_then_chunking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            producer = self.producer(directory, seq_len=200)
+            raw_tree = [
+                {
+                    "message_id": "m1",
+                    "parent_id": None,
+                    "role": "user",
+                    "text": "Question 1: " + "q" * 80,
+                },
+                {
+                    "message_id": "m2",
+                    "parent_id": "m1",
+                    "role": "assistant",
+                    "text": "Answer 1: " + "a" * 80,
+                },
+                {
+                    "message_id": "m3",
+                    "parent_id": "m2",
+                    "role": "user",
+                    "text": "Question 2: " + "q" * 80,
+                },
+                {
+                    "message_id": "m4",
+                    "parent_id": "m3",
+                    "role": "assistant",
+                    "text": "Answer 2: " + "a" * 80,
+                },
+            ]
+            reconstructed = list(_oasst_conversations(raw_tree))
+            self.assertEqual(len(reconstructed), 1)
+            self.assertEqual(len(reconstructed[0]), 4)
+            self.assertEqual(reconstructed[0][0]["role"], "user")
+            self.assertEqual(reconstructed[0][-1]["role"], "assistant")
+
+            producer._append_conversation(reconstructed[0])
+            self.assertEqual(producer.stats["conversations_chunked"], 1)
+            self.assertEqual(producer.stats["chunks_emitted"], 2)
+            for c_ids, c_mask in producer._chunk_conversation(reconstructed[0]):
+                self.assertLessEqual(len(c_ids), 200)
+                self.assertGreater(sum(c_mask), 0)
+
+    def test_chunking_overlap_turns_boundary(self):
+        messages = [
+            {"role": "user", "content": "Prompt 0: " + "x" * 30},
+            {"role": "assistant", "content": "Reply 0: " + "y" * 30},
+            {"role": "user", "content": "Prompt 1: " + "x" * 30},
+            {"role": "assistant", "content": "Reply 1: " + "y" * 30},
+            {"role": "user", "content": "Prompt 2: " + "x" * 30},
+            {"role": "assistant", "content": "Reply 2: " + "y" * 30},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            prod_overlap = self.producer(
+                directory, seq_len=250, overlap_turns=1, min_chunk_tokens=30
+            )
+            chunks_overlap = prod_overlap._chunk_conversation(messages)
+            self.assertEqual(len(chunks_overlap), 2)
+
+            prod_no_overlap = self.producer(
+                directory, seq_len=250, overlap_turns=0, min_chunk_tokens=30
+            )
+            chunks_no_overlap = prod_no_overlap._chunk_conversation(messages)
+            self.assertEqual(len(chunks_no_overlap), 2)
+
+            for c_ids, _ in chunks_overlap:
+                self.assertLessEqual(len(c_ids), 250)
+            for c_ids, _ in chunks_no_overlap:
+                self.assertLessEqual(len(c_ids), 250)
+
+            tokens_overlap = sum(len(c[0]) for c in chunks_overlap)
+            tokens_no_overlap = sum(len(c[0]) for c in chunks_no_overlap)
+            self.assertGreater(tokens_overlap, tokens_no_overlap)
+
+    def test_chunking_deterministic_selection(self):
+        messages = []
+        for i in range(12):
+            messages.append({"role": "user", "content": f"Turn {i} user " + "u" * 60})
+            messages.append(
+                {"role": "assistant", "content": f"Turn {i} ast " + "a" * 60}
+            )
+
+        with (
+            tempfile.TemporaryDirectory() as dir1,
+            tempfile.TemporaryDirectory() as dir2,
+            tempfile.TemporaryDirectory() as dir3,
+        ):
+            p1 = self.producer(
+                dir1, seq_len=200, seed=42, max_chunks_per_conversation=3
+            )
+            p1._append_conversation(messages)
+
+            p2 = self.producer(
+                dir2, seq_len=200, seed=42, max_chunks_per_conversation=3
+            )
+            p2._append_conversation(messages)
+
+            p3 = self.producer(
+                dir3, seq_len=200, seed=999, max_chunks_per_conversation=3
+            )
+            p3._append_conversation(messages)
+
+            self.assertEqual(p1.token_buffer, p2.token_buffer)
+            self.assertEqual(p1.loss_mask_buffer, p2.loss_mask_buffer)
+            self.assertNotEqual(p1.token_buffer, p3.token_buffer)
+
+
 if __name__ == "__main__":
     unittest.main()
