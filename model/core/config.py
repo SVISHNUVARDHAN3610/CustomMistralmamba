@@ -183,7 +183,7 @@ class HybridMambaMoEConfig(MixtralConfig):
     expert_warmup_fraction: float = 0.10
     expert_var_beta: float = 0.5
     lambda_ssm: float = 0.0
-    lambda_slot: float = 3e-3
+    lambda_slot: float = 0.0
     slot_similarity_margin: float = 0.3
     slot_cross_bank_alpha: float = 0.1
     recon_decoder_heads: int = 2

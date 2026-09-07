@@ -22,6 +22,7 @@ from model.hybrid.losses import (
     _expert_loss_schedule,
     associative_retrieval_loss,
     fusion_balance_loss,
+    memory_slot_diversity_loss,
     write_gate_entropy_loss,
 )
 from model.hybrid.mamba import (
@@ -921,6 +922,187 @@ class TestHybridModel(unittest.TestCase):
         self.assertEqual(aux.recon.item(), 0.0)
         self.assertEqual(aux.fusion.item(), 0.0)
         self.assertEqual(aux.expert.item(), 0.0)
+
+    def test_auxiliary_loss_individual_lambda_gating(self) -> None:
+        """Confirm auxiliary losses are skipped when their individual lambda is 0.0."""
+        # 1. lambda_slot=0.0 (default) with use_auxiliary_losses=True
+        cfg_slot_off = _small_hybrid_config(
+            num_layers=1, use_auxiliary_losses=True, lambda_slot=0.0
+        )
+        model_slot_off = HybridForCausalLM(cfg_slot_off).train()
+        ids = torch.randint(0, cfg_slot_off.vocab_size, (1, 16))
+        labels = ids.clone()
+        with mock.patch(
+            "model.hybrid.layer.memory_slot_diversity_loss"
+        ) as mock_slot_fn:
+            out = model_slot_off(input_ids=ids, labels=labels)
+            mock_slot_fn.assert_not_called()
+        self.assertEqual(out.auxiliary_losses.slot.item(), 0.0)
+        assert out.loss is not None
+        out.loss.backward()
+
+        # 2. lambda_read=0.0
+        cfg_read_off = _small_hybrid_config(
+            num_layers=1, use_auxiliary_losses=True, lambda_read=0.0
+        )
+        model_read_off = HybridForCausalLM(cfg_read_off).train()
+        with mock.patch(
+            "model.hybrid.layer.combine_read_utilization_loss"
+        ) as mock_read_fn:
+            out = model_read_off(input_ids=ids, labels=labels)
+            mock_read_fn.assert_not_called()
+        self.assertEqual(out.auxiliary_losses.read.item(), 0.0)
+        assert out.loss is not None
+        out.loss.backward()
+
+        # 3. lambda_fusion=0.0
+        cfg_fusion_off = _small_hybrid_config(
+            num_layers=1, use_auxiliary_losses=True, lambda_fusion=0.0
+        )
+        model_fusion_off = HybridForCausalLM(cfg_fusion_off).train()
+        with mock.patch("model.hybrid.layer.fusion_balance_loss") as mock_fusion_fn:
+            out = model_fusion_off(input_ids=ids, labels=labels)
+            mock_fusion_fn.assert_not_called()
+        self.assertEqual(out.auxiliary_losses.fusion.item(), 0.0)
+        assert out.loss is not None
+        out.loss.backward()
+
+        # 4. lambda_gate=0.0
+        cfg_gate_off = _small_hybrid_config(
+            num_layers=1, use_auxiliary_losses=True, lambda_gate=0.0
+        )
+        model_gate_off = HybridForCausalLM(cfg_gate_off).train()
+        with mock.patch("model.hybrid.layer.write_gate_entropy_loss") as mock_gate_fn:
+            out = model_gate_off(input_ids=ids, labels=labels)
+            mock_gate_fn.assert_not_called()
+        self.assertEqual(out.auxiliary_losses.gate.item(), 0.0)
+        assert out.loss is not None
+        out.loss.backward()
+
+        # 5. lambda_recon=0.0 and lambda_assoc=0.0
+        cfg_recon_assoc_off = _small_hybrid_config(
+            num_layers=1,
+            use_auxiliary_losses=True,
+            lambda_recon=0.0,
+            lambda_assoc=0.0,
+        )
+        model_ra_off = HybridForCausalLM(cfg_recon_assoc_off).train()
+        with (
+            mock.patch("model.hybrid.layer.masked_token_mse") as mock_recon_fn,
+            mock.patch(
+                "model.hybrid.layer.associative_retrieval_loss"
+            ) as mock_assoc_fn,
+        ):
+            out = model_ra_off(input_ids=ids, labels=labels)
+            mock_recon_fn.assert_not_called()
+            mock_assoc_fn.assert_not_called()
+        self.assertEqual(out.auxiliary_losses.recon.item(), 0.0)
+        self.assertEqual(out.auxiliary_losses.assoc.item(), 0.0)
+        assert out.loss is not None
+        out.loss.backward()
+
+        # 6. lambda_recon=0.0 but lambda_assoc > 0.0 (intermediate surprise decoupled)
+        cfg_assoc_only = _small_hybrid_config(
+            num_layers=1,
+            use_auxiliary_losses=True,
+            lambda_recon=0.0,
+            lambda_assoc=0.0614,
+        )
+        model_assoc_only = HybridForCausalLM(cfg_assoc_only).train()
+        with (
+            mock.patch("model.hybrid.layer.masked_token_mse") as mock_recon_fn,
+            mock.patch(
+                "model.hybrid.layer.associative_retrieval_loss",
+                wraps=associative_retrieval_loss,
+            ) as spy_assoc_fn,
+        ):
+            out = model_assoc_only(input_ids=ids, labels=labels)
+            mock_recon_fn.assert_not_called()
+            spy_assoc_fn.assert_called()
+        self.assertEqual(out.auxiliary_losses.recon.item(), 0.0)
+        self.assertGreater(out.auxiliary_losses.assoc.item(), 0.0)
+        assert out.loss is not None
+        out.loss.backward()
+
+        # 7. lambda_assoc_norm=0.0
+        cfg_assoc_norm_off = _small_hybrid_config(
+            num_layers=1, use_auxiliary_losses=True, lambda_assoc_norm=0.0
+        )
+        model_an_off = HybridForCausalLM(cfg_assoc_norm_off).train()
+        with mock.patch("model.hybrid.layer.assoc_state_norm_loss") as mock_norm_fn:
+            out = model_an_off(input_ids=ids, labels=labels)
+            mock_norm_fn.assert_not_called()
+        self.assertEqual(out.auxiliary_losses.assoc_norm.item(), 0.0)
+        assert out.loss is not None
+        out.loss.backward()
+
+    def test_slot_loss_demotion_and_telemetry(self) -> None:
+        """Confirm L_slot is 0.0 by default, telemetry is in gate_stats, and lambda_slot>0 re-enables math."""
+        torch.manual_seed(42)
+        cfg = _small_hybrid_config(num_layers=1)
+        self.assertEqual(cfg.lambda_slot, 0.0)
+
+        # (a) With default config, slot loss is 0.0 and memory_slot_diversity_loss is not invoked.
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (2, 16))
+        labels = ids.clone()
+        with mock.patch("model.hybrid.layer.memory_slot_diversity_loss") as mock_slot:
+            out = model(input_ids=ids, labels=labels)
+            mock_slot.assert_not_called()
+        self.assertEqual(out.auxiliary_losses.slot.item(), 0.0)
+
+        # (b) gate_stats contains slot cosine similarity telemetry in [-1, 1]
+        for key in (
+            "layer_0_attn_mem_slot_cos_sim_mean",
+            "layer_0_state_mem_slot_cos_sim_mean",
+            "layer_0_cross_bank_slot_cos_sim_mean",
+        ):
+            self.assertIn(key, out.gate_stats)
+            val = float(out.gate_stats[key].item())
+            self.assertTrue(torch.isfinite(out.gate_stats[key]))
+            self.assertGreaterEqual(val, -1.0)
+            self.assertLessEqual(val, 1.0)
+
+        # (c) Re-enabling lambda_slot > 0.0 restores backprop and matches exact loss math
+        torch.manual_seed(42)
+        cfg_active = _small_hybrid_config(num_layers=1, lambda_slot=3e-3)
+        model_active = HybridForCausalLM(cfg_active).train()
+        out_active = model_active(input_ids=ids, labels=labels)
+        self.assertGreater(out_active.auxiliary_losses.slot.item(), 0.0)
+
+        # Confirm exact math parity with memory_slot_diversity_loss
+        a_mem, s_mem = out_active.memory_states[0]
+        expected_slot_loss = memory_slot_diversity_loss(
+            a_mem,
+            s_mem,
+            cfg_active.slot_similarity_margin,
+            cfg_active.slot_cross_bank_alpha,
+        )
+        self.assertAlmostEqual(
+            out_active.auxiliary_losses.slot.item(),
+            expected_slot_loss.item(),
+            places=5,
+        )
+
+        assert out_active.loss is not None
+        out_active.loss.backward()
+
+    def test_auxiliary_loss_default_lambdas_gradient_parity(self) -> None:
+        """Confirm bit-for-bit parity when lambda_slot is set to pre-change value."""
+        torch.manual_seed(123)
+        cfg = _small_hybrid_config(num_layers=1, lambda_slot=3e-3)
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 16))
+        labels = ids.clone()
+
+        out = model(input_ids=ids, labels=labels)
+        self.assertIsNotNone(out.loss)
+        self.assertTrue(torch.isfinite(out.loss))
+        out.loss.backward()
+
+        for p in model.parameters():
+            if p.grad is not None:
+                self.assertFalse(torch.isnan(p.grad).any())
 
     def test_recon_loss_gradients_write_path(self) -> None:
         cfg = _small_hybrid_config(num_layers=1, use_auxiliary_losses=True)

@@ -194,6 +194,44 @@ def memory_slot_diversity_loss(
     return (intra + cross_alpha * cross).to(dtype=out_dtype)
 
 
+def memory_slot_monitoring_stats(
+    attn_mem: Tensor,
+    state_mem: Tensor,
+    eps: float = 1e-6,
+) -> dict[str, Tensor]:
+    """Return detached intra-bank and cross-bank slot cosine similarity telemetry.
+
+    Computes the intra-bank pairwise cosine similarity mean (excluding the self-diagonal)
+    for both attention and state memory banks, and the cross-bank slot cosine similarity
+    mean, following the formulas in :func:`memory_slot_diversity_loss` under torch.no_grad().
+    """
+    with torch.no_grad():
+        attn_f = _promote_fp32(attn_mem).detach()
+        state_f = _promote_fp32(state_mem).detach()
+
+        a_norm = attn_f / attn_f.norm(dim=-1, keepdim=True).clamp(min=eps)
+        s_norm = state_f / state_f.norm(dim=-1, keepdim=True).clamp(min=eps)
+
+        def _intra_cos_sim(norm_mem: Tensor) -> Tensor:
+            sim = torch.matmul(norm_mem, norm_mem.transpose(-1, -2))
+            m = sim.size(-1)
+            if m <= 1:
+                return torch.tensor(1.0, device=norm_mem.device, dtype=torch.float32)
+            mask = ~torch.eye(m, device=sim.device, dtype=torch.bool)
+            return sim.masked_select(mask.unsqueeze(0)).mean()
+
+        cross_sim = (a_norm * s_norm).sum(dim=-1).mean()
+
+        return {
+            "attn_mem_slot_cos_sim_mean": _intra_cos_sim(a_norm),
+            "state_mem_slot_cos_sim_mean": _intra_cos_sim(s_norm),
+            "cross_bank_slot_cos_sim_mean": cross_sim,
+        }
+
+
+_memory_slot_monitoring_stats = memory_slot_monitoring_stats
+
+
 def ssm_state_norm_loss(ssm_state: Tensor, gamma: Tensor) -> Tensor:
     s_bar = ssm_state.float().pow(2).mean()
     return torch.relu(s_bar - gamma)
