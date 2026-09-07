@@ -7,7 +7,8 @@
 Run/cache directories must be shared across all nodes. This entry point reuses
 the pretraining FSDP2 custom-math exclusions, replicated-gradient reductions,
 global gradient clipping, full-matrix Muon and consolidated checkpoint helpers.
-The shared SFT loop lives in sft_post_train.py; --help documents its data options.
+The shared SFT loop lives in sft_post_train.py; --help documents its data options
+including --oversized-behavior (filter/truncate/error) and --exclude-topics.
 
 As in pre-training/fsdp2_train.py, master parameters and reductions stay FP32;
 BF16 is enabled through autocast. Layers are sharded before the root, and the
@@ -26,6 +27,9 @@ import os
 import sys
 from datetime import timedelta
 from pathlib import Path
+
+# Disable JAX in Hugging Face datasets to prevent background worker circular imports
+os.environ["USE_JAX"] = "0"
 
 import torch
 

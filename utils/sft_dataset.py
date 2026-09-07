@@ -50,6 +50,15 @@ from collections.abc import Callable, Iterator
 from copy import deepcopy
 from typing import Any
 
+# Disable JAX in Hugging Face datasets to prevent background worker circular imports
+os.environ["USE_JAX"] = "0"
+try:
+    import datasets.config
+
+    datasets.config.JAX_AVAILABLE = False
+except (ImportError, AttributeError):
+    pass
+
 import numpy as np
 import torch
 from datasets import Features, IterableDataset, Value, interleave_datasets, load_dataset
@@ -141,10 +150,27 @@ TOPIC_SOURCES = {
 }
 
 
-def get_dataset_configs() -> list[dict[str, Any]]:
-    """Return independently editable configs with absolute sampling weights."""
+def get_dataset_configs(
+    exclude_topics: list[str] | tuple[str, ...] | set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return independently editable configs with absolute sampling weights.
+
+    If exclude_topics is specified, those topics are excluded and the remaining
+    topic weights are re-normalized so they sum to 1.0.
+    """
+    exclude = set(exclude_topics or [])
+    filtered_weights = {k: v for k, v in TOPIC_WEIGHTS.items() if k not in exclude}
+    if not filtered_weights:
+        raise ValueError("Cannot exclude all topics from dataset configs")
+    total_weight = sum(filtered_weights.values())
+    normalized_topic_weights = {
+        k: v / total_weight for k, v in filtered_weights.items()
+    }
+
     configs = []
     for topic, sources in TOPIC_SOURCES.items():
+        if topic in exclude:
+            continue
         for source in sources:
             cfg = deepcopy(source)
             names = [cfg["name"]] + cfg.pop("extra_names", [])
@@ -154,7 +180,9 @@ def get_dataset_configs() -> list[dict[str, Any]]:
                         cfg,
                         name=name,
                         topic=topic,
-                        weight=TOPIC_WEIGHTS[topic] / len(sources) / len(names),
+                        weight=normalized_topic_weights[topic]
+                        / len(sources)
+                        / len(names),
                     )
                 )
     return configs
@@ -166,6 +194,8 @@ _ROLES = {
     "human": "user",
     "prompter": "user",
     "gpt": "assistant",
+    "model": "assistant",
+    "bot": "assistant",
     "function": "tool",
     "observation": "tool",
 }
@@ -261,10 +291,14 @@ def _oasst_conversations(rows) -> Iterator[list[dict]]:
     This one small source is indexed in RAM. Emit one full path per assistant
     leaf; missing/deleted/rejected ancestors invalidate the entire path.
     """
-    nodes = {row["message_id"]: row for row in rows}
     valid = {
-        key: row
-        for key, row in nodes.items()
+        row["message_id"]: {
+            "message_id": row["message_id"],
+            "parent_id": row.get("parent_id"),
+            "role": row.get("role", ""),
+            "text": _text(row.get("text")),
+        }
+        for row in rows
         if not row.get("deleted")
         and row.get("review_result") is not False
         and _text(row.get("text")).strip()
@@ -353,6 +387,90 @@ def tokenize_messages(tokenizer, messages: list[dict]) -> tuple[list[int], list[
     return ids, mask
 
 
+def _compute_message_spans(tokenizer, messages: list[dict]) -> list[tuple[int, int]]:
+    """Compute (start_token_idx, end_token_idx) in tokenize_messages output for each message."""
+    spans = []
+    curr = 1 if tokenizer.bos_token_id is not None else 0
+    for index, msg in enumerate(messages):
+        header = ("\n" if index else "") + msg["role"] + ":\n"
+        header_ids = tokenizer.encode(header, add_special_tokens=False)
+        body_ids = tokenizer.encode(msg["content"], add_special_tokens=False)
+        assistant = msg["role"] == "assistant"
+        length = (
+            len(header_ids)
+            + len(body_ids)
+            + (1 if (assistant and tokenizer.eos_token_id is not None) else 0)
+        )
+        spans.append((curr, curr + length))
+        curr += length
+    return spans
+
+
+def _default_stats() -> dict[str, int]:
+    return {
+        "conversations_seen": 0,
+        "conversations_kept_whole": 0,
+        "conversations_chunked": 0,
+        "conversations_filtered": 0,
+        "conversations_keep_all": 0,
+        "conversations_sampled": 0,
+        "conversations_hit_max_cap": 0,
+        "chunks_created": 0,
+        "chunks_emitted": 0,
+        "chunks_dropped": 0,
+        "tokens_seen": 0,
+        "tokens_retained": 0,
+        "unique_source_tokens_retained": 0,
+        "training_tokens_emitted": 0,
+        "overlap_tokens": 0,
+        "tokens_dropped": 0,
+        "assistant_tokens_retained": 0,
+    }
+
+
+def format_stats_summary(stats: dict[str, int]) -> str:
+    def _format_count(num: int) -> str:
+        if num >= 1_000_000:
+            return f"{num / 1_000_000:.1f}M"
+        if num >= 1_000:
+            return f"{num / 1_000:.1f}K"
+        return str(num)
+
+    seen = stats.get("tokens_seen", 0)
+    unique_retained = stats.get(
+        "unique_source_tokens_retained", stats.get("tokens_retained", 0)
+    )
+    emitted = stats.get("training_tokens_emitted", unique_retained)
+    overlap = stats.get("overlap_tokens", max(0, emitted - unique_retained))
+    dropped = stats.get("tokens_dropped", max(0, seen - unique_retained))
+    rate = (unique_retained / max(seen, 1)) * 100.0
+    chunked = stats.get("conversations_chunked", 0)
+    keep_all = stats.get("conversations_keep_all", 0)
+    sampled = stats.get("conversations_sampled", 0)
+    hit_max = stats.get("conversations_hit_max_cap", 0)
+    return (
+        "SFT Dataset Statistics\n"
+        "----------------------\n"
+        f"Conversations seen:       {stats.get('conversations_seen', 0)}\n"
+        f"Kept whole:               {stats.get('conversations_kept_whole', 0)}\n"
+        f"Chunked:                  {chunked}\n"
+        f"  - Keep all chunks:      {keep_all}\n"
+        f"  - Sampled:              {sampled}\n"
+        f"  - Hit max cap:          {hit_max}\n"
+        f"Filtered:                 {stats.get('conversations_filtered', 0)}\n"
+        f"Chunks created:           {stats.get('chunks_created', 0)}\n"
+        f"Chunks emitted:           {stats.get('chunks_emitted', 0)}\n"
+        f"Chunks dropped:           {stats.get('chunks_dropped', 0)}\n"
+        f"Original source tokens:   {_format_count(seen)}\n"
+        f"Unique source tokens kept: {_format_count(unique_retained)}\n"
+        f"Training tokens emitted:  {_format_count(emitted)}\n"
+        f"Overlap tokens:           {_format_count(overlap)}\n"
+        f"Tokens dropped:           {_format_count(dropped)}\n"
+        f"Retention rate:            {rate:.1f}%\n"
+        f"Assistant tokens:         {_format_count(stats.get('assistant_tokens_retained', 0))}"
+    )
+
+
 class TokenizedShardProducer:
     """Bounded, resumable CPU producer with the pretraining producer interface."""
 
@@ -369,10 +487,68 @@ class TokenizedShardProducer:
         dataset_configs: list[dict] | None = None,
         tokenizer=None,
         expected_vocab_size: int | None = None,
+        oversized_behavior: str = "chunk",
+        overlap_turns: int = 1,
+        budget_strategy: str = "retention_ratio",
+        retention_ratio: float = 0.25,
+        chunk_retention_ratio: float | None = None,
+        keep_all_threshold: int = 8,
+        min_chunks_per_conversation: int = 4,
+        max_chunks_per_conversation: int = 32,
+        sampling_strategy: str = "stratified",
+        min_assistant_tokens: int = 16,
+        min_chunk_tokens: int = 64,
     ):
         if seq_len < 2 or max_buffered_files < 1:
             raise ValueError("seq_len must be >=2 and max_buffered_files >=1")
+        if oversized_behavior not in {"chunk", "filter", "truncate", "error"}:
+            raise ValueError(
+                f"Invalid oversized_behavior {oversized_behavior!r}; expected 'chunk', 'filter', 'truncate', or 'error'"
+            )
+        if budget_strategy not in {"retention_ratio", "fixed"}:
+            raise ValueError(
+                f"Invalid budget_strategy {budget_strategy!r}; expected 'retention_ratio' or 'fixed'"
+            )
+        if sampling_strategy not in {"stratified", "random"}:
+            raise ValueError(
+                f"Invalid sampling_strategy {sampling_strategy!r}; expected 'stratified' or 'random'"
+            )
+        effective_retention = (
+            chunk_retention_ratio
+            if chunk_retention_ratio is not None
+            else retention_ratio
+        )
+        if not (0.0 < effective_retention <= 1.0):
+            raise ValueError(
+                "retention_ratio/chunk_retention_ratio must be in (0.0, 1.0]"
+            )
+        if keep_all_threshold < 1:
+            raise ValueError("keep_all_threshold must be >=1")
+        if min_chunks_per_conversation < 1:
+            raise ValueError("min_chunks_per_conversation must be >=1")
+        if max_chunks_per_conversation < 1:
+            raise ValueError("max_chunks_per_conversation must be >=1")
+        if overlap_turns < 0:
+            raise ValueError("overlap_turns must be non-negative")
+        if min_assistant_tokens < 1:
+            raise ValueError("min_assistant_tokens must be >=1")
+        if min_chunk_tokens < 1:
+            raise ValueError("min_chunk_tokens must be >=1")
         self.seq_len = seq_len
+        self.oversized_behavior = oversized_behavior
+        self.overlap_turns = overlap_turns
+        self.budget_strategy = budget_strategy
+        self.retention_ratio = effective_retention
+        self.chunk_retention_ratio = effective_retention
+        self.keep_all_threshold = keep_all_threshold
+        self.min_chunks_per_conversation = min_chunks_per_conversation
+        self.max_chunks_per_conversation = max_chunks_per_conversation
+        self.sampling_strategy = sampling_strategy
+        self.min_assistant_tokens = min_assistant_tokens
+        self.min_chunk_tokens = min_chunk_tokens
+        self.skipped_oversized_samples = 0
+        self.stats = _default_stats()
+        self.rng = np.random.RandomState(0 if seed is None else seed)
         self.tokens_per_shard = (
             tokens_per_shard if tokens_per_shard is not None else seq_len * 8
         )
@@ -417,6 +593,9 @@ class TokenizedShardProducer:
         self._lock = threading.RLock()
         os.makedirs(self.cache_dir, exist_ok=True)
 
+    def get_stats_summary(self) -> str:
+        return format_stats_summary(self.stats)
+
     def _settings(self):
         vocab = self.tokenizer.get_vocab()
         return {
@@ -433,6 +612,17 @@ class TokenizedShardProducer:
             "eos_id": self.tokenizer.eos_token_id,
             "pad_id": self.pad_id,
             "dataset_configs": self.dataset_configs,
+            "oversized_behavior": self.oversized_behavior,
+            "overlap_turns": self.overlap_turns,
+            "budget_strategy": self.budget_strategy,
+            "retention_ratio": self.retention_ratio,
+            "chunk_retention_ratio": self.chunk_retention_ratio,
+            "keep_all_threshold": self.keep_all_threshold,
+            "min_chunks_per_conversation": self.min_chunks_per_conversation,
+            "max_chunks_per_conversation": self.max_chunks_per_conversation,
+            "sampling_strategy": self.sampling_strategy,
+            "min_assistant_tokens": self.min_assistant_tokens,
+            "min_chunk_tokens": self.min_chunk_tokens,
         }
 
     def save_checkpoint(self, checkpoint_path: str):
@@ -441,7 +631,9 @@ class TokenizedShardProducer:
                 "settings": self._settings(),
                 "current_shard_idx": self.current_shard_idx,
                 "cumulative_samples": self.cumulative_samples,
+                "skipped_oversized_samples": self.skipped_oversized_samples,
                 "finished": self.finished,
+                "stats": self.stats,
                 "token_buffer_b64": base64.b64encode(
                     np.asarray(self.token_buffer, dtype="<u4").tobytes()
                 ).decode("ascii"),
@@ -455,7 +647,33 @@ class TokenizedShardProducer:
         with self._lock:
             with open(checkpoint_path, encoding="utf-8") as handle:
                 state = json.load(handle)
-            if state.get("settings") != self._settings():
+            loaded_settings = dict(state.get("settings", {}))
+            current_settings = self._settings()
+            for key in (
+                "oversized_behavior",
+                "overlap_turns",
+                "budget_strategy",
+                "retention_ratio",
+                "chunk_retention_ratio",
+                "keep_all_threshold",
+                "min_chunks_per_conversation",
+                "max_chunks_per_conversation",
+                "sampling_strategy",
+                "min_assistant_tokens",
+                "min_chunk_tokens",
+            ):
+                if key not in loaded_settings:
+                    if key == "chunk_retention_ratio":
+                        loaded_settings[key] = loaded_settings.get(
+                            "retention_ratio", current_settings[key]
+                        )
+                    elif key == "retention_ratio":
+                        loaded_settings[key] = loaded_settings.get(
+                            "chunk_retention_ratio", current_settings[key]
+                        )
+                    else:
+                        loaded_settings[key] = current_settings[key]
+            if loaded_settings != current_settings:
                 raise ValueError("SFT checkpoint settings/tokenizer/mix do not match")
             tokens = np.frombuffer(
                 base64.b64decode(state["token_buffer_b64"], validate=True), dtype="<u4"
@@ -467,6 +685,24 @@ class TokenizedShardProducer:
             self.token_buffer, self.loss_mask_buffer = tokens, mask
             self.current_shard_idx = state["current_shard_idx"]
             self.cumulative_samples = state["cumulative_samples"]
+            self.skipped_oversized_samples = state.get("skipped_oversized_samples", 0)
+            loaded_stats = _default_stats()
+            loaded_stats.update(state.get("stats", {}))
+            if "unique_source_tokens_retained" not in state.get("stats", {}):
+                loaded_stats["unique_source_tokens_retained"] = loaded_stats.get(
+                    "tokens_retained", 0
+                )
+            if "training_tokens_emitted" not in state.get("stats", {}):
+                loaded_stats["training_tokens_emitted"] = loaded_stats.get(
+                    "tokens_retained", 0
+                )
+            if "overlap_tokens" not in state.get("stats", {}):
+                loaded_stats["overlap_tokens"] = max(
+                    0,
+                    loaded_stats["training_tokens_emitted"]
+                    - loaded_stats["unique_source_tokens_retained"],
+                )
+            self.stats = loaded_stats
             self.finished = state["finished"]
         self.log(
             f"[SFT Producer] Restored {self.cumulative_samples} conversations; deterministic replay required"
@@ -524,16 +760,545 @@ class TokenizedShardProducer:
         self.token_buffer.extend([self.pad_id] * count)
         self.loss_mask_buffer.extend([0] * count)
 
+    def _split_oversized_message(
+        self,
+        system_msg: dict | None,
+        turn_msgs: list[dict],
+        spans: list[tuple[int, int]] | None = None,
+        system_idx: int | None = None,
+        turn_idxs: list[int] | None = None,
+    ) -> list[tuple[list[int], list[int], set[int]]]:
+        """Dedicated split path for turns where an individual message exceeds seq_len.
+
+        Preserves as much complete context as possible, splits the oversized
+        message at token boundaries, preserves the assistant loss mask, and
+        guarantees that all generated chunks remain valid training examples.
+        """
+        chunks: list[tuple[list[int], list[int], set[int]]] = []
+        if not turn_msgs:
+            return chunks
+
+        assistant_msg = turn_msgs[-1]
+        prefix_msgs = ([system_msg] if system_msg else []) + turn_msgs[:-1]
+        prefix_indices = (
+            [system_idx] if system_msg is not None and system_idx is not None else []
+        ) + (turn_idxs[:-1] if turn_idxs else [])
+        ast_idx = turn_idxs[-1] if turn_idxs else None
+        ast_span = (
+            spans[ast_idx]
+            if (spans is not None and ast_idx is not None and ast_idx < len(spans))
+            else None
+        )
+
+        # Tokenize prompt context (system + user + tools)
+        if prefix_msgs:
+            prefix_ids, prefix_mask = tokenize_messages(self.tokenizer, prefix_msgs)
+        else:
+            prefix_ids, prefix_mask = [], []
+
+        ast_header = ("\n" if prefix_ids else "") + "assistant:\n"
+        ast_header_ids = self.tokenizer.encode(ast_header, add_special_tokens=False)
+        ast_body_ids = self.tokenizer.encode(
+            assistant_msg["content"], add_special_tokens=False
+        )
+        eos_ids = (
+            [self.tokenizer.eos_token_id]
+            if self.tokenizer.eos_token_id is not None
+            else []
+        )
+
+        # Case 1: Prompt prefix is oversized
+        if (
+            len(prefix_ids) + len(ast_header_ids)
+            >= self.seq_len - self.min_assistant_tokens
+        ):
+            max_prefix = max(
+                0,
+                self.seq_len
+                - len(ast_header_ids)
+                - min(len(ast_body_ids), self.min_assistant_tokens),
+            )
+            self.log(
+                f"[SFT Producer] Message-level splitting required for oversized prompt context "
+                f"({len(prefix_ids)} prompt tokens > max allowed; truncated prompt to tail {max_prefix} tokens)"
+            )
+            prefix_ids = prefix_ids[-max_prefix:] if max_prefix > 0 else []
+            prefix_mask = prefix_mask[-max_prefix:] if max_prefix > 0 else []
+
+        full_ast_tokens = ast_body_ids + eos_ids
+        total_len = len(prefix_ids) + len(ast_header_ids) + len(full_ast_tokens)
+        if total_len > self.seq_len:
+            self.log(
+                f"[SFT Producer] Message-level splitting required for oversized assistant message "
+                f"({len(ast_body_ids)} body tokens; total turn {total_len} > seq_len={self.seq_len})"
+            )
+
+        room_1 = self.seq_len - len(prefix_ids) - len(ast_header_ids)
+        if room_1 < self.min_assistant_tokens:
+            needed = self.min_assistant_tokens - room_1
+            prefix_ids = prefix_ids[:-needed] if needed < len(prefix_ids) else []
+            prefix_mask = prefix_mask[:-needed] if needed < len(prefix_mask) else []
+            room_1 = self.seq_len - len(prefix_ids) - len(ast_header_ids)
+
+        slice_1 = full_ast_tokens[:room_1]
+        rem_tokens = full_ast_tokens[room_1:]
+
+        c1_ids = prefix_ids + ast_header_ids + slice_1
+        c1_mask = prefix_mask + [0] * len(ast_header_ids) + [1] * len(slice_1)
+        self._validate_tokens(c1_ids)
+
+        c1_cov: set[int] = set()
+        if spans is not None:
+            if self.tokenizer.bos_token_id is not None:
+                c1_cov.add(0)
+            if prefix_indices:
+                for p_idx in prefix_indices:
+                    if p_idx < len(spans):
+                        c1_cov.update(range(spans[p_idx][0], spans[p_idx][1]))
+            if ast_span:
+                ast_start, ast_end = ast_span
+                h_len = len(ast_header_ids)
+                c1_cov.update(
+                    range(ast_start, min(ast_end, ast_start + h_len + len(slice_1)))
+                )
+
+        if sum(c1_mask) >= self.min_assistant_tokens:
+            chunks.append((c1_ids, c1_mask, c1_cov))
+
+        # Subsequent chunks for remaining assistant body tokens
+        cont_header = "assistant:\n"
+        cont_header_ids = self.tokenizer.encode(cont_header, add_special_tokens=False)
+        room_cont = self.seq_len - len(cont_header_ids)
+        ast_body_offset = len(slice_1)
+
+        while rem_tokens:
+            slice_k = rem_tokens[:room_cont]
+            rem_tokens = rem_tokens[room_cont:]
+            ck_ids = cont_header_ids + slice_k
+            ck_mask = [0] * len(cont_header_ids) + [1] * len(slice_k)
+            self._validate_tokens(ck_ids)
+
+            ck_cov: set[int] = set()
+            if spans is not None:
+                if self.tokenizer.bos_token_id is not None:
+                    ck_cov.add(0)
+                if ast_span:
+                    ast_start, ast_end = ast_span
+                    h_len = len(ast_header_ids)
+                    cov_start = ast_start + h_len + ast_body_offset
+                    cov_end = min(ast_end, cov_start + len(slice_k))
+                    ck_cov.update(range(cov_start, cov_end))
+
+            ast_body_offset += len(slice_k)
+            if sum(ck_mask) >= self.min_assistant_tokens:
+                chunks.append((ck_ids, ck_mask, ck_cov))
+
+        return chunks
+
+    def _chunk_conversation(
+        self,
+        messages: list[dict],
+        original_ids: list[int] | None = None,
+        original_mask: list[int] | None = None,
+        *,
+        return_coverage: bool = False,
+    ):
+        """Boundary-aware chunking: splits conversations at message/turn boundaries."""
+        if not messages:
+            return ([], []) if return_coverage else []
+
+        if messages[0].get("role") in {"system", "developer"}:
+            system_msg = messages[0]
+            chat_messages = messages[1:]
+            system_msg_idx = 0
+            chat_start_idx = 1
+        else:
+            system_msg = None
+            chat_messages = messages
+            system_msg_idx = None
+            chat_start_idx = 0
+
+        # Group chat_messages into turns ending with an assistant message
+        turns: list[list[dict]] = []
+        turn_msg_indices: list[list[int]] = []
+        current_turn: list[dict] = []
+        current_indices: list[int] = []
+        for i, msg in enumerate(chat_messages):
+            orig_idx = chat_start_idx + i
+            current_turn.append(msg)
+            current_indices.append(orig_idx)
+            if msg.get("role") == "assistant":
+                turns.append(current_turn)
+                turn_msg_indices.append(current_indices)
+                current_turn = []
+                current_indices = []
+        if current_turn:
+            if turns:
+                turns[-1].extend(current_turn)
+                turn_msg_indices[-1].extend(current_indices)
+            else:
+                turns.append(current_turn)
+                turn_msg_indices.append(current_indices)
+
+        if not turns:
+            return ([], []) if return_coverage else []
+
+        spans = (
+            _compute_message_spans(self.tokenizer, messages)
+            if (original_ids is not None or return_coverage)
+            else None
+        )
+
+        def _get_coverage_for_slice(sys_m, start_t, end_t) -> set[int]:
+            if spans is None:
+                return set()
+            cov: set[int] = set()
+            if self.tokenizer.bos_token_id is not None:
+                cov.add(0)
+            if (
+                sys_m is not None
+                and system_msg_idx is not None
+                and system_msg_idx < len(spans)
+            ):
+                cov.update(range(spans[system_msg_idx][0], spans[system_msg_idx][1]))
+            for t in range(start_t, end_t + 1):
+                if t < len(turn_msg_indices):
+                    for m_idx in turn_msg_indices[t]:
+                        if m_idx < len(spans):
+                            cov.update(range(spans[m_idx][0], spans[m_idx][1]))
+            return cov
+
+        # Check if system message fits within window budget
+        system_msg_to_use = system_msg
+        if system_msg is not None:
+            sys_ids, _ = tokenize_messages(self.tokenizer, [system_msg])
+            if len(sys_ids) >= self.seq_len - self.min_assistant_tokens:
+                system_msg_to_use = None
+
+        def _tokenize_turn_slice(sys_m, turn_list):
+            msgs = ([sys_m] if sys_m else []) + list(
+                itertools.chain.from_iterable(turn_list)
+            )
+            return tokenize_messages(self.tokenizer, msgs)
+
+        raw_chunks: list[tuple[list[int], list[int], set[int]]] = []
+        turn_start = 0
+
+        while turn_start < len(turns):
+            # Check if turn_start itself exceeds seq_len
+            test_ids, _ = _tokenize_turn_slice(system_msg_to_use, [turns[turn_start]])
+            sys_for_turn = system_msg_to_use
+            sys_idx_for_turn = system_msg_idx if sys_for_turn is not None else None
+            if len(test_ids) > self.seq_len and system_msg_to_use is not None:
+                test_ids, _ = _tokenize_turn_slice(None, [turns[turn_start]])
+                sys_for_turn = None
+                sys_idx_for_turn = None
+
+            if len(test_ids) > self.seq_len:
+                # Single turn is oversized -> use dedicated message split
+                split_chunks = self._split_oversized_message(
+                    sys_for_turn,
+                    turns[turn_start],
+                    spans=spans,
+                    system_idx=sys_idx_for_turn,
+                    turn_idxs=turn_msg_indices[turn_start],
+                )
+                raw_chunks.extend(split_chunks)
+                turn_start += 1
+                continue
+
+            # Greedy forward expansion of turns
+            turn_end = turn_start
+            best_ids, best_mask = _tokenize_turn_slice(
+                sys_for_turn, [turns[turn_start]]
+            )
+
+            while turn_end + 1 < len(turns):
+                next_ids, next_mask = _tokenize_turn_slice(
+                    sys_for_turn, turns[turn_start : turn_end + 2]
+                )
+                if len(next_ids) <= self.seq_len:
+                    turn_end += 1
+                    best_ids, best_mask = next_ids, next_mask
+                else:
+                    break
+
+            active_start = turn_start
+            # Handle small final chunk by expanding backward if possible
+            if (
+                turn_end == len(turns) - 1
+                and turn_start > 0
+                and len(best_ids) < self.min_chunk_tokens
+            ):
+                expand_start = turn_start
+                while expand_start > 0:
+                    cand_ids, cand_mask = _tokenize_turn_slice(
+                        sys_for_turn, turns[expand_start - 1 : turn_end + 1]
+                    )
+                    if len(cand_ids) <= self.seq_len:
+                        expand_start -= 1
+                        best_ids, best_mask = cand_ids, cand_mask
+                    else:
+                        break
+                active_start = expand_start
+
+            cov = _get_coverage_for_slice(sys_for_turn, active_start, turn_end)
+            raw_chunks.append((best_ids, best_mask, cov))
+
+            if turn_end >= len(turns) - 1:
+                break
+
+            if self.overlap_turns > 0:
+                next_start = max(turn_start + 1, turn_end - self.overlap_turns + 1)
+            else:
+                next_start = turn_end + 1
+            turn_start = next_start
+
+        # Validate and filter chunks: require min_assistant_tokens
+        valid_chunks: list[tuple[list[int], list[int], set[int]]] = []
+        eff_min_chunk = (
+            min(self.min_chunk_tokens, max(1, self.seq_len // 2))
+            if self.min_chunk_tokens >= self.seq_len
+            else self.min_chunk_tokens
+        )
+        eff_min_asst = (
+            min(self.min_assistant_tokens, max(1, self.seq_len // 4))
+            if self.min_assistant_tokens >= self.seq_len
+            else self.min_assistant_tokens
+        )
+        for c_ids, c_mask, c_cov in raw_chunks:
+            if len(c_ids) > self.seq_len:
+                continue
+            if sum(c_mask) < eff_min_asst:
+                self.stats["chunks_dropped"] += 1
+                continue
+            if len(c_ids) < eff_min_chunk and len(raw_chunks) > 1:
+                self.stats["chunks_dropped"] += 1
+                continue
+            valid_chunks.append((c_ids, c_mask, c_cov))
+
+        if return_coverage:
+            return (
+                [(c[0], c[1]) for c in valid_chunks],
+                [c[2] for c in valid_chunks],
+            )
+        return [(c[0], c[1]) for c in valid_chunks]
+
+    def _calculate_chunk_budget(self, total_chunks: int) -> int:
+        if self.budget_strategy == "fixed":
+            return min(total_chunks, self.max_chunks_per_conversation)
+        if total_chunks <= self.keep_all_threshold:
+            return total_chunks
+        target = math.ceil(total_chunks * self.retention_ratio)
+        effective_min = min(
+            self.min_chunks_per_conversation, self.max_chunks_per_conversation
+        )
+        target = max(target, effective_min)
+        target = min(target, self.max_chunks_per_conversation)
+        return min(target, total_chunks)
+
+    def _stratified_sample_indices(
+        self, total_chunks: int, target_chunks: int
+    ) -> list[int]:
+        if target_chunks >= total_chunks:
+            return list(range(total_chunks))
+        if target_chunks <= 0:
+            return []
+        if target_chunks == 1:
+            return [0]
+        if target_chunks == 2:
+            return [0, total_chunks - 1]
+
+        # Explicitly protect beginning (0) and end (total_chunks - 1)
+        # and stratify remaining (target_chunks - 2) samples across the interior [1, total_chunks - 1)
+        k = target_chunks - 2
+        interior_total = total_chunks - 2
+        interior_indices: list[int] = []
+        for i in range(k):
+            start = 1 + (i * interior_total // k)
+            end = 1 + ((i + 1) * interior_total // k)
+            interior_indices.append(int(self.rng.randint(start, end)))
+        return [0] + interior_indices + [total_chunks - 1]
+
     def _append_conversation(self, messages):
         ids, mask = tokenize_messages(self.tokenizer, messages)
         self._validate_tokens(ids)
+        self.stats["conversations_seen"] += 1
+        self.stats["tokens_seen"] += len(ids)
+
         if len(ids) > self.seq_len:
-            raise ValueError(
-                f"SFT conversation has {len(ids)} tokens, exceeding seq_len={self.seq_len}. "
-                "Increase seq_len within the model's supported context; no silent truncation is applied."
-            )
+            if self.oversized_behavior == "error":
+                raise ValueError(
+                    f"SFT conversation has {len(ids)} tokens, exceeding seq_len={self.seq_len}. "
+                    "Increase seq_len within the model's supported context; no silent truncation is applied."
+                )
+            elif self.oversized_behavior == "truncate":
+                orig_len = len(ids)
+                ids = ids[: self.seq_len]
+                mask = mask[: self.seq_len]
+                if not any(mask[1:]):
+                    with self._lock:
+                        self.cumulative_samples += 1
+                        self.skipped_oversized_samples += 1
+                        self.stats["conversations_filtered"] += 1
+                        self.stats["tokens_dropped"] += orig_len
+                    return
+                with self._lock:
+                    used = len(self.token_buffer) % self.seq_len
+                    if used and used + len(ids) > self.seq_len:
+                        self._pad_window()
+                    self.token_buffer.extend(ids)
+                    self.loss_mask_buffer.extend(mask)
+                    self.cumulative_samples += 1
+                self.stats["conversations_kept_whole"] += 1
+                self.stats["chunks_emitted"] += 1
+                self.stats["unique_source_tokens_retained"] += len(ids)
+                self.stats["tokens_retained"] += len(ids)
+                self.stats["training_tokens_emitted"] += len(ids)
+                self.stats["tokens_dropped"] += max(0, orig_len - len(ids))
+                self.stats["assistant_tokens_retained"] += sum(mask)
+                return
+            elif self.oversized_behavior == "filter":
+                with self._lock:
+                    self.cumulative_samples += 1
+                    self.skipped_oversized_samples += 1
+                self.stats["conversations_filtered"] += 1
+                self.stats["tokens_dropped"] += len(ids)
+                if (
+                    self.skipped_oversized_samples <= 5
+                    or self.skipped_oversized_samples % 100 == 0
+                ):
+                    self.log(
+                        f"[SFT Producer] Skipped oversized conversation ({len(ids)} tokens > "
+                        f"seq_len={self.seq_len}; total skipped: {self.skipped_oversized_samples})"
+                    )
+                return
+            elif self.oversized_behavior == "chunk":
+                self.stats["conversations_chunked"] += 1
+                # Chunk generation preserves dataset/topic mixture weighting because sampling
+                # occurs at the conversation level in _build_stream() before chunking.
+                chunks, coverages = self._chunk_conversation(
+                    messages, original_ids=ids, original_mask=mask, return_coverage=True
+                )
+                chunks_created = len(chunks)
+                self.stats["chunks_created"] += chunks_created
+
+                if not chunks:
+                    self.stats["conversations_filtered"] += 1
+                    self.stats["tokens_dropped"] += len(ids)
+                    with self._lock:
+                        self.cumulative_samples += 1
+                        self.skipped_oversized_samples += 1
+                    return
+
+                target_chunks = self._calculate_chunk_budget(chunks_created)
+
+                if target_chunks < chunks_created:
+                    self.stats["conversations_sampled"] += 1
+                    if (
+                        target_chunks == self.max_chunks_per_conversation
+                        and chunks_created > self.max_chunks_per_conversation
+                    ):
+                        self.stats["conversations_hit_max_cap"] += 1
+                        self.log(
+                            f"[SFT Producer] Capped chunks for conversation "
+                            f"({chunks_created} created -> {target_chunks} emitted, "
+                            f"max_chunks_per_conversation={self.max_chunks_per_conversation})"
+                        )
+                    else:
+                        self.log(
+                            f"[SFT Producer] Sampled chunks for conversation "
+                            f"({chunks_created} created -> {target_chunks} emitted, "
+                            f"budget_strategy={self.budget_strategy}, sampling_strategy={self.sampling_strategy})"
+                        )
+
+                    if self.sampling_strategy == "stratified":
+                        selected_indices = self._stratified_sample_indices(
+                            chunks_created, target_chunks
+                        )
+                    elif self.sampling_strategy == "random":
+                        selected_indices = sorted(
+                            self.rng.choice(
+                                chunks_created,
+                                size=target_chunks,
+                                replace=False,
+                            )
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unknown sampling_strategy: {self.sampling_strategy}"
+                        )
+                    dropped_count = chunks_created - len(selected_indices)
+                    self.stats["chunks_dropped"] += dropped_count
+                    chunks = [chunks[i] for i in selected_indices]
+                    coverages = [coverages[i] for i in selected_indices]
+                else:
+                    self.stats["conversations_keep_all"] += 1
+
+                with self._lock:
+                    for c_ids, c_mask in chunks:
+                        used = len(self.token_buffer) % self.seq_len
+                        if used and used + len(c_ids) > self.seq_len:
+                            self._pad_window()
+                        self.token_buffer.extend(c_ids)
+                        self.loss_mask_buffer.extend(c_mask)
+                    self.cumulative_samples += 1
+
+                covered_indices: set[int] = set()
+                for cov in coverages:
+                    covered_indices.update(cov)
+                unique_source_tokens_conv = len(covered_indices)
+                training_tokens_emitted_conv = sum(len(c_ids) for c_ids, _ in chunks)
+                overlap_tokens_conv = max(
+                    0, training_tokens_emitted_conv - unique_source_tokens_conv
+                )
+                tokens_dropped_conv = max(0, len(ids) - unique_source_tokens_conv)
+                asst_retained_conv = sum(sum(c_mask) for _, c_mask in chunks)
+
+                self.stats["chunks_emitted"] += len(chunks)
+                self.stats["unique_source_tokens_retained"] += unique_source_tokens_conv
+                self.stats["tokens_retained"] += unique_source_tokens_conv
+                self.stats["training_tokens_emitted"] += training_tokens_emitted_conv
+                self.stats["overlap_tokens"] += overlap_tokens_conv
+                self.stats["tokens_dropped"] += tokens_dropped_conv
+                self.stats["assistant_tokens_retained"] += asst_retained_conv
+
+                chunk_retention_pct = (len(chunks) / max(chunks_created, 1)) * 100.0
+                token_retention_pct = (
+                    unique_source_tokens_conv / max(len(ids), 1)
+                ) * 100.0
+                self.log(
+                    f"[SFT Producer] Chunked conversation:\n"
+                    f"  original_tokens={len(ids)}\n"
+                    f"  chunks_created={chunks_created}\n"
+                    f"  budget_strategy={self.budget_strategy}\n"
+                    f"  target_chunks={len(chunks)}\n"
+                    f"  chunks_emitted={len(chunks)}\n"
+                    f"  chunk_retention_ratio={chunk_retention_pct:.1f}%\n"
+                    f"  sampling_strategy={self.sampling_strategy}\n"
+                    f"  unique_source_tokens_retained={unique_source_tokens_conv}\n"
+                    f"  training_tokens_emitted={training_tokens_emitted_conv}\n"
+                    f"  overlap_tokens={overlap_tokens_conv}\n"
+                    f"  tokens_dropped={tokens_dropped_conv}\n"
+                    f"  token_retention_rate={token_retention_pct:.1f}%\n"
+                    f"  assistant_tokens_retained={asst_retained_conv}"
+                )
+                return
+            else:
+                raise ValueError(
+                    f"Unknown oversized_behavior: {self.oversized_behavior}"
+                )
+
         if not any(mask[1:]):
-            raise ValueError("Conversation contains no supervised next-token target")
+            with self._lock:
+                self.cumulative_samples += 1
+            self.stats["conversations_filtered"] += 1
+            self.stats["tokens_dropped"] += len(ids)
+            self.log(
+                "[SFT Producer] Skipping conversation with no supervised next-token target"
+            )
+            return
+
         with self._lock:
             used = len(self.token_buffer) % self.seq_len
             if used and used + len(ids) > self.seq_len:
@@ -541,6 +1306,13 @@ class TokenizedShardProducer:
             self.token_buffer.extend(ids)
             self.loss_mask_buffer.extend(mask)
             self.cumulative_samples += 1
+
+        self.stats["conversations_kept_whole"] += 1
+        self.stats["chunks_emitted"] += 1
+        self.stats["unique_source_tokens_retained"] += len(ids)
+        self.stats["tokens_retained"] += len(ids)
+        self.stats["training_tokens_emitted"] += len(ids)
+        self.stats["assistant_tokens_retained"] += sum(mask)
 
     def _write_shard(self, count):
         # Publish .bin LAST, so the existing queue's *.bin polling is safe.
@@ -616,6 +1388,7 @@ class TokenizedShardProducer:
                         self._pad_window()
                     if self._flush(stop_event, final=True):
                         self.finished = True
+                        self.log(self.get_stats_summary())
                     break
                 self._append_conversation(json.loads(sample["conversation_json"]))
                 if not self._flush(stop_event):

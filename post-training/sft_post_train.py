@@ -29,6 +29,7 @@ reads a SEPARATE directory of held-out SFT shards, scoring assistant tokens only
 from __future__ import annotations
 
 import argparse
+import gc
 import hashlib
 import itertools
 import json
@@ -38,6 +39,16 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
+
+# Disable JAX in Hugging Face datasets to prevent background worker circular imports
+os.environ["USE_JAX"] = "0"
+try:
+    import datasets.config
+
+    datasets.config.JAX_AVAILABLE = False
+except (ImportError, AttributeError):
+    pass
 
 import numpy as np
 import torch
@@ -50,14 +61,17 @@ if str(ROOT) not in sys.path:
 
 import train as pretrain
 from model.core.config import HybridMambaMoEConfig
+from model.hybrid.losses import _aux_loss_schedule, _expert_loss_schedule
 from model.hybrid.model import HybridForCausalLM
 from utils.sft_dataset import (
     DATASET_CONFIGS,
     IGNORE_INDEX,
     MmapShardDataset,
     TokenizedShardProducer,
+    get_dataset_configs,
     verify_tokenizer_vocab,
 )
+from utils.training_logging import format_training_log_line
 
 
 def read_checkpoint(path):
@@ -196,6 +210,29 @@ class ShardFeed:
                 dataset_configs=sources,
                 expected_vocab_size=cfg.vocab_size,
                 log_fn=logger.info,
+                oversized_behavior=getattr(args, "oversized_behavior", "chunk"),
+                overlap_turns=getattr(args, "overlap_turns", 1),
+                budget_strategy=getattr(args, "budget_strategy", "retention_ratio"),
+                retention_ratio=getattr(
+                    args,
+                    "chunk_retention_ratio",
+                    getattr(args, "retention_ratio", 0.25),
+                ),
+                chunk_retention_ratio=getattr(
+                    args,
+                    "chunk_retention_ratio",
+                    getattr(args, "retention_ratio", 0.25),
+                ),
+                keep_all_threshold=getattr(args, "keep_all_threshold", 8),
+                min_chunks_per_conversation=getattr(
+                    args, "min_chunks_per_conversation", 4
+                ),
+                max_chunks_per_conversation=getattr(
+                    args, "max_chunks_per_conversation", 32
+                ),
+                sampling_strategy=getattr(args, "sampling_strategy", "stratified"),
+                min_assistant_tokens=getattr(args, "min_assistant_tokens", 16),
+                min_chunk_tokens=getattr(args, "min_chunk_tokens", 64),
             )
             state_path = self.producer.state_path
             if Path(state_path).exists():
@@ -285,11 +322,61 @@ def runtime_contract(args, cfg, sources, backend, use_muon, tokenizer):
         "sources": sources,
         "tokens_per_shard": args.tokens_per_shard,
         "cache_dir": str(Path(args.cache_dir).resolve()),
+        "oversized_behavior": getattr(args, "oversized_behavior", "chunk"),
+        "overlap_turns": getattr(args, "overlap_turns", 1),
+        "budget_strategy": getattr(args, "budget_strategy", "retention_ratio"),
+        "retention_ratio": getattr(
+            args, "chunk_retention_ratio", getattr(args, "retention_ratio", 0.25)
+        ),
+        "chunk_retention_ratio": getattr(
+            args, "chunk_retention_ratio", getattr(args, "retention_ratio", 0.25)
+        ),
+        "keep_all_threshold": getattr(args, "keep_all_threshold", 8),
+        "min_chunks_per_conversation": getattr(args, "min_chunks_per_conversation", 4),
+        "max_chunks_per_conversation": getattr(args, "max_chunks_per_conversation", 32),
+        "sampling_strategy": getattr(args, "sampling_strategy", "stratified"),
+        "min_assistant_tokens": getattr(args, "min_assistant_tokens", 16),
+        "min_chunk_tokens": getattr(args, "min_chunk_tokens", 64),
     }
 
 
 def restore_training_state(checkpoint, contract, optimizers, schedulers, backend):
-    if checkpoint.get("sft_runtime") != contract:
+    saved_contract = dict(checkpoint.get("sft_runtime", {}))
+    for key, default_val in (
+        ("oversized_behavior", "chunk"),
+        ("overlap_turns", 1),
+        ("budget_strategy", "retention_ratio"),
+        ("retention_ratio", 0.25),
+        ("chunk_retention_ratio", 0.25),
+        ("keep_all_threshold", 8),
+        ("min_chunks_per_conversation", 4),
+        ("max_chunks_per_conversation", 32),
+        ("sampling_strategy", "stratified"),
+        ("min_assistant_tokens", 16),
+        ("min_chunk_tokens", 64),
+    ):
+        if key not in saved_contract:
+            if key == "chunk_retention_ratio":
+                saved_contract[key] = saved_contract.get(
+                    "retention_ratio", contract.get(key, default_val)
+                )
+            elif key == "retention_ratio":
+                saved_contract[key] = saved_contract.get(
+                    "chunk_retention_ratio", contract.get(key, default_val)
+                )
+            else:
+                saved_contract[key] = contract.get(key, default_val)
+    if (
+        "chunk_retention_ratio" in saved_contract
+        and "retention_ratio" not in saved_contract
+    ):
+        saved_contract["retention_ratio"] = saved_contract["chunk_retention_ratio"]
+    if (
+        "retention_ratio" in saved_contract
+        and "chunk_retention_ratio" not in saved_contract
+    ):
+        saved_contract["chunk_retention_ratio"] = saved_contract["retention_ratio"]
+    if saved_contract != contract:
         raise ValueError(
             "SFT resume contract mismatch (model, data, optimizer, schedule or world size); use --pretrained-checkpoint for a fresh weights-only run"
         )
@@ -393,6 +480,14 @@ def accumulated_loss(output, count, global_count, world, microbatches):
     )
 
 
+def _as_double(v: Any) -> torch.Tensor | float:
+    if isinstance(v, torch.Tensor):
+        return v.detach().to(dtype=torch.float64).reshape(())
+    if v is None:
+        return 0.0
+    return float(v)
+
+
 def train_window(model, batches, optimizers, args, backend, step):
     counts = [validate_batch(x, y, model.config.vocab_size) for x, y in batches]
     total = backend.sum(
@@ -400,7 +495,22 @@ def train_window(model, batches, optimizers, args, backend, step):
     )
     for optimizer in optimizers:
         optimizer.zero_grad(set_to_none=True)
-    metrics = torch.zeros(2, device=backend.device, dtype=torch.float64)
+    # sums layout (accumulated on-device, reduced in one collective):
+    #  0: token-weighted CE loss (ce_loss * count)
+    #  1: count of assistant tokens
+    #  2: non-CE regularization terms (loss - ce_loss)
+    #  3: router load-balancing auxiliary loss
+    #  4: router z-loss
+    #  5: memory reconstruction loss (recon)
+    #  6: associative recall auxiliary loss (assoc)
+    #  7: associative key norm regularizer (assoc_norm)
+    #  8: expert specialization loss (expert)
+    #  9: write-gate entropy regularizer (gate)
+    # 10: memory read loss (read)
+    # 11: memory fusion loss (fusion)
+    # 12: SSM state regularization loss (ssm)
+    # 13: memory slot regularization loss (slot)
+    sums = torch.zeros(14, device=backend.device, dtype=torch.float64)
     for i, ((inputs, labels), count) in enumerate(zip(batches, counts)):
         backend.sync_backward(model, i == len(batches) - 1)
         inputs, labels = inputs.to(backend.device), labels.to(backend.device)
@@ -423,15 +533,49 @@ def train_window(model, batches, optimizers, args, backend, step):
         if int(finite) != backend.world:
             raise FloatingPointError("Non-finite SFT loss; optimizer step aborted")
         loss.backward()
-        metrics[0] += output.ce_loss.detach().double() * count
-        metrics[1] += count
+        aux = output.auxiliary_losses
+        sums[0] += _as_double(output.ce_loss) * count
+        sums[1] += count
+        if output.loss is not None and output.ce_loss is not None:
+            sums[2] += _as_double(output.loss - output.ce_loss)
+        sums[3] += _as_double(output.router_aux_loss)
+        sums[4] += _as_double(output.router_z_loss)
+        if aux is not None:
+            sums[5] += _as_double(aux.recon)
+            sums[6] += _as_double(aux.assoc)
+            sums[7] += _as_double(aux.assoc_norm)
+            sums[8] += _as_double(aux.expert)
+            sums[9] += _as_double(aux.gate)
+            sums[10] += _as_double(aux.read)
+            sums[11] += _as_double(aux.fusion)
+            sums[12] += _as_double(aux.ssm)
+            sums[13] += _as_double(aux.slot)
     norm = backend.clip(model, args.max_grad_norm)
     if not torch.isfinite(norm):
         raise FloatingPointError("Non-finite SFT gradient norm; optimizer step aborted")
     for optimizer in optimizers:
         optimizer.step()
-    metrics = backend.sum(metrics)
-    return float(metrics[0] / metrics[1]), int(metrics[1]), float(norm)
+    sums = backend.sum(sums)
+    token_total = max(float(sums[1].item()), 1.0)
+    ce = float(sums[0].item() / token_total)
+    tokens = int(sums[1].item())
+    micro_total = len(batches) * backend.world
+    aux_means = (sums[2:] / micro_total).tolist()
+    scalars = {
+        "loss": float(ce + aux_means[0]),
+        "router_aux_loss": float(aux_means[1]),
+        "router_z_loss": float(aux_means[2]),
+        "recon": float(aux_means[3]),
+        "assoc": float(aux_means[4]),
+        "assoc_norm": float(aux_means[5]),
+        "expert": float(aux_means[6]),
+        "gate": float(aux_means[7]),
+        "read": float(aux_means[8]),
+        "fusion": float(aux_means[9]),
+        "ssm": float(aux_means[10]),
+        "slot": float(aux_means[11]),
+    }
+    return ce, tokens, float(norm), scalars
 
 
 @torch.no_grad()
@@ -480,10 +624,35 @@ def evaluate(model, args, backend):
 
 def run_training(args, backend, logger):
     pretrain.set_seed(args.seed)
-    checkpoint = read_checkpoint(args.resume or args.pretrained_checkpoint)
-    cfg = HybridMambaMoEConfig.from_dict(checkpoint["config"])
-    if cfg.label_ignore_index != IGNORE_INDEX:
-        raise ValueError("SFT shards require config.label_ignore_index=-100")
+    model = None
+    checkpoint = None
+    cfg = None
+    for rank_turn in range(backend.world):
+        if backend.rank == rank_turn:
+            checkpoint = read_checkpoint(args.resume or args.pretrained_checkpoint)
+            cfg = HybridMambaMoEConfig.from_dict(checkpoint["config"])
+            if cfg.label_ignore_index != IGNORE_INDEX:
+                raise ValueError("SFT shards require config.label_ignore_index=-100")
+            # If not resuming, prune optimizer/RNG states immediately to conserve host RAM
+            if not args.resume and isinstance(checkpoint, dict):
+                checkpoint.pop("optimizers", None)
+                checkpoint.pop("schedulers", None)
+                checkpoint.pop("rng_state", None)
+                gc.collect()
+            if model is None:
+                model = HybridForCausalLM(cfg)
+            model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+            checkpoint.pop("model_state_dict", None)
+            if not args.resume:
+                del checkpoint
+                checkpoint = None
+            gc.collect()
+        if (
+            backend.world > 1
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            torch.distributed.barrier()
     args.seq_len = args.seq_len or cfg.max_position_embeddings
     if args.seq_len > cfg.max_position_embeddings:
         raise ValueError("--seq-len exceeds the pretrained model's supported context")
@@ -509,8 +678,8 @@ def run_training(args, backend, logger):
     sources = DATASET_CONFIGS
     if args.dataset_config:
         sources = json.loads(Path(args.dataset_config).read_text(encoding="utf-8"))
-    model = HybridForCausalLM(cfg)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    elif getattr(args, "exclude_topics", None):
+        sources = get_dataset_configs(exclude_topics=args.exclude_topics)
     pretrain.configure_gradient_checkpointing(
         model, args.gradient_checkpointing, logger
     )
@@ -527,7 +696,9 @@ def run_training(args, backend, logger):
         step, shard, offset = restore_training_state(
             checkpoint, contract, optimizers, schedulers, backend
         )
-    del checkpoint
+        del checkpoint
+        gc.collect()
+    ce_smooth = pretrain.RollingAverage(getattr(args, "smooth_window", 20))
     if backend.rank == 0:
         TokenizedShardProducer._atomic_json(
             str(Path(args.run_dir) / "sft_config.json"), contract
@@ -552,40 +723,68 @@ def run_training(args, backend, logger):
                     batches = list(itertools.islice(iterator, args.grad_accum_steps))
                     if not batches:
                         break
-                    ce, tokens, norm = train_window(
+                    step_start = time.perf_counter()
+                    ce, tokens, norm, scalars = train_window(
                         model, batches, optimizers, args, backend, step
                     )
                     for scheduler in schedulers:
                         scheduler.step()
                     step += 1
                     offset += len(batches)
+                    step_time_s = time.perf_counter() - step_start
+                    ce_smooth.update(ce)
+                    val_ce = None
+                    if args.validation_dir and step % args.val_interval == 0:
+                        val_ce = evaluate(model, args, backend)
+                        logger.info(
+                            "SFT validation step=%d assistant_ce=%.5f",
+                            step,
+                            val_ce,
+                        )
                     if backend.rank == 0 and (
                         step == 1 or step % args.log_interval == 0
                     ):
                         record = {
                             "step": step,
+                            "shard_idx": shard,
+                            "loss": scalars["loss"],
                             "ce_loss": ce,
-                            "assistant_tokens": tokens,
+                            "ce_smooth": ce_smooth.mean,
+                            "val_ce_loss": val_ce,
+                            "router_aux_loss": scalars["router_aux_loss"],
+                            "router_z_loss": scalars["router_z_loss"],
+                            "recon": scalars["recon"],
+                            "assoc": scalars["assoc"],
+                            "assoc_scale": _aux_loss_schedule(
+                                step, args.max_steps, cfg.assoc_warmup_fraction
+                            ),
+                            "assoc_norm": scalars["assoc_norm"],
+                            "expert": scalars["expert"],
+                            "expert_scale": _expert_loss_schedule(
+                                step, args.max_steps, cfg.expert_warmup_fraction
+                            ),
                             "grad_norm": norm,
+                            "step_time_s": step_time_s,
+                            "assistant_tokens": tokens,
+                            "adam_lr": float(schedulers[-1].get_last_lr()[0]),
                             "lr": [s.get_last_lr() for s in schedulers],
+                            "gate": scalars["gate"],
+                            "read": scalars["read"],
+                            "fusion": scalars["fusion"],
+                            "ssm": scalars["ssm"],
+                            "slot": scalars["slot"],
                         }
+                        if use_muon:
+                            record["muon_lr"] = float(schedulers[0].get_last_lr()[0])
                         logger.info(
-                            "SFT step=%d ce=%.5f assistant_tokens=%d grad_norm=%.4f",
-                            step,
-                            ce,
+                            "SFT %s tokens=%d",
+                            format_training_log_line(step, args.max_steps, record),
                             tokens,
-                            norm,
                         )
                         with (Path(args.run_dir) / "metrics.jsonl").open(
                             "a", encoding="utf-8"
                         ) as handle:
                             handle.write(json.dumps(record) + "\n")
-                    if args.validation_dir and step % args.val_interval == 0:
-                        logger.info(
-                            "SFT validation step=%d assistant_ce=%.5f",
-                            step,
-                            evaluate(model, args, backend),
-                        )
                     if step % args.save_interval == 0:
                         save_checkpoint(
                             model,
@@ -638,6 +837,74 @@ def parse_args(argv=None, *, distributed=False, description=None):
     parser.add_argument(
         "--dataset-config", help="JSON list of weighted SFT source configs"
     )
+    parser.add_argument(
+        "--exclude-topics",
+        nargs="*",
+        default=None,
+        help="Topics to exclude from default SFT mixture (e.g. --exclude-topics long_context)",
+    )
+    parser.add_argument(
+        "--oversized-behavior",
+        choices=["chunk", "filter", "truncate", "error"],
+        default="chunk",
+        help="Action when conversation tokens exceed seq_len (default: chunk)",
+    )
+    parser.add_argument(
+        "--overlap-turns",
+        type=int,
+        default=1,
+        help="Number of context turns to overlap between chunks (default: 1)",
+    )
+    parser.add_argument(
+        "--budget-strategy",
+        choices=["retention_ratio", "fixed"],
+        default="retention_ratio",
+        help="Chunk budgeting strategy: retention_ratio or fixed (default: retention_ratio)",
+    )
+    parser.add_argument(
+        "--chunk-retention-ratio",
+        "--retention-ratio",
+        dest="chunk_retention_ratio",
+        type=float,
+        default=0.25,
+        help="Fraction of chunks to retain for oversized conversations (default: 0.25)",
+    )
+    parser.add_argument(
+        "--keep-all-threshold",
+        type=int,
+        default=8,
+        help="Maximum chunk count for which all chunks are retained (default: 8)",
+    )
+    parser.add_argument(
+        "--min-chunks-per-conversation",
+        type=int,
+        default=4,
+        help="Minimum chunks retained when sub-sampling (default: 4)",
+    )
+    parser.add_argument(
+        "--max-chunks-per-conversation",
+        type=int,
+        default=32,
+        help="Maximum chunks to retain per oversized conversation (default: 32)",
+    )
+    parser.add_argument(
+        "--sampling-strategy",
+        choices=["stratified", "random"],
+        default="stratified",
+        help="Chunk sub-sampling strategy: stratified or random (default: stratified)",
+    )
+    parser.add_argument(
+        "--min-assistant-tokens",
+        type=int,
+        default=16,
+        help="Minimum supervised assistant tokens required per chunk (default: 16)",
+    )
+    parser.add_argument(
+        "--min-chunk-tokens",
+        type=int,
+        default=64,
+        help="Minimum total tokens required per chunk (default: 64)",
+    )
     parser.add_argument("--offline-shards", action="store_true")
     parser.add_argument(
         "--seq-len",
@@ -687,6 +954,12 @@ def parse_args(argv=None, *, distributed=False, description=None):
     parser.add_argument("--save-interval", type=int, default=100)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument(
+        "--smooth-window",
+        type=int,
+        default=20,
+        help="Window size for rolling-average smoothed CE loss (default: 20)",
+    )
+    parser.add_argument(
         "--validation-dir", help="Separate held-out SFT shard directory"
     )
     parser.add_argument("--val-interval", type=int, default=100)
@@ -702,14 +975,25 @@ def parse_args(argv=None, *, distributed=False, description=None):
         "grad_accum_steps",
         "save_interval",
         "log_interval",
+        "smooth_window",
         "val_interval",
         "val_batches",
         "max_buffered_files",
         "shard_timeout",
         "max_grad_norm",
+        "keep_all_threshold",
+        "min_chunks_per_conversation",
+        "max_chunks_per_conversation",
+        "min_assistant_tokens",
+        "min_chunk_tokens",
     ):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
+    args.retention_ratio = args.chunk_retention_ratio
+    if not (0.0 < args.chunk_retention_ratio <= 1.0):
+        parser.error("--chunk-retention-ratio must be in (0.0, 1.0]")
+    if args.overlap_turns < 0:
+        parser.error("--overlap-turns must be non-negative")
     if args.seq_len is not None and args.seq_len < 1:
         parser.error("--seq-len must be positive")
     if args.tokens_per_shard is not None and args.tokens_per_shard < 2:

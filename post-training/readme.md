@@ -133,9 +133,35 @@ The serialization uses ordinary `role:\n` headers, an optional BOS at conversati
 
 Complete conversations can share a packed window. They share causal attention and are not isolated by a block-diagonal attention mask. A conversation never crosses a storage-window boundary; unused space is padded. The reader returns already shifted `(input_ids, labels)` tensors, so the trainer must not shift labels again.
 
-### Customize sources
+### Customize sources and sequence handling
 
 `--dataset-config path/to/mix.json` replaces the default mixture with a JSON list using the source schema from `utils/sft_dataset.py`. Each weight must be positive and finite, and the weights must sum to one.
+
+`--exclude-topics` allows excluding specific topics from the default mixture without writing a custom JSON file. The remaining topic weights are automatically re-normalized to sum to 1.0:
+```text
+# Exclude long_context for standard 4096-context training to avoid streaming 64k-token samples:
+torchrun --standalone --nproc_per_node=2 post-training/sft_fsdp2_post_train.py \
+    --pretrained-checkpoint model_ckpt --exclude-topics long_context
+```
+
+`--oversized-behavior {chunk,filter,truncate,error}` controls how conversations longer than `--seq-len` are handled:
+* `chunk` (default): Boundary-aware conversation chunking. Splits oversized conversations at message/turn boundaries into valid training chunks (each `<= seq_len`), preserves assistant supervision, and applies configurable turn overlap and chunk-capping.
+* `filter`: Skips the conversation, logs progress, and continues without interrupting training.
+* `truncate`: Truncates tokens and loss mask to `seq_len` (skipping the sample if no supervised assistant tokens remain after truncation).
+* `error`: Raises an explicit `ValueError` (legacy behavior).
+
+When `--oversized-behavior chunk` is enabled, additional options fine-tune chunk generation:
+* `--overlap-turns` (default: `1`): Number of interaction turns to overlap between consecutive chunks to preserve conversational context.
+* `--budget-strategy` (default: `retention_ratio`): Chunk budgeting strategy: `retention_ratio` (adaptive) or `fixed` (legacy).
+* `--chunk-retention-ratio` (alias `--retention-ratio`, default: `0.25`): Fraction of chunks retained for conversations exceeding `keep_all_threshold`.
+* `--keep-all-threshold` (default: `8`): Conversations yielding $\le$ this number of chunks retain 100% of their chunks without downsampling.
+* `--min-chunks-per-conversation` (default: `4`): Minimum chunks retained when downsampling.
+* `--max-chunks-per-conversation` (default: `32`): Upper bound cap on chunks retained per conversation to prevent massive outlier conversations from dominating shard buffers.
+* `--sampling-strategy` (default: `stratified`): Selection strategy when downsampling: `stratified` (always preserves the first chunk `0` and final chunk `total_chunks - 1`, and stratifies remaining samples evenly across the interior) or `random`.
+* `--min-assistant-tokens` (default: `16`): Minimum number of supervised assistant tokens required for a chunk to be kept; chunks without assistant supervision are dropped.
+* `--min-chunk-tokens` (default: `64`): Minimum total tokens required for a chunk; small final turns are expanded backwards into preceding context to avoid emitting micro-fragments.
+* Message-level splitting: If an individual assistant message exceeds `seq_len`, it is split across chunks with continuation headers (`assistant:\n`) while preserving prompt context and assistant loss supervision.
+* Accurate token accounting: Shard statistics and conversation logs separate unique source tokens retained from emitted training tokens, correctly reporting duplicate overlap tokens and preventing artificial zeroing of dropped tokens.
 
 For example, this is a **replacement general-instruction mix**, not the eight-topic default:
 
@@ -168,7 +194,7 @@ runs/sft/
   config.json          # Saved model configuration
   sft_config.json      # Resolved SFT runtime contract
   train.log            # Startup, progress, validation and failure diagnostics
-  metrics.jsonl        # Logged training CE, assistant-token count, norm and LRs
+  metrics.jsonl        # Logged training losses, smoothed CE, auxiliary regularizers, norm, tokens, and LRs
 
 data_cache/sft/
   producer_state.json  # Stream position and buffered tokens/masks
@@ -214,6 +240,16 @@ The scripts do not create a validation split automatically. Choose held-out sour
 | `--muon-gather-buffer-mb` | `64` | Distributed Muon gathered working-set cap in MiB. |
 | `--max-buffered-files` / `--shard-timeout` | `3` / `1800` | Read-ahead limit and shard wait timeout in seconds. |
 | `--save-interval` / `--log-interval` | `100` / `10` | Checkpoint and training-log intervals. |
+| `--oversized-behavior` | `chunk` | Oversized conversation action: `chunk`, `filter`, `truncate`, or `error`. |
+| `--overlap-turns` | `1` | Interaction turns to overlap between consecutive chunks. |
+| `--budget-strategy` | `retention_ratio` | Chunk budgeting strategy: `retention_ratio` or `fixed`. |
+| `--retention-ratio` | `0.25` | Fraction of chunks retained for conversations exceeding `keep_all_threshold`. |
+| `--keep-all-threshold` | `8` | Maximum chunks for which all chunks are retained without downsampling. |
+| `--min-chunks-per-conversation` | `4` | Minimum chunks retained when downsampling. |
+| `--max-chunks-per-conversation` | `32` | Maximum chunks kept per oversized conversation. |
+| `--sampling-strategy` | `stratified` | Chunk downsampling strategy: `stratified` or `random`. |
+| `--min-assistant-tokens` | `16` | Minimum supervised assistant tokens required per chunk. |
+| `--min-chunk-tokens` | `128` | Minimum total tokens required per chunk. |
 | `--seed` | `42` | Training and source/sampler seed. |
 
 See both CLIs for all options:
