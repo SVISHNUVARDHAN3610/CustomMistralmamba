@@ -314,7 +314,7 @@ The memory write path receives direct supervisory signals through eight dedicate
 │ L_gate            │ 1.0e-3      │ Constant     │ -mean(g·log(g+ε) + (1-g)·log(1-g+ε))  │
 │ L_read            │ 5.0e-3      │ Constant     │ max(0, r_min - r_combine)²            │
 │ L_fusion          │ 8.0e-3      │ Constant     │ ‖mean(g_fusion) - 0.5‖² / d           │
-│ L_slot            │ 3.0e-3      │ Constant     │ L_slot_intra + α · L_slot_cross       │
+│ L_slot            │ 0.0         │ Bypassed     │ L_slot_intra + α · L_slot_cross (monitored)│
 │ L_expert          │ 0.0         │ Bypassed     │ L_ortho + β · L_variance (disabled)   │
 │ L_ssm             │ 0.0         │ Bypassed     │ max(0, mean‖h_t‖² - γ) (disabled)     │
 └───────────────────┴─────────────┴──────────────┴───────────────────────────────────────┘
@@ -324,6 +324,7 @@ The memory write path receives direct supervisory signals through eight dedicate
 * **Associative Retrieval Warmup (`_aux_loss_schedule`):** Ramps $\mathcal{L}_{\text{assoc}}$ linearly from $0.0 \to 1.0$ across the first 5% of training steps, allowing memory slots to stabilize before enforcing retrieval error.
 * **Expert Specialization:** Bypassed when `lambda_expert == 0.0` to eliminate VRAM holding overhead and pairwise token cosine calculations.
 * **Associative State Norm Control (T-7):** Persistent $\gamma$ calibrated at step 0 to prevent memory bank activation explosion.
+* **Memory Slot Diversity Monitoring:** Bypassed by default (`lambda_slot == 0.0`) to avoid redundant backprop; slot cosine similarities are computed under `torch.no_grad()` and reported via `gate_stats` monitoring telemetry.
 
 ---
 

@@ -376,8 +376,9 @@ L_total = (
     + lambda_gate * L_gate  # 1e-3
     + lambda_read * L_read  # 5e-3
     + lambda_fusion * L_fusion  # 8e-3
-    + lambda_slot * L_slot  # 3e-3
-    # L_expert (0.0, bypassed) and L_ssm (0.0, bypassed) disabled by default to save VRAM/compute
+    + lambda_slot
+    * L_slot  # 0.0 (bypassed by default; cosine similarities logged as monitoring metrics)
+    # L_expert (0.0, bypassed), L_ssm (0.0, bypassed), and L_slot (0.0, bypassed) disabled by default to save VRAM/compute
 )
 ```
 
@@ -390,8 +391,8 @@ L_total = (
 | Primary | `ce_loss` | 1.0 | Language modeling |
 | Router | `aux_loss`, `z_loss` | ~1e-2 | MoE balance + logit stability |
 | Memory correctness | `L_recon`, `L_assoc` | ~1e-2 | Write-path training + retrieval |
-| Stabilization | `L_assoc_norm`, `L_gate`, `L_read`, `L_fusion`, `L_slot` | ~1e-3 – 8e-3 | Prevent known memory/fusion failure modes |
-| Bypassed | `L_expert`, `L_ssm` | 0.0 | Disabled to save VRAM & redundant FLOPs |
+| Stabilization | `L_assoc_norm`, `L_gate`, `L_read`, `L_fusion` | ~1e-3 – 8e-3 | Prevent known memory/fusion failure modes |
+| Bypassed | `L_expert`, `L_ssm`, `L_slot` | 0.0 | Disabled to save VRAM & redundant FLOPs (L_slot monitored via detached metrics) |
 
 ---
 
@@ -405,7 +406,7 @@ L_total = (
 | 4 | `L_gate` | Write-gate saturation (Test 2) | Moderate | Negligible | Low | 1e-3 | Active |
 | 5 | `L_read` | Combine-layer memory bypass | Moderate | Negligible (weight norm) | Low | 5e-3 | Active |
 | 6 | `L_fusion` | Attention-branch collapse | Moderate (protective) | Negligible | Low | 8e-3 | Active |
-| 7 | `L_slot` | Slot collapse | Moderate (capacity) | Low | Moderate | 3e-3 | Active |
+| 7 | `L_slot` | Slot collapse | Moderate (capacity) | Low | Moderate | 0.0 | Bypassed (monitored) |
 | 8 | `L_expert` | Expert redundancy | Low / Redundant | Moderate (pairwise cos) | Low | 0.0 | Bypassed |
 | 9 | `L_ssm` | Long-context SSM precision | Redundant (SSM contractive)| Negligible | Low | 0.0 | Bypassed |
 

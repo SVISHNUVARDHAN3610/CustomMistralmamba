@@ -16,6 +16,7 @@ from model.hybrid.losses import (
     fusion_balance_loss,
     masked_token_mse,
     memory_slot_diversity_loss,
+    memory_slot_monitoring_stats,
     ssm_state_norm_loss,
     write_gate_entropy_loss,
 )
@@ -440,91 +441,198 @@ class HybridDecoderLayer(nn.Module):
                         new_s_mem,
                         getattr(self, "assoc_norm_gamma", None),
                     ),
+                    **memory_slot_monitoring_stats(
+                        new_a_mem,
+                        new_s_mem,
+                    ),
                 }
 
-                if self.training and self.use_auxiliary_losses:
+                if (
+                    self.training
+                    and self.use_auxiliary_losses
+                    and (
+                        cfg.lambda_recon > 0.0
+                        or cfg.lambda_assoc > 0.0
+                        or cfg.lambda_gate > 0.0
+                        or cfg.lambda_slot > 0.0
+                        or cfg.lambda_assoc_norm > 0.0
+                    )
+                ):
                     # FP16 AMP: recon/gate/slot paths need fp32 attention + logs.
                     with torch.autocast(
                         device_type=buf_attn_cat.device.type, enabled=False
                     ):
-                        buf_a = _promote_fp32(buf_attn_cat)
-                        buf_m = _promote_fp32(buf_mamba_cat)
-                        sum_a = _promote_fp32(a_summary)
-                        sum_s = _promote_fp32(s_summary)
-                        write_valid = (
-                            write_mask.bool() if write_mask is not None else None
-                        )
-                        row_has_valid = (
-                            write_valid.any(dim=-1) if write_valid is not None else None
-                        )
-                        attn_recon_out = self.attn_memory_bank.recon_decoder(
-                            buf_a, sum_a
-                        )
-                        mamba_recon_out = self.state_memory_bank.recon_decoder(
-                            buf_m, sum_s
-                        )
-                        attn_recon_tok = (
-                            (buf_a - attn_recon_out).pow(2).mean(dim=-1).sqrt()
-                        )
-                        mamba_recon_tok = (
-                            (buf_m - mamba_recon_out).pow(2).mean(dim=-1).sqrt()
-                        )
-                        attn_recon = masked_token_mse(
-                            attn_recon_out, buf_a, write_valid
-                        )
-                        mamba_recon = masked_token_mse(
-                            mamba_recon_out, buf_m, write_valid
-                        )
-                        del attn_recon_out, mamba_recon_out
-                        attn_assoc = associative_retrieval_loss(
-                            self.attn_memory_bank,
-                            buf_a,
-                            _promote_fp32(new_a_mem),
-                            attn_recon_tok,
-                            cfg.assoc_sample_count,
-                            write_mask,
-                            err_clip=cfg.assoc_err_clip,
-                        )
-                        mamba_assoc = associative_retrieval_loss(
-                            self.state_memory_bank,
-                            buf_m,
-                            _promote_fp32(new_s_mem),
-                            mamba_recon_tok,
-                            cfg.assoc_sample_count,
-                            write_mask,
-                            err_clip=cfg.assoc_err_clip,
-                        )
-                        gate_loss = write_gate_entropy_loss(
-                            a_write_gate,
-                            cfg.gate_entropy_eps,
-                            row_mask=row_has_valid,
-                            saturation_threshold=cfg.gate_saturation_threshold,
-                            saturation_penalty_weight=cfg.gate_saturation_penalty_weight,
-                        ) + write_gate_entropy_loss(
-                            s_write_gate,
-                            cfg.gate_entropy_eps,
-                            row_mask=row_has_valid,
-                            saturation_threshold=cfg.gate_saturation_threshold,
-                            saturation_penalty_weight=cfg.gate_saturation_penalty_weight,
-                        )
-                        slot_loss = memory_slot_diversity_loss(
-                            new_a_mem,
-                            new_s_mem,
-                            cfg.slot_similarity_margin,
-                            cfg.slot_cross_bank_alpha,
-                        )
+                        # Gated recon and assoc losses.
+                        # Note: attn_recon_tok / mamba_recon_tok (residuals from recon_decoder)
+                        # are consumed as surprise weights by associative_retrieval_loss.
+                        # If lambda_recon == 0.0 but lambda_assoc > 0.0, decoder outputs
+                        # are computed under torch.no_grad() for surprise weights, skipping
+                        # the masked_token_mse reduction and backward graph.
+                        if cfg.lambda_recon > 0.0 or cfg.lambda_assoc > 0.0:
+                            buf_a = _promote_fp32(buf_attn_cat)
+                            buf_m = _promote_fp32(buf_mamba_cat)
+                            sum_a = _promote_fp32(a_summary)
+                            sum_s = _promote_fp32(s_summary)
+                            write_valid = (
+                                write_mask.bool() if write_mask is not None else None
+                            )
+                            if cfg.lambda_recon > 0.0:
+                                attn_recon_out = self.attn_memory_bank.recon_decoder(
+                                    buf_a, sum_a
+                                )
+                                mamba_recon_out = self.state_memory_bank.recon_decoder(
+                                    buf_m, sum_s
+                                )
+                                attn_recon = masked_token_mse(
+                                    attn_recon_out, buf_a, write_valid
+                                )
+                                mamba_recon = masked_token_mse(
+                                    mamba_recon_out, buf_m, write_valid
+                                )
+                                if cfg.lambda_assoc > 0.0:
+                                    attn_recon_tok = (
+                                        (buf_a - attn_recon_out)
+                                        .pow(2)
+                                        .mean(dim=-1)
+                                        .sqrt()
+                                    )
+                                    mamba_recon_tok = (
+                                        (buf_m - mamba_recon_out)
+                                        .pow(2)
+                                        .mean(dim=-1)
+                                        .sqrt()
+                                    )
+                                del attn_recon_out, mamba_recon_out
+                            else:
+                                # lambda_recon == 0.0, but lambda_assoc > 0.0
+                                attn_recon = torch.tensor(
+                                    0.0, device=x.device, dtype=x.dtype
+                                )
+                                mamba_recon = torch.tensor(
+                                    0.0, device=x.device, dtype=x.dtype
+                                )
+                                with torch.no_grad():
+                                    attn_recon_out = (
+                                        self.attn_memory_bank.recon_decoder(
+                                            buf_a, sum_a
+                                        )
+                                    )
+                                    mamba_recon_out = (
+                                        self.state_memory_bank.recon_decoder(
+                                            buf_m, sum_s
+                                        )
+                                    )
+                                    attn_recon_tok = (
+                                        (buf_a - attn_recon_out)
+                                        .pow(2)
+                                        .mean(dim=-1)
+                                        .sqrt()
+                                    )
+                                    mamba_recon_tok = (
+                                        (buf_m - mamba_recon_out)
+                                        .pow(2)
+                                        .mean(dim=-1)
+                                        .sqrt()
+                                    )
+                                    del attn_recon_out, mamba_recon_out
+
+                            if cfg.lambda_assoc > 0.0:
+                                attn_assoc = associative_retrieval_loss(
+                                    self.attn_memory_bank,
+                                    buf_a,
+                                    _promote_fp32(new_a_mem),
+                                    attn_recon_tok,
+                                    cfg.assoc_sample_count,
+                                    write_mask,
+                                    err_clip=cfg.assoc_err_clip,
+                                )
+                                mamba_assoc = associative_retrieval_loss(
+                                    self.state_memory_bank,
+                                    buf_m,
+                                    _promote_fp32(new_s_mem),
+                                    mamba_recon_tok,
+                                    cfg.assoc_sample_count,
+                                    write_mask,
+                                    err_clip=cfg.assoc_err_clip,
+                                )
+                            else:
+                                attn_assoc = torch.tensor(
+                                    0.0, device=x.device, dtype=x.dtype
+                                )
+                                mamba_assoc = torch.tensor(
+                                    0.0, device=x.device, dtype=x.dtype
+                                )
+                        else:
+                            attn_recon = torch.tensor(
+                                0.0, device=x.device, dtype=x.dtype
+                            )
+                            mamba_recon = torch.tensor(
+                                0.0, device=x.device, dtype=x.dtype
+                            )
+                            attn_assoc = torch.tensor(
+                                0.0, device=x.device, dtype=x.dtype
+                            )
+                            mamba_assoc = torch.tensor(
+                                0.0, device=x.device, dtype=x.dtype
+                            )
+
+                        if cfg.lambda_gate > 0.0:
+                            write_valid = (
+                                write_mask.bool() if write_mask is not None else None
+                            )
+                            row_has_valid = (
+                                write_valid.any(dim=-1)
+                                if write_valid is not None
+                                else None
+                            )
+                            gate_loss = write_gate_entropy_loss(
+                                a_write_gate,
+                                cfg.gate_entropy_eps,
+                                row_mask=row_has_valid,
+                                saturation_threshold=cfg.gate_saturation_threshold,
+                                saturation_penalty_weight=cfg.gate_saturation_penalty_weight,
+                            ) + write_gate_entropy_loss(
+                                s_write_gate,
+                                cfg.gate_entropy_eps,
+                                row_mask=row_has_valid,
+                                saturation_threshold=cfg.gate_saturation_threshold,
+                                saturation_penalty_weight=cfg.gate_saturation_penalty_weight,
+                            )
+                        else:
+                            gate_loss = torch.tensor(
+                                0.0, device=x.device, dtype=x.dtype
+                            )
+
+                        if cfg.lambda_slot > 0.0:
+                            slot_loss = memory_slot_diversity_loss(
+                                new_a_mem,
+                                new_s_mem,
+                                cfg.slot_similarity_margin,
+                                cfg.slot_cross_bank_alpha,
+                            )
+                        else:
+                            slot_loss = torch.tensor(
+                                0.0, device=x.device, dtype=x.dtype
+                            )
+
                         # Bound the post-write bank state (ssm_state_norm_loss
                         # analog, T-7). Zero state contributes nothing (hinge at 0),
                         # so a Jamba-like zero-bank start never adds a bias.
-                        assoc_norm_gamma = getattr(self, "assoc_norm_gamma", None)
-                        if assoc_norm_gamma is not None:
-                            assoc_norm_loss = assoc_state_norm_loss(
-                                new_a_mem, assoc_norm_gamma
-                            ) + assoc_state_norm_loss(new_s_mem, assoc_norm_gamma)
+                        if cfg.lambda_assoc_norm > 0.0:
+                            assoc_norm_gamma = getattr(self, "assoc_norm_gamma", None)
+                            if assoc_norm_gamma is not None:
+                                assoc_norm_loss = assoc_state_norm_loss(
+                                    new_a_mem, assoc_norm_gamma
+                                ) + assoc_state_norm_loss(new_s_mem, assoc_norm_gamma)
+                            else:
+                                assoc_norm_loss = torch.tensor(
+                                    0.0, device=x.device, dtype=x.dtype
+                                )
                         else:
                             assoc_norm_loss = torch.tensor(
                                 0.0, device=x.device, dtype=x.dtype
                             )
+
                     layer_aux = HybridLayerAuxLosses(
                         recon=_restore_dtype((attn_recon + mamba_recon) / 2.0, x.dtype),
                         assoc=_restore_dtype((attn_assoc + mamba_assoc) / 2.0, x.dtype),
@@ -562,15 +670,18 @@ class HybridDecoderLayer(nn.Module):
 
         if self.training and self.use_auxiliary_losses:
             read_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
-            if self.use_dual_memory:
+            if self.use_dual_memory and cfg.lambda_read > 0.0:
                 read_loss = combine_read_utilization_loss(
                     self.attn_memory_combine, cfg.read_util_min_fraction
                 ) + combine_read_utilization_loss(
                     self.state_memory_combine, cfg.read_util_min_fraction
                 )
-            fusion_loss = fusion_balance_loss(
-                fusion_gate, target=cfg.fusion_balance_target
-            )
+            if cfg.lambda_fusion > 0.0:
+                fusion_loss = fusion_balance_loss(
+                    fusion_gate, target=cfg.fusion_balance_target
+                )
+            else:
+                fusion_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
             ssm_loss = torch.tensor(0.0, device=x.device, dtype=x.dtype)
             if ssm_state is not None and cfg.lambda_ssm > 0.0:
                 gamma = getattr(self, "ssm_norm_gamma", None)
