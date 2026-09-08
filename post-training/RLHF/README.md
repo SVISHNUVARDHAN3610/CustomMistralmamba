@@ -447,11 +447,20 @@ notebook cell with the repository as the working directory:
 from model.core.config import HybridMambaMoEConfig
 
 HybridMambaMoEConfig(
-    vocab_size=32000, hidden_size=768, num_layers=12,
-    num_heads=8, num_kv_heads=2, head_dim=96, intermediate_size=2048,
-    num_experts=4, top_k=2, dropout=0.0,
-    max_position_embeddings=2048, window_size=2048,
-    use_dual_memory=False, use_auxiliary_losses=False,
+    vocab_size=32000,
+    hidden_size=768,
+    num_layers=12,
+    num_heads=8,
+    num_kv_heads=2,
+    head_dim=96,
+    intermediate_size=2048,
+    num_experts=4,
+    top_k=2,
+    dropout=0.0,
+    max_position_embeddings=2048,
+    window_size=2048,
+    use_dual_memory=False,
+    use_auxiliary_losses=False,
     use_fused_mamba_scan=False,
 ).save_pretrained("reward_tpu_model.json")
 ```
