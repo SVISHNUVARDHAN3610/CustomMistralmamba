@@ -25,6 +25,7 @@ class DataConfig:
     hh_rlhf_weight: float = 75
     max_length: int = 2048
     min_response_tokens: int = 128
+    response_truncation_strategy: str = "head_tail"
     num_workers: int = 0
     buffer_size: int = 3  # maximum unconsumed disk shards
     pairs_per_shard: int = 64
@@ -65,7 +66,12 @@ class SystemConfig:
     save_interval: int = 500
     resume_from_checkpoint: str | None = None
     initial_checkpoint: str | None = None
-    eval_batches: int = 16
+    # Legacy eval_interval remains the fallback for existing configurations.
+    diagnostic_eval_enabled: bool = True
+    diagnostic_eval_pairs: int = 512
+    diagnostic_eval_interval: int | None = None
+    full_eval_enabled: bool = True
+    full_eval_at_checkpoints: bool = False
 
 
 @dataclass
@@ -88,7 +94,11 @@ class RewardConfig:
             ("training", TrainingConfig),
             ("system", SystemConfig),
         ):
-            value[key] = kind(**value.get(key, {}))
+            options = dict(value.get(key, {}))
+            if key == "system":
+                # Old checkpoints remain readable; pair counts replace this cap.
+                options.pop("eval_batches", None)
+            value[key] = kind(**options)
         result = cls(**value)
         result.validate()
         return result
@@ -118,7 +128,8 @@ class RewardConfig:
             self.system.log_interval,
             self.system.eval_interval,
             self.system.save_interval,
-            self.system.eval_batches,
+            self.system.diagnostic_eval_pairs,
+            self.system.diagnostic_eval_interval or self.system.eval_interval,
         ]
         if any(not math.isfinite(x) or x <= 0 for x in positive):
             raise ValueError(
@@ -126,6 +137,17 @@ class RewardConfig:
             )
         if self.data.num_workers < 0 or self.training.weight_decay < 0:
             raise ValueError("num_workers and weight_decay must be nonnegative")
+        if self.system.diagnostic_eval_pairs < 2:
+            raise ValueError(
+                "diagnostic_eval_pairs must allocate at least one pair per source"
+            )
+        if (
+            self.system.diagnostic_eval_interval is not None
+            and self.system.diagnostic_eval_interval <= 0
+        ):
+            raise ValueError("diagnostic_eval_interval must be positive")
+        if self.data.response_truncation_strategy not in ("head", "head_tail"):
+            raise ValueError("response_truncation_strategy must be head or head_tail")
         if not 0 <= self.training.warmup_ratio < 1:
             raise ValueError("warmup_ratio must be in [0, 1)")
         if not 4 <= self.data.max_length <= self.model.max_length:
@@ -147,5 +169,5 @@ def smoke_config(output_dir: str) -> RewardConfig:
     cfg.system.output_dir = output_dir
     cfg.system.precision = "fp32"
     cfg.system.log_interval = cfg.system.eval_interval = cfg.system.save_interval = 1
-    cfg.system.eval_batches = 1
+    cfg.system.diagnostic_eval_pairs = 4
     return cfg

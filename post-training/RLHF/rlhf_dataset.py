@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import random
 import re
+import threading
 import warnings
 from collections import Counter
 from pathlib import Path
@@ -28,6 +30,12 @@ from .config import DataConfig
 
 
 def sources(config: DataConfig, purpose: str = "train") -> list[dict]:
+    if purpose in ("ultrafeedback_test", "hh_rlhf_test"):
+        source = dict(
+            sources(config, "validation")[0 if purpose == "ultrafeedback_test" else 1]
+        )
+        source["weight"] = 1.0
+        return [source]
     if purpose in ("train", "validation"):
         probabilities = config.probabilities()
         return [
@@ -160,10 +168,16 @@ def normalize_preference(row: dict, source: str) -> dict:
         "rejected": rejected,
         "prompt_messages": messages,
         "category": category,
+        "original_split": row.get("split", "unknown")
+        if source == "helpsteer2"
+        else "unknown",
+        "source": source,
     }
 
 
-def tokenize_preference(record: dict, tokenizer, config: DataConfig) -> dict:
+def tokenize_preference(
+    record: dict, tokenizer, config: DataConfig, diagnostics: dict | None = None
+) -> dict:
     """Keep the entire shared prompt; reserve response tokens or filter the pair.
 
     Response overflow retains its beginning and ending, independently per side.
@@ -178,21 +192,133 @@ def tokenize_preference(record: dict, tokenizer, config: DataConfig) -> dict:
         side: tokenizer.encode(record[side], add_special_tokens=False)
         for side in ("chosen", "rejected")
     }
+    if config.response_truncation_strategy not in ("head", "head_tail"):
+        raise ValueError("response_truncation_strategy must be head or head_tail")
+    if tokenizer.eos_token_id is None:
+        raise ValueError("Reward tokenizer requires an EOS token")
+    # A response may already end in an explicit tokenizer EOS spelling.
+    for ids in encoded.values():
+        while ids and ids[-1] == tokenizer.eos_token_id:
+            ids.pop()
     if not all(encoded.values()):
         raise ValueError("Empty tokenized response")
     budget = config.max_length - len(prefix) - 1
     reserve = min(config.min_response_tokens, max(map(len, encoded.values())))
-    if budget < reserve:
+    if diagnostics is not None:
+        diagnostics.update(valid_before_truncation=1)
+    if budget <= 0 or budget < reserve:
+        if diagnostics is not None:
+            diagnostics["insufficient_budget"] = 1
         raise ValueError("Prompt too long to preserve response context")
     for side, ids in encoded.items():
+        original = len(ids)
         if len(ids) > budget:
-            head = (budget + 1) // 2
-            ids = ids[:head] + (ids[-(budget - head) :] if budget > head else [])
+            if config.response_truncation_strategy == "head":
+                ids = ids[:budget]
+            else:
+                head = (budget + 1) // 2
+                ids = ids[:head] + (ids[-(budget - head) :] if budget > head else [])
+        # A head cutoff can land on an internal explicit EOS token too.
+        while ids and ids[-1] == tokenizer.eos_token_id:
+            ids.pop()
+        if diagnostics is not None:
+            diagnostics[f"{side}_truncated"] = int(original > budget)
+            diagnostics[f"{side}_original_length"] = original
+            diagnostics[f"{side}_retained_length"] = len(ids)
+        if not ids:
+            raise ValueError("Empty tokenized response")
         encoded[side] = prefix + ids + [tokenizer.eos_token_id]
     if encoded["chosen"] == encoded["rejected"]:
         raise ValueError("Truncation/tokenization removed the preference difference")
     encoded["category"] = record.get("category", "overall")
+    encoded["original_split"] = record.get("original_split", "unknown")
+    encoded["source"] = record.get("source", "unknown")
     return encoded
+
+
+class LengthStatistics:
+    """Exact count/mean/max and a fixed-memory, locally seeded quantile sample."""
+
+    def __init__(self, capacity=2048):
+        self.capacity, self.count, self.total, self.maximum = capacity, 0, 0, 0
+        self.sample = []
+        self.rng = random.Random(0)
+
+    def add(self, value):
+        self.count += 1
+        self.total += value
+        self.maximum = max(self.maximum, value)
+        if len(self.sample) < self.capacity:
+            self.sample.append(value)
+        else:
+            index = self.rng.randrange(self.count)
+            if index < self.capacity:
+                self.sample[index] = value
+
+    def summary(self):
+        quantiles = (
+            np.quantile(self.sample, [0.5, 0.95, 0.99]) if self.sample else [0, 0, 0]
+        )
+        return {
+            "count": self.count,
+            "mean": self.total / max(1, self.count),
+            "max": self.maximum,
+            "median": float(quantiles[0]),
+            "p95": float(quantiles[1]),
+            "p99": float(quantiles[2]),
+            "quantile_sample_size": len(self.sample),
+            "quantiles_exact": self.count <= self.capacity,
+        }
+
+
+def accounting_summary(config: DataConfig, counts: dict, consumed: dict) -> dict:
+    """Invocation-scoped counts; source draws repeated by all_exhausted count again."""
+    names = ("ultrafeedback", "hh_rlhf")
+    valid_total = sum(counts.get(s, {}).get("valid", 0) for s in names)
+    consumed_total = sum(consumed.get(s, 0) for s in names)
+    result = {
+        "scope": "current invocation (resume starts a new accounting interval)",
+        "configured_weights": dict(
+            zip(names, (config.ultrafeedback_weight, config.hh_rlhf_weight))
+        ),
+        "target_probabilities": dict(zip(names, config.probabilities())),
+        "sources": {},
+    }
+    for name in names:
+        c = dict(counts.get(name, {}))
+        for key in (
+            "raw",
+            "normalized",
+            "filtered",
+            "valid",
+            "tokenized",
+            "valid_before_truncation",
+            "chosen_truncated",
+            "rejected_truncated",
+            "pair_truncated",
+            "both_truncated",
+            "insufficient_budget",
+        ):
+            c.setdefault(key, 0)
+        raw, valid = c.get("raw", 0), c.get("valid", 0)
+        c.update(
+            consumed=consumed.get(name, 0),
+            valid_mixture=valid / max(1, valid_total),
+            consumed_mixture=consumed.get(name, 0) / max(1, consumed_total),
+            retention_rate=valid / max(1, raw),
+            filtering_rate=c.get("filtered", 0) / max(1, raw),
+        )
+        denominator = max(1, c.get("valid_before_truncation", 0))
+        for key in (
+            "chosen_truncated",
+            "rejected_truncated",
+            "pair_truncated",
+            "both_truncated",
+            "insufficient_budget",
+        ):
+            c[f"{key}_rate"] = c.get(key, 0) / denominator
+        result["sources"][name] = c
+    return result
 
 
 def _envelope(row: dict, source: str) -> dict:
@@ -259,6 +385,11 @@ class PreferenceShardProducer(SFTShardProducer, TokenizedShardProducer):
         self.sample_stream = sample_stream
         self.stats = Counter(raw=0, filtered=0, valid=0)
         self.reasons = Counter()
+        self.source_stats = {
+            s: Counter() for s in ("ultrafeedback", "hh_rlhf", "helpsteer2")
+        }
+        self.length_stats = {s: {} for s in self.source_stats}
+        self.stats_lock = threading.Lock()
         cursor = cursor or {}
         self.current_shard_idx = cursor.get("shard", 0)
         self.cumulative_samples = cursor.get("raw_start", 0)
@@ -368,19 +499,41 @@ class PreferenceShardProducer(SFTShardProducer, TokenizedShardProducer):
         )
 
     def _encode_sample(self, sample: dict) -> list:
+        with self.stats_lock:
+            return self._encode_accounted_sample(sample)
+
+    def accounting_snapshot(self):
+        with self.stats_lock:
+            return {s: dict(c) for s, c in self.source_stats.items()}
+
+    def sequence_summary(self):
+        with self.stats_lock:
+            return {
+                s: {key: stats.summary() for key, stats in values.items()}
+                for s, values in self.length_stats.items()
+            }
+
+    def _encode_accounted_sample(self, sample: dict) -> list:
         self.stats["raw"] += 1
+        source_counts = self.source_stats[sample["source"]]
+        source_counts["raw"] += 1
         try:
             record = normalize_preference(
                 json.loads(sample["payload"]), sample["source"]
             )
         except (ValueError, KeyError, TypeError) as exc:
             self.stats["filtered"] += 1
+            source_counts["filtered"] += 1
             self.reasons[str(exc)] += 1
             return []
         # Tokenizer exceptions are serious failures and propagate via self.error.
         # Only our explicit content/truncation checks are filtered.
+        source_counts["normalized"] += 1
+        diagnostics = {}
         try:
-            record = tokenize_preference(record, self.tokenizer, self.config)
+            record = tokenize_preference(
+                record, self.tokenizer, self.config, diagnostics
+            )
         except ValueError as exc:
             if str(exc) not in (
                 "Empty tokenized response",
@@ -389,12 +542,37 @@ class PreferenceShardProducer(SFTShardProducer, TokenizedShardProducer):
             ):
                 raise RuntimeError("Reward tokenizer failed") from exc
             self.stats["filtered"] += 1
+            source_counts["filtered"] += 1
             self.reasons[str(exc)] += 1
             return []
+        finally:
+            for key, value in diagnostics.items():
+                if key.endswith("_length"):
+                    side = key.split("_")[0]
+                    group = (
+                        "truncated"
+                        if diagnostics.get(f"{side}_truncated")
+                        else "complete"
+                    )
+                    lengths = self.length_stats[sample["source"]]
+                    name = f"{group}/{key}"
+                    if name not in lengths:
+                        lengths[name] = LengthStatistics()
+                    lengths[name].add(value)
+                else:
+                    source_counts[key] += value
+            chosen_cut, rejected_cut = (
+                diagnostics.get("chosen_truncated", 0),
+                diagnostics.get("rejected_truncated", 0),
+            )
+            source_counts["both_truncated"] += int(chosen_cut and rejected_cut)
+            source_counts["pair_truncated"] += int(chosen_cut or rejected_cut)
         for side in ("chosen", "rejected"):
             if min(record[side]) < 0 or max(record[side]) >= self.vocab_size:
                 raise ValueError("Tokenizer emitted an out-of-vocabulary reward token")
         self.stats["valid"] += 1
+        source_counts["valid"] += 1
+        source_counts["tokenized"] += 1
         return [record]
 
     def _write_shard(self, count: int) -> None:
@@ -411,6 +589,9 @@ class PreferenceShardProducer(SFTShardProducer, TokenizedShardProducer):
                 "format": "reward-pairs-v1",
                 "offsets": offsets,
                 "categories": categories,
+                "sources": [record["source"] for record in records],
+                "original_splits": [record["original_split"] for record in records],
+                "source_stats": self.accounting_snapshot(),
                 "raw_start": self.raw_start,
                 "raw_end": self.cumulative_samples,
                 "native_start": self.native_start,
@@ -471,6 +652,10 @@ class PreferenceShardDataset(Dataset):
             "chosen": self._data[a:b],
             "rejected": self._data[b:c],
             "category": self.metadata["categories"][index],
+            "source": self.metadata.get("sources", ["unknown"] * len(self))[index],
+            "original_split": self.metadata.get(
+                "original_splits", ["unknown"] * len(self)
+            )[index],
         }
 
     def close(self):
@@ -488,6 +673,8 @@ class PreferenceCollator:
 
     def __call__(self, records: list[dict]) -> dict:
         batch = {"category": [r.get("category", "overall") for r in records]}
+        batch["source"] = [r.get("source", "unknown") for r in records]
+        batch["original_split"] = [r.get("original_split", "unknown") for r in records]
         # One common dynamic width permits a single chosen+rejected model call.
         width = max(len(r[s]) for r in records for s in ("chosen", "rejected"))
         for side in ("chosen", "rejected"):
@@ -526,7 +713,7 @@ def smoke_stream(purpose: str):
                 "response_1": "Correct.",
                 "response_2": "Wrong.",
                 "preference_strength": -1,
-                "split": "validation",
+                "split": "validation" if i % 2 else "train",
             }
             source = "helpsteer2"
         elif i % 2:
@@ -549,5 +736,9 @@ def smoke_stream(purpose: str):
                     {"role": "assistant", "content": "Wrong."},
                 ],
             }
-        rows.append(_envelope(row, source))
+        if purpose not in (
+            "ultrafeedback_test",
+            "hh_rlhf_test",
+        ) or source == purpose.removesuffix("_test"):
+            rows.append(_envelope(row, source))
     return IterableDataset.from_generator(lambda: iter(rows))

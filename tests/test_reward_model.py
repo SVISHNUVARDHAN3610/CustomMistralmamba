@@ -220,6 +220,7 @@ class RewardTests(unittest.TestCase):
                 self.assertEqual(len(dataset), 4)
                 batch = PreferenceCollator(0)([dataset[0], dataset[1]])
                 self.assertEqual(batch["chosen_input_ids"].size(0), 2)
+                self.assertEqual(batch["source"], ["ultrafeedback", "hh_rlhf"])
                 dataset.close()
                 time.sleep(0.1)
                 self.assertEqual(len(list(Path(directory).glob("*.bin"))), 1)
@@ -243,7 +244,16 @@ class RewardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             cfg = smoke_config(str(Path(directory, "continuous")))
             cfg.data.pairs_per_shard = 6  # stop/resume inside the first shard
+            cfg.system.full_eval_at_checkpoints = True
             full = run_training(cfg, smoke=True)
+            self.assertTrue(
+                Path(directory, "continuous", "full_evaluation_1.json").is_file()
+            )
+            cfg_no_eval = smoke_config(str(Path(directory, "no_evaluation")))
+            cfg_no_eval.data.pairs_per_shard = 6
+            cfg_no_eval.system.diagnostic_eval_enabled = False
+            cfg_no_eval.system.full_eval_enabled = False
+            no_eval = run_training(cfg_no_eval, smoke=True)
             cfg = smoke_config(str(Path(directory, "resumed")))
             cfg.data.pairs_per_shard = 6
             first = run_training(cfg, smoke=True, stop_after=1)
@@ -251,11 +261,36 @@ class RewardTests(unittest.TestCase):
             cfg.system.resume_from_checkpoint = first
             final = run_training(cfg, smoke=True)
             self.assertEqual(checkpoint_metadata(final)["step"], 2)
-            a, b = RewardModel(cfg.model), RewardModel(cfg.model)
+            a, b, c = (
+                RewardModel(cfg.model),
+                RewardModel(cfg.model),
+                RewardModel(cfg.model),
+            )
             load_checkpoint(full, a, cfg=cfg)
             load_checkpoint(final, b, cfg=cfg)
+            load_checkpoint(no_eval, c, cfg=cfg)
             for name, value in a.state_dict().items():
                 torch.testing.assert_close(value, b.state_dict()[name], rtol=0, atol=0)
+                torch.testing.assert_close(value, c.state_dict()[name], rtol=0, atol=0)
+            first_diagnostic = json.loads(
+                Path(
+                    directory, "continuous", "diagnostic_evaluation_1.json"
+                ).read_text()
+            )
+            resumed_diagnostic = json.loads(
+                Path(directory, "resumed", "diagnostic_evaluation_2.json").read_text()
+            )
+            for source in first_diagnostic:
+                self.assertEqual(
+                    first_diagnostic[source]["subset_sha256"],
+                    resumed_diagnostic[source]["subset_sha256"],
+                )
+            accounting = json.loads(
+                Path(cfg.system.output_dir, "dataset_accounting.json").read_text()
+            )
+            self.assertEqual(
+                sum(s["consumed"] for s in accounting["sources"].values()), 2
+            )
             result = evaluation_main(
                 [
                     "--checkpoint",
@@ -267,8 +302,11 @@ class RewardTests(unittest.TestCase):
                     str(Path(directory, "evaluation")),
                 ]
             )
-            self.assertEqual(result["pairs"], 2)
-            self.assertTrue(0 <= result["pairwise_accuracy"] <= 1)
+            self.assertEqual(
+                set(result), {"ultrafeedback_test", "hh_rlhf_test", "helpsteer2"}
+            )
+            self.assertEqual(result["helpsteer2"]["pairs"], 2)
+            self.assertTrue(0 <= result["helpsteer2"]["pairwise_accuracy"] <= 1)
             self.assertTrue(Path(cfg.system.output_dir, "metrics.jsonl").is_file())
 
     def test_native_and_fallback_shard_resume(self):

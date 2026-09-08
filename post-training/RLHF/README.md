@@ -1,7 +1,7 @@
 # Mamba reward model stage
 
 This module trains a scalar preference reward model and independently evaluates it
-on HelpSteer2-Preference. It contains no policy optimizer, rollouts, reference
+on UltraFeedback test, HH-RLHF test, and HelpSteer2-Preference. It contains no policy optimizer, rollouts, reference
 policy, vocabulary head, attention, or MoE. Actual training belongs on cloud GPUs.
 The offline development profile uses an **8,513-parameter CPU model**, not the
 production model.
@@ -95,15 +95,68 @@ An additional `prompt_messages` field preserves multi-turn boundaries for the SF
 tokenizer. Missing/empty text, malformed roles, mismatched prompt prefixes,
 identical responses, ties, invalid strengths, and pairs made identical by
 tokenization/truncation are filtered. Raw/filtered/valid counts and reason counts
-are logged per producer invocation; resume starts a new diagnostics interval.
+are logged per producer invocation; resume starts a new accounting interval.
 
 Default maximum length is **2,048 tokens**. The entire prompt and assistant header
 are preserved identically for both branches. Response overflow retains its start
-and end independently. The producer reserves up to 128 response tokens (less for
+and end independently (`data.response_truncation_strategy="head_tail"`). The producer reserves up to 128 response tokens (less for
 short responses) plus EOS. Prompts that cannot fit that reserve are filtered with
 an explicit reason, rather than deleting instructions or the preference signal.
 This deliberate filter can reduce long-context coverage; tune length/reserve for
 the cloud GPU budget. There is no global cross-source deduplication pass.
+
+### Explicit truncation and sequence accounting
+
+`data.max_length` stays **2048**. Response budget is `max_length - len(prompt with
+BOS and role headers) - len(assistant header) - 1 EOS`. Long responses never cause
+the shared prompt to be shortened. The existing minimum-response reserve remains
+`min(min_response_tokens, max(chosen_length, rejected_length))`; pairs below that
+reserve, or with zero response budget, are filtered explicitly. Thus a nearly full
+prompt can be rejected even when a few response tokens would technically fit.
+
+Strategies are `head` (first N tokens) and the unchanged default `head_tail`
+(ceil(N/2) beginning tokens plus floor(N/2) ending tokens). Each side uses its own
+length and the same available budget; the shorter response stays complete. One
+terminal EOS is appended after truncation; existing terminal EOS tokens are removed
+before budgeting to avoid duplication. Empty tokenized responses and pairs made
+identical by truncation are filtered. Padding happens afterwards in the collator.
+Truncation is a deliberate data-processing decision that can remove preference
+evidence, including reasoning/code in the middle; these diagnostics do not establish
+that either strategy is optimal for learning.
+
+Startup logs show **only bounded producer prefetch**, not a full preprocessing pass.
+Per-source counters include chosen/rejected/both/pair truncations and insufficient
+budget filtering. Rates divide by nonempty tokenized pairs before truncation,
+including pairs subsequently rejected for insufficient budget or identical tokens.
+Length summaries separate truncated and complete responses and original/retained
+lengths (response body only, excluding prompt/EOS). Count, mean and max are exact;
+median/p95/p99 use a private seeded reservoir of at most 2048 lengths per group,
+and are labeled approximate above that capacity. Final summaries cover each
+producer invocation. No entire source or unbounded length list is materialized.
+
+### Effective source mixture accounting
+
+`dataset_accounting.json` and the final `Dataset Accounting` log report configured
+35:75 weights, target probabilities, and each source's raw, normalized, filtered,
+valid, tokenized and consumed pair counts. `normalized` means schema validation
+passed; `valid` and `tokenized` mean the final token pair passed all filters.
+Retention is valid/raw; filtering is filtered/raw. Valid and consumed proportions
+are reported separately, since filtering, prefetch and distributed sampler tails
+can change them. No rebalancing is applied: HF probabilities, seed, source order
+and `all_exhausted` behavior remain unchanged.
+
+Raw/normalization/filter/tokenization counts belong to the single rank-zero producer
+and include bounded unconsumed prefetch. Consumed counts are incremented only after
+a training microbatch's backward pass, and summed across disjoint rank samplers;
+DataLoader prefetch and validation do not increment them. Overflow-skipped updates
+still consumed their input pairs. Repeated source draws from `all_exhausted` or new
+epochs count as repeated training exposures, not unique dataset records.
+
+Accounting is explicitly **current invocation only**. Resume regenerates its shard
+boundary and may repeat producer work; resumed consumed counts include only newly
+used batches. Historical counts are not reconstructed or added to checkpoint cursors.
+This preserves the existing checkpoint format and resume semantics; reports from
+different invocations must not be interpreted as a deduplicated lifetime dataset count.
 
 ## Integration with existing infrastructure
 
@@ -171,9 +224,89 @@ The scheduler horizon is the configured cap, not an expensive full-stream count.
 Logs include step, epoch, pairwise loss/accuracy, both mean rewards, mean margin,
 LR, global gradient norm, pair throughput, optimizer-state entry count, scheduler
 step, loss scale, and peak allocated CUDA memory. Rank zero writes `train.log`
-through the existing logger and `metrics.jsonl`. Validation uses only UF/HH test
-splits, defaults to 16 batches every 100 updates, and is clearly labeled validation.
-Its deterministic small prefix is a diagnostic, not a full validation benchmark.
+through the existing logger and `metrics.jsonl`. Periodic validation uses the fixed
+UF/HH diagnostic sets described below; full evaluations have separate reports.
+
+## Diagnostic and full evaluation
+
+Repository-native nested JSON settings under `system`:
+
+```json
+{
+  "diagnostic_eval_enabled": true,
+  "diagnostic_eval_pairs": 512,
+  "diagnostic_eval_interval": 100,
+  "full_eval_enabled": true,
+  "full_eval_at_checkpoints": false
+}
+```
+
+The diagnostic subset is built **once before the training feed starts** using
+independent source feeds: the first 256 valid UF `test_prefs` pairs and 256 valid
+HH `test` pairs in pinned HF source order. A private RNG with `cfg.seed` orders each
+cached subset. For odd totals UF gets the extra pair. Only these tokenized pairs
+are cached (plus the existing bounded feed's transient prefetch); no full source is
+materialized. Insufficient valid pairs raise a clear error. The smoke profile uses
+four diagnostic pairs. This fixed prefix is reproducible but is not a random
+representative sample of the entire benchmark.
+
+Every periodic evaluation uses these exact cached tokens and reports UF and HH
+separately, with `subset_sha256` fingerprints. Rebuilding with the checkpoint's
+pinned revisions/configuration produces the same membership/order regardless of
+training cursor, epoch or RNG state. Python, NumPy, Torch CPU and initialized CUDA
+RNG states and model train/eval mode are restored, including on failure. Diagnostic
+progress is never recorded in a training checkpoint. The optional interval defaults
+to the existing `eval_interval` (100). Legacy `eval_batches` is accepted when reading
+old configurations but no longer controls periodic evaluation.
+
+Full evaluation streams each source separately to exhaustion: UF `test_prefs`, HH
+`test`, HelpSteer2's preference release. It runs at normal training completion by
+default, optionally after saved checkpoints, and independently from the evaluation
+entry point. It does **not** run at every diagnostic interval. `--stop-after` skips
+end-of-training full evaluation when it is only interrupting a longer job.
+HelpSteer2 remains entirely outside training and periodic diagnostic membership.
+Its overall results, original-train/original-validation subsets (when present),
+and existing split/strength categories each have independent statistics.
+
+Reports are written to `diagnostic_evaluation_<step>.json` or
+`full_evaluation_<step>.json`, plus evaluation records in `metrics.jsonl`. Standalone
+evaluation defaults to all three sources and writes `full_evaluation_metrics.json`;
+`--dataset helpsteer2` retains a HelpSteer2-only report. `--max-batches` is a bounded
+sample per source for development, explicitly labeled Sample Evaluation in logs.
+
+### Reward Scale Diagnostics
+
+**Pairwise accuracy remains the primary metric**: the fraction with chosen reward
+strictly greater than rejected reward. Exact ties are incorrect rankings and are
+also reported separately. Accuracy measures ranking quality; it cannot distinguish
+small reward differences from excessively large magnitudes or tails.
+
+Every source/subset report includes `pairs`, `loss`, `pairwise_accuracy`, and:
+
+- `chosen_reward_{mean,std,min,max,p50,p95,p99}`
+- `rejected_reward_{mean,std,min,max,p50,p95,p99}`
+- `margin_{mean,std,min,max,p50,p95,p99}` for chosen minus rejected
+- `fraction_positive_margin`, `fraction_zero_margin`, `fraction_negative_margin`
+- Pooled chosen+rejected `reward_{mean,std,min,max,p50,p95,p99}` within that source
+
+Existing mean metric names remain aliases; `mean_chosen_reward`,
+`mean_rejected_reward`, `mean_reward_margin`, and `std_reward_margin` are also
+provided. The nested `reward_scale_diagnostics` section and labeled log include
+both reward means/stds and margin mean/std/p50/p95/p99. The tiny diagnostic set
+receives these statistics too, without extra work every training step.
+
+Detached rewards move to CPU and accumulate in float64 using stable Chan/Welford
+moments. Standard deviations are population standard deviations (`ddof=0`), including
+zero for a singleton. Exact percentiles use NumPy linear interpolation and in-place
+partitioning of temporary writable memory maps, avoiding a Python list or GPU tensor
+containing all rewards. Disk use is 40 bytes per pair per reported group, released
+even on errors; provision OS temporary storage in the cloud (e.g. `TMPDIR` on Linux).
+Only the current batch and scalar moments need active working RAM.
+
+These natural reward-scale measurements establish a baseline for later PPO reward
+processing; they **do not prove PPO stability**. Outputs remain unrestricted linear
+scalars: there is no normalization, clipping, whitening, sigmoid or tanh added to
+the model, and no changes to the objective or policy optimization.
 
 ## FSDP2, precision, and checkpointing
 
@@ -218,10 +351,13 @@ precision, and compatible dependencies. DCP does not promise cross-version
 compatibility; use the same environment for training and resume. Evaluation can
 load only the model into a new world size, subject to DCP compatibility.
 
-Evaluation uses the same bounded feed and scores identical batches on every rank,
-then reduces totals. This avoids uneven FSDP forward collectives and duplicate-row
+Evaluation uses the same bounded feed and scores identical batches on every rank.
+This avoids uneven FSDP forward collectives and duplicate-row
 bias from padded distributed samplers, at the cost of redundant evaluation compute.
-The reported sample count divides out rank replication. A single-GPU torchrun is
+Rank zero owns each scored pair exactly once and computes the global moments and
+exact percentiles, then broadcasts the small report. Because every rank sees the
+entire evaluation stream, no cross-rank reward gathering or averaging of local
+percentiles is necessary. Counts are independent of world size. A single-GPU torchrun is
 appropriate for standalone evaluation. `--max-batches` explicitly bounds evaluation.
 
 ## Commands
@@ -232,13 +368,14 @@ and safe for a laptop; no distributed group or CUDA training is initialized:
 ```bash
 python post-training/RLHF/train_reward_model.py --count-only
 python -m unittest tests.test_reward_model -v
+python -m unittest tests.test_reward_diagnostics -v
 python post-training/RLHF/train_reward_model.py --smoke --output-dir runs/reward_smoke --stop-after 1
 python post-training/RLHF/train_reward_model.py --smoke --resume runs/reward_smoke/checkpoint-00000001
 python post-training/RLHF/evaluate_reward_model.py --smoke --checkpoint runs/reward_smoke/checkpoint-00000002 --max-batches 1
 ```
 
 Use a fresh output directory for a fresh smoke run. The smoke evaluator uses
-offline HelpSteer2-shaped fixtures; its metric is a software check, not model quality.
+offline UF/HH/HelpSteer2-shaped fixtures; its metric is a software check, not model quality.
 To repeat the tiny live schema check (two rows per source), in PowerShell:
 
 ```powershell
@@ -266,8 +403,11 @@ torchrun --standalone --nproc_per_node=4 post-training/RLHF/train_reward_model.p
 # Resume: saved config supplies the original scheduler and data settings
 torchrun --standalone --nproc_per_node=4 post-training/RLHF/train_reward_model.py --resume runs/reward_model/checkpoint-00000500
 
-# Independent held-out evaluation (omit --max-batches for all preferences)
-torchrun --standalone --nproc_per_node=1 post-training/RLHF/evaluate_reward_model.py --checkpoint runs/reward_model/checkpoint-00000500 --max-batches 32
+# Independent full evaluation of all three sources (cloud only)
+torchrun --standalone --nproc_per_node=1 post-training/RLHF/evaluate_reward_model.py --checkpoint runs/reward_model/checkpoint-00000500
+
+# Optional single-source evaluation
+torchrun --standalone --nproc_per_node=1 post-training/RLHF/evaluate_reward_model.py --checkpoint runs/reward_model/checkpoint-00000500 --dataset helpsteer2
 ```
 
 No cloud training was run during implementation. CPU smoke/checkpoint tests and

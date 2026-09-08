@@ -1,4 +1,4 @@
-"""Independently load a reward checkpoint and score held-out HelpSteer2 preferences."""
+"""Independently score UF test, HH-RLHF test and held-out HelpSteer2 preferences."""
 
 import argparse
 import json
@@ -18,9 +18,11 @@ from RLHF.train_reward_model import (
     RewardBackend,
     checkpoint_metadata,
     evaluate,
+    evaluate_full,
     initialize_tokenizer,
     load_checkpoint,
     load_pretraining_fsdp2,
+    write_evaluation,
 )
 
 
@@ -28,6 +30,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", default="runs/reward_evaluation")
+    parser.add_argument(
+        "--dataset",
+        choices=("all", "ultrafeedback_test", "hh_rlhf_test", "helpsteer2"),
+        default="all",
+    )
     parser.add_argument(
         "--max-batches",
         type=int,
@@ -51,20 +58,30 @@ def main(argv=None):
         tokenizer = initialize_tokenizer(cfg, args.smoke)
         model = backend.wrap(RewardModel(cfg.model), cfg)
         load_checkpoint(args.checkpoint, model, cfg=cfg)
-        result = evaluate(
+        result = (evaluate_full if args.dataset == "all" else evaluate)(
             model,
             cfg,
             tokenizer,
             backend,
-            "helpsteer2",
-            args.smoke,
-            args.max_batches or (2 if args.smoke else None),
+            **({} if args.dataset == "all" else {"purpose": args.dataset}),
+            smoke=args.smoke,
+            max_batches=args.max_batches or (2 if args.smoke else None),
+        )
+        report = result if args.dataset == "all" else {args.dataset: result}
+        write_evaluation(
+            report,
+            cfg,
+            backend,
+            "Full" if args.max_batches is None and not args.smoke else "Sample",
+            "standalone",
         )
         if backend.rank == 0:
-            logger.info("HelpSteer2 %s", json.dumps(result))
-            Path(args.output_dir, "helpsteer2_metrics.json").write_text(
-                json.dumps(result, indent=2), encoding="utf-8"
-            )
+            Path(
+                args.output_dir,
+                "full_evaluation_metrics.json"
+                if args.dataset == "all"
+                else f"{args.dataset}_metrics.json",
+            ).write_text(json.dumps(result, indent=2), encoding="utf-8")
         return result
     finally:
         if torch.distributed.is_initialized():

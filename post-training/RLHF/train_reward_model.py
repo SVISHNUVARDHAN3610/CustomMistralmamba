@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import itertools
 import json
 import os
@@ -11,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import Counter
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
@@ -31,12 +33,14 @@ from transformers import AutoTokenizer
 from model.hybrid.mamba import fused_mamba_scan_available
 from model.hybrid.model import _checkpoint_autocast_contexts
 from RLHF.config import RewardConfig, smoke_config
+from RLHF.evaluation_metrics import RewardStatistics, isolated_evaluation_rng
 from RLHF.reward_model import RewardModel, pairwise_loss, parameter_counts
 from RLHF.rlhf_dataset import (
     PreferenceCollator,
     PreferenceShardDataset,
     PreferenceShardProducer,
     SmokeTokenizer,
+    accounting_summary,
     smoke_stream,
 )
 
@@ -331,16 +335,9 @@ def metric_means(totals):
     return {name: value / values[-1] for name, value in zip(names, values)}
 
 
-@torch.no_grad()
-def evaluate(
-    model, cfg, tokenizer, backend, purpose="validation", smoke=False, max_batches=None
-):
-    """Periodic validation uses UF/HH test splits; HelpSteer2 is standalone only."""
-    was_training = model.training
-    model.eval()
+def evaluation_batches(cfg, tokenizer, backend, purpose, smoke=False, max_batches=None):
+    """Separate bounded source feed; never uses a training feed or its cursor."""
     feed = PreferenceFeed(cfg, tokenizer, backend, purpose, smoke=smoke)
-    totals = torch.zeros(6, device=backend.device, dtype=torch.float64)
-    categories = {}
     batches, shard = 0, 0
     try:
         while max_batches is None or batches < max_batches:
@@ -352,18 +349,7 @@ def evaluate(
             )
             try:
                 for batch in loader:
-                    chosen, rejected = score_batch(model, batch, backend)
-                    totals += metric_sums(chosen, rejected)
-                    for category in set(batch["category"]):
-                        indices = [
-                            i
-                            for i, value in enumerate(batch["category"])
-                            if value == category
-                        ]
-                        categories.setdefault(category, torch.zeros_like(totals))
-                        categories[category] += metric_sums(
-                            chosen[indices], rejected[indices]
-                        )
+                    yield batch
                     batches += 1
                     if max_batches is not None and batches >= max_batches:
                         break
@@ -371,17 +357,210 @@ def evaluate(
                 dataset.close()
             feed.consume(path)
             shard += 1
-        # Identical eval rows on each rank avoid unequal FSDP forward collectives;
-        # averages are unchanged by the common replication factor.
-        result = metric_means(backend.sum(totals))
-        result["pairs"] = int(totals[-1].item() / backend.world)
-        result["categories"] = {
-            k: metric_means(backend.sum(v)) for k, v in sorted(categories.items())
-        }
-        return result
     finally:
         feed.close()
-        model.train(was_training)
+
+
+def build_diagnostic_set(cfg, tokenizer, backend, smoke=False):
+    """Cache fixed source prefixes once: ceil(N/2) UF, floor(N/2) HH pairs.
+
+    Pinned revisions and fixed source order determine membership. A private RNG
+    seeded with cfg.seed orders each tiny subset. Cache identity is content based
+    and independent of training epoch/cursor and checkpoint progress.
+    """
+    result = {}
+    with isolated_evaluation_rng():
+        for purpose, count in zip(
+            ("ultrafeedback_test", "hh_rlhf_test"),
+            (
+                (cfg.system.diagnostic_eval_pairs + 1) // 2,
+                cfg.system.diagnostic_eval_pairs // 2,
+            ),
+        ):
+            rows = []
+            iterator = evaluation_batches(cfg, tokenizer, backend, purpose, smoke)
+            try:
+                for batch in iterator:
+                    for i in range(batch["chosen_input_ids"].size(0)):
+                        row = {
+                            key: batch[key][i]
+                            for key in ("category", "source", "original_split")
+                        }
+                        for side in ("chosen", "rejected"):
+                            row[side] = batch[f"{side}_input_ids"][i][
+                                batch[f"{side}_attention_mask"][i]
+                            ].tolist()
+                        rows.append(row)
+                        if len(rows) == count:
+                            break
+                    if len(rows) == count:
+                        break
+            finally:
+                iterator.close()
+            if len(rows) != count:
+                raise ValueError(
+                    f"{purpose}: requested {count} diagnostic pairs, only {len(rows)} survived filtering"
+                )
+            random.Random(cfg.seed).shuffle(rows)
+            result[purpose] = rows
+    return result
+
+
+@torch.no_grad()
+def evaluate_batches(model, batches, backend):
+    """Global statistics for the existing replicated FSDP evaluation protocol.
+
+    Every rank scores the same rows and executes identical forward collectives.
+    Rank zero owns each observation exactly once, including exact percentiles;
+    only the final small report is broadcast. No rank-local means/percentiles are
+    averaged and no reward arrays are gathered or replicated for statistics.
+    """
+    was_training = model.training
+    groups = {}
+    with isolated_evaluation_rng():
+        model.eval()
+        try:
+            for batch in batches:
+                chosen, rejected = score_batch(model, batch, backend)
+                status = None
+                if backend.rank == 0:
+                    try:
+                        chosen, rejected = (
+                            chosen.detach().cpu(),
+                            rejected.detach().cpu(),
+                        )
+                        if "overall" not in groups:
+                            groups["overall"] = RewardStatistics()
+                        groups["overall"].update(chosen, rejected)
+                        for field, prefix in (
+                            ("category", "category/"),
+                            ("original_split", "original_"),
+                        ):
+                            for value in sorted(set(batch[field])):
+                                if value in ("overall", "unknown"):
+                                    continue
+                                indices = [
+                                    i for i, v in enumerate(batch[field]) if v == value
+                                ]
+                                key = prefix + value
+                                if key not in groups:
+                                    groups[key] = RewardStatistics()
+                                groups[key].update(chosen[indices], rejected[indices])
+                    except Exception as exc:  # noqa: BLE001 -- broadcast rank-zero failures
+                        status = str(exc)
+                status = backend.broadcast(status)
+                if status is not None:
+                    raise RuntimeError(f"Reward evaluation statistics failed: {status}")
+            payload = None
+            if backend.rank == 0:
+                try:
+                    if "overall" not in groups:
+                        raise ValueError("No valid preference pairs were scored")
+                    result = groups["overall"].result()
+                    result["categories"] = {
+                        k.removeprefix("category/"): v.result()
+                        for k, v in sorted(groups.items())
+                        if k.startswith("category/")
+                    }
+                    result["subsets"] = {
+                        k: v.result()
+                        for k, v in sorted(groups.items())
+                        if k.startswith("original_")
+                    }
+                    payload = {"result": result}
+                except Exception as exc:  # noqa: BLE001 -- broadcast rank-zero failures
+                    payload = {"error": str(exc)}
+            payload = backend.broadcast(payload)
+            if "error" in payload:
+                raise RuntimeError(f"Reward evaluation failed: {payload['error']}")
+            return payload["result"]
+        finally:
+            if hasattr(batches, "close"):
+                batches.close()
+            for group in groups.values():
+                group.close()
+            model.train(was_training)
+
+
+def evaluate_diagnostic(model, diagnostic, cfg, tokenizer, backend):
+    result = {}
+    for purpose, rows in diagnostic.items():
+        collate = PreferenceCollator(tokenizer.pad_token_id)
+        batches = (
+            collate(rows[i : i + cfg.training.batch_size])
+            for i in range(0, len(rows), cfg.training.batch_size)
+        )
+        result[purpose] = evaluate_batches(model, batches, backend)
+        result[purpose]["subset_sha256"] = hashlib.sha256(
+            json.dumps(rows, sort_keys=True).encode()
+        ).hexdigest()
+        result[purpose]["evaluation_scope"] = "fixed_diagnostic"
+    return result
+
+
+def evaluate(
+    model, cfg, tokenizer, backend, purpose="validation", smoke=False, max_batches=None
+):
+    """Stream a complete source, or a clearly bounded development sample."""
+    if purpose == "validation":
+        return {
+            name: evaluate(model, cfg, tokenizer, backend, name, smoke, max_batches)
+            for name in ("ultrafeedback_test", "hh_rlhf_test")
+        }
+    result = evaluate_batches(
+        model,
+        evaluation_batches(cfg, tokenizer, backend, purpose, smoke, max_batches),
+        backend,
+    )
+    result["evaluation_scope"] = (
+        "synthetic_fixture"
+        if smoke
+        else ("bounded_sample" if max_batches is not None else "full_split")
+    )
+    return result
+
+
+def evaluate_full(model, cfg, tokenizer, backend, smoke=False, max_batches=None):
+    return {
+        name: evaluate(model, cfg, tokenizer, backend, name, smoke, max_batches)
+        for name in ("ultrafeedback_test", "hh_rlhf_test", "helpsteer2")
+    }
+
+
+def write_evaluation(result, cfg, backend, kind, step):
+    if backend.rank == 0:
+        headline = {
+            name: {
+                "pairs": values["pairs"],
+                "pairwise_accuracy": values["pairwise_accuracy"],
+                "subsets": {
+                    key: {
+                        "pairs": group["pairs"],
+                        "pairwise_accuracy": group["pairwise_accuracy"],
+                    }
+                    for key, group in values["subsets"].items()
+                },
+            }
+            for name, values in result.items()
+        }
+        backend.logger.info(
+            "%s Evaluation step=%s %s", kind, step, json.dumps(headline)
+        )
+        backend.logger.info(
+            "Reward Scale Diagnostics %s",
+            json.dumps({k: v["reward_scale_diagnostics"] for k, v in result.items()}),
+        )
+        path = Path(cfg.system.output_dir)
+        (path / f"{kind.lower()}_evaluation_{step}.json").write_text(
+            json.dumps(result, indent=2), encoding="utf-8"
+        )
+        with (path / "metrics.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {"step": step, "evaluation": kind.lower(), "datasets": result}
+                )
+                + "\n"
+            )
 
 
 def checkpoint_metadata(path):
@@ -456,7 +635,11 @@ def load_checkpoint(
         set_model_state_dict(model, state["model"], options=options)
     else:
         for key in ("seed", "model", "data", "training"):
-            if metadata["config"][key] != cfg.to_dict()[key]:
+            # Fill new observability/default strategy fields for old checkpoints.
+            if (
+                RewardConfig.from_dict(metadata["config"]).to_dict()[key]
+                != cfg.to_dict()[key]
+            ):
                 raise ValueError(f"Resume configuration mismatch: {key}")
         if (
             metadata["world_size"] != backend.world
@@ -604,6 +787,15 @@ def run_training(cfg: RewardConfig, smoke=False, stop_after=None):
             else cfg.training.max_steps
         )
         last_saved = None
+        last_full_eval = None
+        diagnostic = (
+            build_diagnostic_set(cfg, tokenizer, backend, smoke)
+            if cfg.system.diagnostic_eval_enabled
+            else None
+        )
+        source_counts = {s: Counter() for s in ("ultrafeedback", "hh_rlhf")}
+        consumed = Counter()
+        sequence_startup_logged = False
         metrics_path = Path(cfg.system.output_dir) / "metrics.jsonl"
         while cursor["epoch"] < cfg.training.num_epochs and step < target:
             feed = PreferenceFeed(cfg, tokenizer, backend, "train", cursor, smoke)
@@ -636,6 +828,17 @@ def run_training(cfg: RewardConfig, smoke=False, stop_after=None):
                         raw_start=dataset.metadata["raw_start"],
                         native_start=dataset.metadata["native_start"],
                     )
+                    if not sequence_startup_logged and backend.rank == 0:
+                        logger.info(
+                            "RLHF Sequence Statistics (bounded startup prefetch, not full dataset) %s lengths=%s",
+                            json.dumps(
+                                accounting_summary(
+                                    cfg.data, feed.producer.accounting_snapshot(), {}
+                                )
+                            ),
+                            json.dumps(feed.producer.sequence_summary()),
+                        )
+                        sequence_startup_logged = True
                     iterator = iter(loader)
                     try:
                         while step < target:
@@ -659,6 +862,7 @@ def run_training(cfg: RewardConfig, smoke=False, stop_after=None):
                                     chosen.size(0) / count
                                 )
                                 (loss * backend.loss_scale).backward()
+                                consumed.update(batch["source"])
                                 totals += metric_sums(chosen, rejected)
                             grad_norm, updated = backend.optimizer_step(
                                 model, optimizer, cfg.training.gradient_clip_norm
@@ -698,21 +902,21 @@ def run_training(cfg: RewardConfig, smoke=False, stop_after=None):
                                         "a", encoding="utf-8"
                                     ) as handle:
                                         handle.write(json.dumps(record) + "\n")
-                            if step % cfg.system.eval_interval == 0:
-                                result = evaluate(
-                                    model,
-                                    cfg,
-                                    tokenizer,
-                                    backend,
-                                    smoke=smoke,
-                                    max_batches=cfg.system.eval_batches,
+                            if (
+                                diagnostic is not None
+                                and step
+                                % (
+                                    cfg.system.diagnostic_eval_interval
+                                    or cfg.system.eval_interval
                                 )
-                                if backend.rank == 0:
-                                    logger.info(
-                                        "reward validation step=%d %s",
-                                        step,
-                                        json.dumps(result),
-                                    )
+                                == 0
+                            ):
+                                result = evaluate_diagnostic(
+                                    model, diagnostic, cfg, tokenizer, backend
+                                )
+                                write_evaluation(
+                                    result, cfg, backend, "Diagnostic", step
+                                )
                             if step % cfg.system.save_interval == 0:
                                 last_saved = (
                                     Path(cfg.system.output_dir)
@@ -728,6 +932,20 @@ def run_training(cfg: RewardConfig, smoke=False, stop_after=None):
                                     cursor,
                                     step,
                                 )
+                                if (
+                                    cfg.system.full_eval_enabled
+                                    and cfg.system.full_eval_at_checkpoints
+                                ):
+                                    write_evaluation(
+                                        evaluate_full(
+                                            model, cfg, tokenizer, backend, smoke
+                                        ),
+                                        cfg,
+                                        backend,
+                                        "Full",
+                                        step,
+                                    )
+                                    last_full_eval = step
                     finally:
                         del iterator, loader
                         dataset.close()
@@ -741,11 +959,55 @@ def run_training(cfg: RewardConfig, smoke=False, stop_after=None):
                         feed.consume(path)
             finally:
                 feed.close()
+                if backend.rank == 0:
+                    for name, counts in feed.producer.accounting_snapshot().items():
+                        if name in source_counts:
+                            source_counts[name].update(counts)
+                    logger.info(
+                        "RLHF Sequence Statistics (producer invocation) %s",
+                        json.dumps(feed.producer.sequence_summary()),
+                    )
                 feed = None
         final_path = Path(cfg.system.output_dir) / f"checkpoint-{step:08d}"
         if step and final_path != last_saved and not final_path.exists():
             save_checkpoint(
                 final_path, model, optimizer, scheduler, cfg, backend, cursor, step
+            )
+        # A deliberate early stop is an interruption, not end-of-training evaluation.
+        if (
+            cfg.system.full_eval_enabled
+            and last_full_eval != step
+            and (
+                stop_after is None
+                or step >= cfg.training.max_steps
+                or cursor["epoch"] >= cfg.training.num_epochs
+            )
+        ):
+            write_evaluation(
+                evaluate_full(model, cfg, tokenizer, backend, smoke),
+                cfg,
+                backend,
+                "Full",
+                step,
+            )
+        consumed_global = (
+            backend.sum(
+                torch.tensor(
+                    [consumed[s] for s in source_counts],
+                    dtype=torch.int64,
+                    device=backend.device,
+                )
+            )
+            .cpu()
+            .tolist()
+        )
+        if backend.rank == 0:
+            report = accounting_summary(
+                cfg.data, source_counts, dict(zip(source_counts, consumed_global))
+            )
+            logger.info("Dataset Accounting %s", json.dumps(report))
+            Path(cfg.system.output_dir, "dataset_accounting.json").write_text(
+                json.dumps(report, indent=2), encoding="utf-8"
             )
         return str(final_path)
     finally:
