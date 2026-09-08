@@ -419,3 +419,118 @@ checkpoint is included; only development smoke checkpoints can be produced local
 The documented cloud launcher targets one node with multiple GPUs. The reused
 distributed initializer checks world size against local GPU count, so multi-node
 launches require a separate update to that existing utility before they are supported.
+
+## Kaggle TPU v5e-8 entry point
+
+`reward_model_tpu_train.py` is an opt-in **hybrid Mamba–Attention–MoE** reward
+trainer for a single TPU host with eight devices. The GPU trainer above still uses
+the pure-Mamba reward model. The TPU model reuses `HybridModel` embeddings,
+`HybridDecoderLayer`, normalization, attention, Mamba, fusion and expert weights,
+and adds a scalar linear head at the last valid token. It has no vocabulary head.
+It uses the existing pairwise logistic loss, AdamW (LR `1e-5`, betas `0.9/0.95`,
+constant LR), clipping and configurable gradient accumulation.
+
+Supply a repository-native `HybridMambaMoEConfig` JSON. Set
+`use_dual_memory=false`, `use_auxiliary_losses=false`, `capacity_factor=null`
+and `use_torch_compile=false`: this entry supports stateless hybrid reward
+scoring, not persistent memory or auxiliary policy training. CUDA fused scans
+are disabled in the TPU adapter. Model dimensions come from your JSON and the
+actual parameter count is logged before training; there is no implicit enormous
+policy-model default. `--backbone-weights` optionally loads a **bare
+`HybridModel.state_dict()`** on CPU before device placement. It does not accept
+a full LM wrapper or a GPU distributed checkpoint directory.
+
+Create an appropriately sized starting configuration, for example in a Kaggle
+notebook cell with the repository as the working directory:
+
+```python
+from model.core.config import HybridMambaMoEConfig
+
+HybridMambaMoEConfig(
+    vocab_size=32000, hidden_size=768, num_layers=12,
+    num_heads=8, num_kv_heads=2, head_dim=96, intermediate_size=2048,
+    num_experts=4, top_k=2, dropout=0.0,
+    max_position_embeddings=2048, window_size=2048,
+    use_dual_memory=False, use_auxiliary_losses=False,
+    use_fused_mamba_scan=False,
+).save_pretrained("reward_tpu_model.json")
+```
+
+The Dataset is already preprocessed. A `--dataset-factory module:callable` returns
+a deterministic, map-style PyTorch Dataset. Each item contains **unpadded integer
+token sequences**, `{"chosen": [...], "rejected": [...]}`, including the shared
+formatted prompt and terminal EOS, exactly as `PreferenceShardDataset` returns.
+An existing shard can be used directly through that class as the factory. For
+multiple shards, your factory can return a PyTorch `ConcatDataset` of them.
+No full Dataset is loaded or tokenized by this entry. Keep HelpSteer2 out of the
+training Dataset; its contents and source mixture remain the caller's existing
+preprocessing responsibility.
+
+`FixedPreferenceCollator` calls the existing `PreferenceCollator`, removes
+non-tensor metadata from device transfers, and pads to `--sequence-length`
+(default 256). It rejects empty/overlength/out-of-vocabulary records rather than
+silently truncating preprocessed preferences. Prepare longer data upstream or
+explicitly increase that option within the model's window and RoPE limits.
+Global batch size defaults to eight pairs and must be divisible by eight.
+The per-epoch incomplete batch is dropped to keep compilation shapes constant;
+a partial final gradient-accumulation window is scaled by its actual batch count.
+Each pair is visited once per epoch's shuffled index order, apart from that
+explicit dropped tail. Preprocessing must be deterministic for exact resume.
+
+Install matching Linux TPU builds of `torch` and `torch_xla` (same major/minor,
+2.6 or newer), plus the repository's dataset dependencies, using the official
+[XLA installation instructions](https://docs.pytorch.org/xla/master/learn/quickstart.html).
+Restart the Kaggle kernel after changing runtime packages, and launch a fresh
+Python process once. The script selects PJRT TPU, calls `runtime.use_spmd()`
+before `xm.xla_device()`, verifies eight locally addressable devices, and builds
+an eight-way `fsdp` mesh. `torch.distributed` is aliased as `xla_dist` for
+`init_process_group("gloo", init_method="xla://")`; this only coordinates the host.
+The old `torch_xla.distributed.xla_dist` launcher has no SPMD initialization API.
+
+There is no generic `SPMD(model, optimizer)` wrapper in the supported API.
+Instead, parameters and Adam moments receive matching `mark_sharding`
+annotations, layer activations and input batches are partitioned across the
+mesh, and the XLA compiler generates the required TPU gradient collectives.
+No DDP sampler, eight Python replicas or extra `xm.optimizer_step` reduction is
+used. The existing XLA `ParallelLoader` provides bounded background uploads.
+BF16 autocast preserves FP32 optimizer weights/moments and sensitive Mamba
+computations; do **not** set `XLA_USE_BF16`, `XLA_DOWNCAST_BF16` or legacy
+`XLA_TPU_ENABLE_XRT`. The script rejects these flags. Activation checkpointing
+uses XLA's RNG-aware checkpoint helper and can be disabled with
+`--no-activation-checkpointing`.
+
+The TPU-local MoE adapter computes experts at fixed shapes and masks their
+outputs with the original top-k router weights. This preserves the dropless
+mixture and avoids variable-size token indexing, at the cost of evaluating
+unselected experts. CPU tests compare outputs and gradients to the original
+dispatch. This is a compatibility baseline: fused TPU MoE/scan performance,
+compilation time and peak memory still require measurement on Kaggle.
+
+```bash
+# Kaggle only: one process controls all eight devices. Use your Dataset factory.
+python post-training/RLHF/reward_model_tpu_train.py --model-config reward_tpu_model.json --dataset-factory my_data:make_train_dataset --dataset-kwargs '{}' --output-dir /kaggle/working/reward_tpu
+
+# Resume with the SAME model, Dataset and training settings.
+python post-training/RLHF/reward_model_tpu_train.py --model-config reward_tpu_model.json --dataset-factory my_data:make_train_dataset --dataset-kwargs '{}' --output-dir /kaggle/working/reward_tpu --resume /kaggle/working/reward_tpu/latest.pth
+
+# Laptop: only a built-in 6,417-parameter CPU fixture, at most two steps.
+python post-training/RLHF/reward_model_tpu_train.py --smoke --output-dir runs/reward_tpu_smoke
+python -m unittest tests.test_reward_tpu_train -v
+```
+
+`latest.pth` is atomically replaced at save intervals and completion. It contains
+the model, Adam state, configuration, step/epoch/next-batch cursor, and Python,
+Torch and XLA RNG state. The deterministic sampler resumes from the next index
+without fetching preceding examples. To extend a finished run, increase
+`--max-steps` and/or `--epochs`. Dataset content must stay identical: factory
+arguments and Dataset length are checked, but content is not hashed.
+`xm.save` gathers checkpoint tensors to the **sole host**, so checkpointing
+requires enough CPU RAM for the model and optimizer state. It does not gather
+copies onto each TPU core. This hybrid TPU checkpoint family is distinct from
+the pure-Mamba GPU DCP checkpoints and the existing GPU evaluation CLI.
+For scoring, construct `TPURewardModel` from the saved `config`, load its `model`
+state dict, call `eval()`, and supply token IDs and nonempty right-padding masks.
+
+Local validation uses tiny CPU fixtures only. No TPU compilation, eight-device
+execution, BF16 XLA backward, or TPU checkpoint round trip has been validated on
+the development laptop. Run a short Kaggle job before committing to long training.
