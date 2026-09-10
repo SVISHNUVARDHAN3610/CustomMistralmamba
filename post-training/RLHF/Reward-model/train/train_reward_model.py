@@ -18,24 +18,19 @@ from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
-ROOT = Path(__file__).resolve().parents[2]
-for directory in (ROOT, ROOT / "post-training"):
+ROOT = Path(__file__).resolve().parents[4]
+REWARD_MODEL_DIR = ROOT / "post-training" / "RLHF" / "Reward-model"
+for directory in (ROOT, ROOT / "post-training", REWARD_MODEL_DIR):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 os.environ["USE_JAX"] = "0"
 
 import sft_post_train as sft
 import torch
-from sft_fsdp2_post_train import load_pretraining_fsdp2
-from torch.utils.data import DataLoader, DistributedSampler, Subset
-from transformers import AutoTokenizer
-
-from model.hybrid.mamba import MambaBlock, fused_mamba_scan_available
-from model.hybrid.model import _checkpoint_autocast_contexts
-from RLHF.config import RewardConfig, smoke_config
-from RLHF.evaluation_metrics import RewardStatistics, isolated_evaluation_rng
-from RLHF.reward_model import RewardModel, pairwise_loss, parameter_counts
-from RLHF.rlhf_dataset import (
+from config import RewardConfig, smoke_config
+from evaluation_metrics import RewardStatistics, isolated_evaluation_rng
+from reward_model import RewardModel, pairwise_loss, parameter_counts
+from rlhf_dataset import (
     PreferenceCollator,
     PreferenceShardDataset,
     PreferenceShardProducer,
@@ -43,6 +38,12 @@ from RLHF.rlhf_dataset import (
     accounting_summary,
     smoke_stream,
 )
+from sft_fsdp2_post_train import load_pretraining_fsdp2
+from torch.utils.data import DataLoader, DistributedSampler, Subset
+from transformers import AutoTokenizer
+
+from model.hybrid.mamba import MambaBlock, fused_mamba_scan_available
+from model.hybrid.model import _checkpoint_autocast_contexts
 
 FAMILY = "pure_mamba_reward_dcp_v1"
 

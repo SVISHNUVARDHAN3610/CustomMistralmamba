@@ -6,7 +6,9 @@ through Module.__call__; no inference cache or old-policy model is retained.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -16,7 +18,11 @@ from model.core.config import HybridMambaMoEConfig
 from model.hybrid.model import HybridForCausalLM
 from model.layers.sampling import top_k_filter, top_p_filter
 
-from .config import PPOConfig
+REWARD_MODEL_DIR = Path(__file__).resolve().parent / "Reward-model"
+if str(REWARD_MODEL_DIR) not in sys.path:
+    sys.path.insert(0, str(REWARD_MODEL_DIR))
+
+from config import PPOConfig
 
 
 class PolicyValueModel(HybridForCausalLM):

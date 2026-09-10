@@ -26,7 +26,10 @@ from utils.dataset import TokenizedShardProducer
 from utils.sft_dataset import TokenizedShardProducer as SFTShardProducer
 from utils.sft_dataset import tokenize_messages
 
-from .config import DataConfig
+try:
+    from .config import DataConfig
+except (ImportError, ValueError):
+    from config import DataConfig
 
 
 def sources(config: DataConfig, purpose: str = "train") -> list[dict]:

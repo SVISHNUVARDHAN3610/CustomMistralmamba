@@ -15,28 +15,26 @@ from pathlib import Path
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
-for directory in (ROOT, ROOT / "post-training"):
+REWARD_MODEL_DIR = Path(__file__).resolve().parent / "Reward-model"
+TRAIN_DIR = REWARD_MODEL_DIR / "train"
+for directory in (ROOT, ROOT / "post-training", REWARD_MODEL_DIR, TRAIN_DIR):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
 import torch
-from torch.utils.data import DataLoader, DistributedSampler, Subset
-
-from model.core.config import HybridMambaMoEConfig
-from model.hybrid.mamba import fused_mamba_scan_available
-from model.hybrid.model import HybridForCausalLM
-from RLHF.config import PPOConfig, RewardConfig, smoke_config
-from RLHF.evaluation_metrics import isolated_evaluation_rng
-from RLHF.ppo import (
+from config import PPOConfig, RewardConfig, smoke_config
+from evaluation_metrics import isolated_evaluation_rng
+from ppo import (
     PolicyValueModel,
     Rollout,
     assert_frozen,
     collect_rollout,
     ppo_objective,
 )
-from RLHF.ppo_dataset import PromptShardDataset, prompt_collator, prompt_feed
-from RLHF.reward_model import RewardModel, parameter_counts
-from RLHF.train_reward_model import (
+from ppo_dataset import PromptShardDataset, prompt_collator, prompt_feed
+from reward_model import RewardModel, parameter_counts
+from torch.utils.data import DataLoader, DistributedSampler, Subset
+from train_reward_model import (
     RewardBackend,
     checkpoint_metadata,
     initialize_tokenizer,
@@ -46,6 +44,10 @@ from RLHF.train_reward_model import (
     save_checkpoint,
     sft,
 )
+
+from model.core.config import HybridMambaMoEConfig
+from model.hybrid.mamba import fused_mamba_scan_available
+from model.hybrid.model import HybridForCausalLM
 
 FAMILY = "hybrid_ppo_dcp_v1"
 

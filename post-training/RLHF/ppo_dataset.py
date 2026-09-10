@@ -1,17 +1,27 @@
 """Prompt-only storage adapter on the existing RLHF/SFT bounded shard pipeline."""
 
 import json
+import sys
 from functools import partial
+from pathlib import Path
 
 import numpy as np
 from datasets import IterableDataset
 
-from RLHF.rlhf_dataset import (
+ROOT = Path(__file__).resolve().parents[2]
+REWARD_MODEL_DIR = Path(__file__).resolve().parent / "Reward-model"
+TRAIN_DIR = REWARD_MODEL_DIR / "train"
+for directory in (ROOT, ROOT / "post-training", REWARD_MODEL_DIR, TRAIN_DIR):
+    if str(directory) not in sys.path:
+        sys.path.insert(0, str(directory))
+
+from rlhf_dataset import (
     PreferenceShardDataset,
     PreferenceShardProducer,
     load_streaming_source,
 )
-from RLHF.train_reward_model import PreferenceFeed
+from train_reward_model import PreferenceFeed
+
 from utils.sft_dataset import tokenize_messages
 
 

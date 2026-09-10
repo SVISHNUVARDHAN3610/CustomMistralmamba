@@ -21,13 +21,15 @@ from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-for directory in (ROOT, ROOT / "post-training"):
+ROOT = Path(__file__).resolve().parents[4]
+REWARD_MODEL_DIR = ROOT / "post-training" / "RLHF" / "Reward-model"
+for directory in (ROOT, ROOT / "post-training", REWARD_MODEL_DIR):
     if str(directory) not in sys.path:
         sys.path.insert(0, str(directory))
 
 import torch
 import torch.nn.functional as F
+from reward_model import pairwise_loss
 from torch import Tensor, nn
 from torch.utils.data import (
     DataLoader,
@@ -40,7 +42,6 @@ from torch.utils.data import (
 from model.core.config import HybridMambaMoEConfig
 from model.hybrid.model import HybridModel
 from model.layers.moe import DroplessMoELayer
-from RLHF.reward_model import pairwise_loss
 
 LOGGER = logging.getLogger("reward_tpu")
 CHECKPOINT_FAMILY = "hybrid_reward_xla_spmd_v1"
@@ -167,7 +168,7 @@ class FixedPreferenceCollator:
         )
 
     def __call__(self, records: list[dict]) -> dict[str, Tensor]:
-        from RLHF.rlhf_dataset import PreferenceCollator
+        from rlhf_dataset import PreferenceCollator
 
         for record in records:
             for side in ("chosen", "rejected"):

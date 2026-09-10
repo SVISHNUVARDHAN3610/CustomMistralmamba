@@ -10,17 +10,23 @@ import threading
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-for directory in (ROOT, ROOT / "post-training"):
-    if str(directory) not in sys.path:
-        sys.path.insert(0, str(directory))
+ROOT = Path(__file__).resolve().parents[3]
+REWARD_MODEL_DIR = ROOT / "post-training" / "RLHF" / "Reward-model"
+TRAIN_DIR = REWARD_MODEL_DIR / "train"
+if str(ROOT) in sys.path:
+    sys.path.remove(str(ROOT))
+sys.path.insert(0, str(ROOT))
+
+for directory in (ROOT / "post-training", REWARD_MODEL_DIR, TRAIN_DIR):
+    dir_str = str(directory)
+    if dir_str not in sys.path:
+        sys.path.append(dir_str)
 
 import torch
-
-from RLHF.config import RewardConfig
-from RLHF.reward_model import RewardModel, pairwise_loss, parameter_counts
-from RLHF.rlhf_dataset import PreferenceShardProducer
-from RLHF.train_reward_model import (
+from config import RewardConfig
+from reward_model import RewardModel, pairwise_loss, parameter_counts
+from rlhf_dataset import PreferenceShardProducer
+from train_reward_model import (
     PreferenceFeed,
     RewardBackend,
     initialize_tokenizer,

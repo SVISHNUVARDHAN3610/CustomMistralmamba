@@ -11,7 +11,10 @@ from model.hybrid.mamba import MambaBlock
 from model.hybrid.model import _checkpoint_autocast_contexts
 from model.layers.norm import RMSNorm
 
-from .config import ModelConfig
+try:
+    from .config import ModelConfig
+except (ImportError, ValueError):
+    from config import ModelConfig
 
 
 class RewardLayer(nn.Module):
