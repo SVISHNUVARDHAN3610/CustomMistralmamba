@@ -1,8 +1,239 @@
-# Mamba reward model stage
+# Reward modelling and PPO policy alignment
+
+## PPO policy stage
+
+`train_reward_model.py` trains the existing **352,798,721-parameter pure-Mamba
+Reward Model**. `train_rlhf.py` starts from an actual repository SFT checkpoint
+and performs policy optimization. The architecture/loss/35:75 sampling and
+consumer-owned resume behavior of Reward Model training remain intact.
+
+```text
+SFT checkpoint -> hybrid policy + Linear(hidden_size, 1) value head
+               -> frozen hybrid reference (no value head)
+RM checkpoint  -> frozen pure-Mamba scalar reward model
+
+prompt -> sampled policy response -> frozen RM score
+       -> recorded old policy logprobs + frozen reference logprobs
+       -> token KL penalty + terminal RM score -> GAE -> clipped PPO updates
+```
+
+The value head estimates each state **before** its generated token. Prompt and
+padding positions never enter the objective. EOS itself contributes; all tokens
+after it are masked. The configured maximum response length is a finite episode
+horizon, so both EOS and length cutoff bootstrap with zero. Rewards remain raw,
+unrestricted scalars: no whitening, normalization, clipping, or sigmoid output.
+
+For each action, `KL_t = log pi_old(a_t|s_t) - log pi_ref(a_t|s_t)` is a sampled
+log-ratio estimator. It can be negative for individual tokens/batches. Rewards are
+`-kl_beta * KL_t` at every response token, with the RM score added **once**, at the
+last active action. Both policies use the configured temperature. GAE uses
+`gamma=1`, `gae_lambda=0.95` by default, and optional advantage normalization uses
+global response-token moments. Return targets are formed before normalization.
+
+The loss is clipped PPO policy loss + `value_loss_coef` times clipped squared
+value loss (including its 1/2 factor) - `entropy_coef` times categorical entropy.
+Policy/value clip ranges default to 0.2; value coefficient is 0.5; entropy
+coefficient is 0. The rollout is detached, kept on CPU between phases, shuffled
+for `ppo_epochs`, then discarded. Old probabilities are never recomputed from an
+updated policy. Accumulation is weighted by the **global valid token count**,
+including partial accumulation windows.
+
+The adapter retains the hybrid attention/Mamba/MoE/memory modules and LM head.
+It replays prefixes using SFT's fixed memory chunks with differentiable memory
+between chunks, starting fresh each episode. Dropout and auxiliary losses are
+disabled by evaluation mode during both generation and PPO replay; autograd is
+enabled for policy updates. The reference and RM remain frozen and are checked
+after each update. No separate large critic or old-policy copy is allocated.
+
+The native `generate()` calls `self.forward()` directly and performs rank-local
+early exit. PPO therefore uses an FSDP-safe adapter calling `model(...)` for a
+fixed number of steps across ranks, reusing native token-sampling helpers. Tokens
+replace right-padding immediately, preserving the Mamba mask contract. Fixed
+context shapes also keep memory-chunk collective counts equal across ranks.
+This prefix-replay path is deliberately slower than incremental cache decoding;
+it ensures rollout/replay use the same SFT memory semantics. Cached PPO decoding
+is not implemented. Budget cloud memory/throughput using the preflight first.
+
+Production PPO uses full-support sampling (`do_sample=true`, `top_p=1`,
+`top_k=null`). Temperature is configurable. Greedy/top-k/nucleus options are
+supported by the standalone `sample_tokens` helper for diagnostic decoding, but
+rejected for PPO updates: changing hard sampling support can invalidate finite
+importance ratios. Fixed seeds provide deterministic debug sampling without
+making the behavior policy greedy. Capacity-limited, batch-dependent MoE routing
+is likewise rejected for PPO.
+
+### Prompt data and configuration
+
+The default is the **prompt column only** from UltraChat `train_gen`; policy
+diagnostics use `test_gen`. Config is `default`. The upstream
+[UltraChat dataset card](https://huggingface.co/datasets/HuggingFaceH4/ultrachat_200k)
+explicitly provides these splits for generation/PPO. No recorded assistant
+response is used as a rollout target. HelpSteer2 is rejected as a PPO training
+source and remains held out. Custom HF datasets can supply the same string
+prompt column via `rlhf.prompt_dataset/prompt_config/prompt_column/prompt_split`.
+Revisions are resolved and persisted before cloud training.
+
+`ppo_dataset.py` specializes `PreferenceShardProducer` only for prompt schema
+and record storage. It inherits HF state restore/raw-row replay, the original
+`utils.dataset.py` failure propagation/cleanup, SFT bounded flush and atomic
+publication, and `PreferenceFeed` thread lifecycle/wait/broadcast/backpressure.
+`PromptShardDataset` reuses mmap cleanup/worker serialization. Prompt boundaries
+are stored as offsets, not packed across episodes. Tokenization uses unchanged
+SFT role text and the same `\nassistant:\n` prefix as the RM. Oversized prompts
+are filtered whole; responses are never silently truncated before RM scoring.
+The policy and RM must share tokenizer identity, vocabulary, BOS/EOS and context
+compatibility. SFT's saved vocabulary hash is checked.
+
+Configuration remains dataclass/JSON. `rlhf` contains PPO-specific options;
+shared `training` contains learning rate (1e-5), weight decay (0.01), accumulation,
+warmup ratio (0.03), clipping (1.0), epochs and max steps. Shared `system` contains
+precision, kernel requirement, checkpoint/diagnostic intervals and output path.
+`training.max_steps` counts completed **rollout batches**; `optimizer_steps` is
+logged separately. The existing AdamW builder and warmup/cosine scheduler are
+reused. Scheduler horizon accounts for PPO epochs and accumulation windows.
+Batch sizes under `rlhf` are **per rank**. `data.pairs_per_shard` is the number
+of prompt records per shard when running PPO; it must fit one global rollout
+batch. Incomplete distributed batches are dropped, without sampler replication.
+
+```bash
+# Write native JSON, then set rlhf.policy_checkpoint and reward_model_checkpoint.
+python post-training/RLHF/train_rlhf.py --write-config ppo.json
+
+# Local only: synthetic 22,001-parameter hybrid + tiny RM checkpoint fixtures.
+python post-training/RLHF/train_rlhf.py --smoke --output-dir runs/ppo_smoke
+
+# Cloud training, after preflight, with immutable SFT/RM checkpoint paths.
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/train_rlhf.py \
+  --config ppo.json --output-dir runs/ppo
+
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/train_rlhf.py \
+  --resume runs/ppo/checkpoint-00000100
+```
+
+### PPO FSDP2 and checkpoints
+
+Policy/value, reference, and Reward Model each use the existing `RewardBackend`
+bottom-up `fully_shard` approach. Complete layers own non-reentrant activation
+checkpoint wrappers; the root owns remaining embedding/norm/heads. No FSDP1,
+`ignored_params` requirement, or Trainer framework is introduced. Reference/RM
+inference is sequential in no-grad mode; the policy optimizer is built after
+sharding. FP32 parameters/reductions use BF16 autocast or explicit FP32.
+
+The SFT loader reuses the repository consolidated `model_ckpt.pth` format and
+checks its `sft_runtime` contract. Loading is serialized across ranks on CPU;
+host RAM must still fit an entire SFT checkpoint. Full policy copies are never
+deliberately placed on each GPU. Every model is sharded before computation.
+Frozen checkpoints must be kept immutable. Their paths and SHA256 identities
+(SFT file, RM trainer metadata) are saved; the RM metadata hash does **not** hash
+all DCP tensor shards. Retain the complete original checkpoint directories.
+
+PPO reuses the Reward Model's DCP save/load helpers and completion-marker
+protocol with family `hybrid_ppo_dcp_v1`. Model state includes policy and value
+head; metadata includes optimizer/scheduler, RNG, rollout and optimizer counters,
+configuration and consumer cursor. Adam states are initialized through DCP's
+public helper to account for conditionally unused experts/memory parameters;
+the helper's dummy step counter is reset before real training.
+Reference/RM weights are reconstructed from their original checkpoints, not
+duplicated in every PPO checkpoint. Exact resume requires the same world size,
+precision, pinned sources and training configuration. Checkpoints are taken only
+after an entire rollout's PPO epochs. A crash loses incomplete work; resume
+starts at the last committed prompt cursor and samples fresh rollouts.
+
+### Policy evaluation and drift diagnostics
+
+Before updates, at `system.diagnostic_eval_interval`, and after training, PPO
+scores a fixed bounded set of `test_gen` prompts, with an isolated fixed sampling
+seed and a content fingerprint. It never advances the training producer/cursor
+or its RNG. `diagnostic_eval_enabled=false` disables these calls. A resumed
+run's first report describes the resumed policy; the original step-zero report
+in `ppo_metrics.jsonl` provides the SFT baseline.
+
+Logs separate `raw_reward_model_score`, `KL_penalty`, and `final_rl_reward`,
+with means/std/p95. Also reported: policy/value loss, entropy, approximate update
+KL, clipping fraction, reference KL mean/std/p95, advantages, returns, values,
+explained variance (null for constant targets), response length, EOS/completion
+rate, gradient norm, learning rate, throughput and GPU memory. EOS completion is
+not a quality judgment. Rank-zero aggregation collects only bounded rollout
+scalar arrays, then broadcasts the small global report; diagnostics count
+replicated examples once. Reward increases accompanied by rising KL/length or
+collapsing entropy warrant inspection. No arbitrary automatic failure threshold
+is imposed. These diagnostics do not establish quality or PPO stability; compare
+outputs and downstream language-model tasks before deploying an aligned policy.
+
+### Cloud-only preflight (required before a long run)
+
+Use the real SFT and trained pure-Mamba RM checkpoints in `ppo.json`, a shared
+output/cache filesystem, two CUDA GPUs with sufficient model capacity, matching
+PyTorch/CUDA builds and working `mamba-ssm` kernels. The repository baseline is
+`requirements-fsdp2.txt` (PyTorch 2.6); no on-device validation was run locally.
+`--preflight` keeps real architectures and forces BF16/fused kernels, two rollout
+updates, per-rank rollout 2/microbatch 1, one PPO epoch, accumulation 2, two
+diagnostic prompts, at most 128 prompt and 8 response tokens, and a 1,024 raw-row
+cap per prompt source. No full evaluation.
+
+```bash
+# Cloud only. First invocation saves step 1 with the two-update scheduler horizon.
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/train_rlhf.py \
+  --config ppo.json --preflight --stop-after 1 --output-dir runs/ppo_preflight
+
+# Restart processes, load policy/value/Adam/scheduler/RNG/cursor, collect NEW rollout.
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/train_rlhf.py \
+  --resume runs/ppo_preflight/checkpoint-00000001 --preflight
+
+# Optional separate Reward Model FSDP2 preflight (two updates, four diagnostics).
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/train_reward_model.py \
+  --config reward.json --preflight --stop-after 1 --output-dir runs/rm_preflight
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/train_reward_model.py \
+  --resume runs/rm_preflight/checkpoint-00000001 --preflight
+```
+
+Verify both PPO completion markers, finite losses/rewards/gradients, reference/RM
+freeze assertions, successful resumed optimizer counter, and final
+`preflight=resumed_update_completed`. Inspect memory and timings on the actual
+cloud environment. This checks initialization, FSDP2, real BF16/Mamba forwards,
+rollout, reward/reference inference, backward, optimizer, save/load and resume.
+It is intentionally a correctness check, not a training-quality or throughput
+claim. The two-GPU capacity requirement depends on the user's SFT architecture.
+
+### Cloud shard benchmark and percentile scaling
+
+The existing shard default remains **64**. No performance numbers or preferred
+replacement are claimed without a cloud measurement. Run the separate bounded
+benchmark with the real RM on otherwise idle cloud GPUs:
+
+```bash
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/benchmark_reward_shards.py \
+  --config reward.json --cloud-benchmark --pairs 2048
+```
+
+It tests 64/256/512/1024 with the same seed, fresh real architecture and fixed
+global consumed pair count; it performs AdamW forward/backward steps but saves no
+training checkpoint. `shard_benchmark.json` reports end-to-end pairs/sec including
+startup/shutdown, data-wait time, rank-zero process CPU utilization (one-core
+scale), producer publish/fsync overhead, logical bytes, Linux process I/O deltas,
+sampled GPU utilization and memory. Prefetched published records are identified
+separately from consumed pairs. Optional `nvidia-smi` telemetry reports unavailable
+instead of inventing utilization. Kernel/process counters differ from physical
+storage throughput due to page cache. Repeat on the target disk/GPU setup and
+record warm/cold-cache conditions before selecting `data.pairs_per_shard`; the
+small benchmark includes startup and is not a steady-state throughput guarantee.
+**Cloud results: not run. Default selection remains pending measurements.**
+
+Reward diagnostics always retain exact statistics. Full/normal held-out
+evaluation defaults to the existing float64 moments and disk-backed exact
+percentiles. For very large evaluations, set `system.percentile_strategy` to
+`approximate` and `percentile_sample_size` (default 100,000), or pass those options
+to `evaluate_reward_model.py`. Only percentiles become approximate: a fixed-memory
+uniform random-priority reservoir with a private seed replaces disk columns.
+All counts, means/std, min/max, margin fractions and accuracy remain exact.
+Output explicitly reports the percentile strategy/sample size. UF, HH and all
+HelpSteer2 groups remain separate; no reward-output transformation is introduced.
 
 This module trains a scalar preference reward model and independently evaluates it
-on UltraFeedback test, HH-RLHF test, and HelpSteer2-Preference. It contains no policy optimizer, rollouts, reference
-policy, vocabulary head, attention, or MoE. Actual training belongs on cloud GPUs.
+on UltraFeedback test, HH-RLHF test, and HelpSteer2-Preference. The Reward Model
+contains no vocabulary head, attention, or MoE. `train_rlhf.py` separately aligns
+the existing hybrid SFT policy with PPO using that frozen Reward Model.
+Actual training belongs on cloud GPUs.
 The offline development profile uses an **8,513-parameter CPU model**, not the
 production model.
 
@@ -255,9 +486,12 @@ separately, with `subset_sha256` fingerprints. Rebuilding with the checkpoint's
 pinned revisions/configuration produces the same membership/order regardless of
 training cursor, epoch or RNG state. Python, NumPy, Torch CPU and initialized CUDA
 RNG states and model train/eval mode are restored, including on failure. Diagnostic
-progress is never recorded in a training checkpoint. The optional interval defaults
-to the existing `eval_interval` (100). Legacy `eval_batches` is accepted when reading
-old configurations but no longer controls periodic evaluation.
+progress is never recorded in a training checkpoint. `diagnostic_eval_interval`
+defaults to 100 and is the only runtime interval. When reading legacy JSON,
+`eval_interval` is migrated only if `diagnostic_eval_interval` is absent/null;
+an explicit diagnostic interval wins. New configurations need no `eval_interval`.
+Legacy `eval_batches` is accepted when reading old configurations but no longer
+controls periodic evaluation.
 
 Full evaluation streams each source separately to exhaustion: UF `test_prefs`, HH
 `test`, HelpSteer2's preference release. It runs at normal training completion by
@@ -325,20 +559,22 @@ Parameters are initialized on CPU and moved/sharded one layer at a time; a full
 CPU model initially exists on each rank. Full GPU model copies are not constructed.
 
 FP32 master parameters and reductions follow repository conventions. `auto` uses
-BF16 autocast where supported, otherwise FP16. FP16 uses explicit local-gradient
-unscaling and the shared global-norm reduction for a synchronized overflow decision;
-all ranks skip together and halve the saved loss scale. BF16/FP32 nonfinite gradients
-raise. Accumulation uses `set_requires_gradient_sync`, clipping is global, and
+BF16 autocast where supported, otherwise FP32. FP16 is rejected, including old FP16
+resume configurations. BF16/FP32 nonfinite gradients raise.
+Accumulation uses `set_requires_gradient_sync`, clipping is global, and
 gradients are cleared with `zero_grad(set_to_none=True)`. Activation checkpointing
-is enabled by default. Install the compatible optional `mamba-ssm` CUDA extension
-for practical cloud throughput; the repository's CPU/PyTorch scan remains available.
+is enabled by default. `system.require_fused_mamba=true` is the production default:
+install a compatible `mamba-ssm` CUDA extension. Missing/disabled kernels fail before
+training, and runtime kernel failures raise instead of silently entering a fallback.
+Set this flag false only for development; `--smoke` does so automatically.
 
 All ranks participate in **Distributed Checkpoint (DCP)** using the distributed
 state-dict API with `full_state_dict=False`. No full model/optimizer gathering is
 performed on each rank. Checkpoints contain sharded model and AdamW state, scheduler,
 successful step, epoch, intra-shard batch cursor, source boundary/native HF state,
 configuration, pinned Hub/tokenizer revisions, per-rank Python/Torch/CUDA RNG,
-and FP16 scale state. A `complete` marker commits the small trainer metadata last;
+and legacy scale metadata (fixed to 1, retained for checkpoint compatibility).
+A `complete` marker commits the small trainer metadata last;
 incomplete/incompatible checkpoints are rejected. Checkpoint directories are never
 overwritten. Keep output directories on storage shared by all ranks/nodes.
 

@@ -32,7 +32,12 @@ class RewardStatistics:
     is 40 bytes per pair per group; files are deleted by close().
     """
 
-    def __init__(self):
+    def __init__(self, strategy="exact", sample_size=100000, seed=42):
+        if strategy not in ("exact", "approximate") or sample_size <= 0:
+            raise ValueError("Invalid percentile strategy/sample size")
+        self.strategy, self.sample_size = strategy, sample_size
+        self.rng = np.random.default_rng(seed)
+        self.samples = {}
         self.resources = ExitStack()
         self.files = {
             key: self.resources.enter_context(tempfile.TemporaryFile())  # noqa: SIM115 -- lifetime managed by ExitStack
@@ -74,13 +79,27 @@ class RewardStatistics:
                 min(low, float(values.min())),
                 max(high, float(values.max())),
             ]
-            values.tofile(self.files[key])
+            if self.strategy == "exact":
+                values.tofile(self.files[key])
+            else:
+                # Uniform random-priority reservoir: fixed RAM, batchwise work.
+                priorities = self.rng.random(len(values))
+                old_p, old_v = self.samples.get(key, (np.empty(0), np.empty(0)))
+                priorities = np.concatenate((old_p, priorities))
+                sample = np.concatenate((old_v, values))
+                if len(sample) > self.sample_size:
+                    keep = np.argpartition(priorities, self.sample_size - 1)[
+                        : self.sample_size
+                    ]
+                    priorities, sample = priorities[keep], sample[keep]
+                self.samples[key] = priorities, sample
 
     def result(self):
         pairs = self.positive + self.zero + self.negative
         if not pairs:
             raise ValueError("No valid preference pairs were scored")
         result = {
+            "percentile_strategy": self.strategy,
             "pairs": pairs,
             "pairwise_accuracy": self.positive / pairs,
             "fraction_positive_margin": self.positive / pairs,
@@ -90,14 +109,18 @@ class RewardStatistics:
         }
         for key, handle in self.files.items():
             n, mean, m2, low, high = self.moments[key]
-            handle.flush()
-            values = np.memmap(handle, dtype=np.float64, mode="r+", shape=(n,))
-            try:
-                percentiles = np.quantile(
-                    values, [0.50, 0.95, 0.99], overwrite_input=True
-                )
-            finally:
-                values._mmap.close()
+            if self.strategy == "exact":
+                handle.flush()
+                values = np.memmap(handle, dtype=np.float64, mode="r+", shape=(n,))
+                try:
+                    percentiles = np.quantile(
+                        values, [0.50, 0.95, 0.99], overwrite_input=True
+                    )
+                finally:
+                    values._mmap.close()
+            else:
+                percentiles = np.quantile(self.samples[key][1], [0.50, 0.95, 0.99])
+                result["percentile_sample_size"] = self.sample_size
             for suffix, value in zip(
                 ("mean", "std", "min", "max", "p50", "p95", "p99"),
                 (mean, np.sqrt(max(0.0, m2 / n)), low, high, *percentiles),

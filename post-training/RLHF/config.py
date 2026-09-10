@@ -62,16 +62,87 @@ class SystemConfig:
     activation_checkpointing: bool = True
     output_dir: str = "runs/reward_model"
     log_interval: int = 10
-    eval_interval: int = 100
+    eval_interval: int | None = None  # deprecated input only
     save_interval: int = 500
     resume_from_checkpoint: str | None = None
     initial_checkpoint: str | None = None
-    # Legacy eval_interval remains the fallback for existing configurations.
+    require_fused_mamba: bool = True
     diagnostic_eval_enabled: bool = True
     diagnostic_eval_pairs: int = 512
-    diagnostic_eval_interval: int | None = None
+    diagnostic_eval_interval: int = 100
+    percentile_strategy: str = "exact"
+    percentile_sample_size: int = 100000
     full_eval_enabled: bool = True
     full_eval_at_checkpoints: bool = False
+
+
+@dataclass
+class PPOConfig:
+    policy_checkpoint: str = ""
+    reward_model_checkpoint: str = ""
+    policy_sha256: str = ""
+    reward_metadata_sha256: str = ""
+    prompt_dataset: str = "HuggingFaceH4/ultrachat_200k"
+    prompt_config: str = "default"
+    prompt_split: str = "train_gen"
+    evaluation_split: str = "test_gen"
+    prompt_revision: str = "main"
+    prompt_column: str = "prompt"
+    prompt_limit: int | None = None  # raw source cap for cloud preflight
+    max_prompt_tokens: int = 512
+    max_new_tokens: int = 128
+    temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int | None = None
+    do_sample: bool = True
+    kl_beta: float = 0.05
+    clip_range: float = 0.2
+    value_clip_range: float = 0.2
+    gamma: float = 1.0
+    gae_lambda: float = 0.95
+    value_loss_coef: float = 0.5
+    entropy_coef: float = 0.0
+    advantage_normalization: bool = True
+    rollout_batch_size: int = 8  # per rank
+    rollout_microbatch_size: int = 1
+    ppo_minibatch_size: int = 1  # per rank
+    ppo_epochs: int = 4
+    diagnostic_prompts: int = 16
+
+    def validate(self):
+        if self.prompt_limit is not None and self.prompt_limit <= 0:
+            raise ValueError("prompt_limit must be positive when configured")
+        for name in (
+            "max_prompt_tokens",
+            "max_new_tokens",
+            "rollout_batch_size",
+            "rollout_microbatch_size",
+            "ppo_minibatch_size",
+            "ppo_epochs",
+            "diagnostic_prompts",
+        ):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"rlhf.{name} must be positive")
+        for name in ("temperature", "clip_range", "value_clip_range"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"rlhf.{name} must be finite and positive")
+        for name in ("kl_beta", "value_loss_coef", "entropy_coef"):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"rlhf.{name} must be finite and nonnegative")
+        if not 0 <= self.gamma <= 1 or not 0 <= self.gae_lambda <= 1:
+            raise ValueError("gamma and gae_lambda must be in [0,1]")
+        if self.top_p != 1 or self.top_k is not None or not self.do_sample:
+            raise ValueError(
+                "PPO updates require full-support sampling: do_sample=true, top_p=1, top_k=null; filtered/greedy decoding is diagnostic-only"
+            )
+        if self.rollout_batch_size % self.ppo_minibatch_size:
+            raise ValueError("rollout_batch_size must divide into PPO minibatches")
+        if self.rollout_batch_size % self.rollout_microbatch_size:
+            raise ValueError("rollout_batch_size must divide into rollout microbatches")
+        if "helpsteer" in self.prompt_dataset.lower():
+            raise ValueError("HelpSteer2 is held out, never a PPO training source")
+        if self.prompt_split == self.evaluation_split:
+            raise ValueError("PPO training and diagnostic splits must differ")
 
 
 @dataclass
@@ -81,6 +152,7 @@ class RewardConfig:
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     system: SystemConfig = field(default_factory=SystemConfig)
+    rlhf: PPOConfig | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -88,6 +160,8 @@ class RewardConfig:
     @classmethod
     def from_dict(cls, value: dict) -> "RewardConfig":
         value = dict(value)
+        if value.get("rlhf") is not None:
+            value["rlhf"] = PPOConfig(**value["rlhf"])
         for key, kind in (
             ("model", ModelConfig),
             ("data", DataConfig),
@@ -98,6 +172,9 @@ class RewardConfig:
             if key == "system":
                 # Old checkpoints remain readable; pair counts replace this cap.
                 options.pop("eval_batches", None)
+                legacy_interval = options.pop("eval_interval", None)
+                if options.get("diagnostic_eval_interval") is None:
+                    options["diagnostic_eval_interval"] = legacy_interval or 100
             value[key] = kind(**options)
         result = cls(**value)
         result.validate()
@@ -111,6 +188,8 @@ class RewardConfig:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
 
     def validate(self) -> None:
+        if self.rlhf is not None:
+            self.rlhf.validate()
         self.data.probabilities()
         positive = [
             *asdict(self.model).values(),
@@ -126,10 +205,10 @@ class RewardConfig:
             self.training.learning_rate,
             self.training.gradient_clip_norm,
             self.system.log_interval,
-            self.system.eval_interval,
             self.system.save_interval,
             self.system.diagnostic_eval_pairs,
-            self.system.diagnostic_eval_interval or self.system.eval_interval,
+            self.system.diagnostic_eval_interval,
+            self.system.percentile_sample_size,
         ]
         if any(not math.isfinite(x) or x <= 0 for x in positive):
             raise ValueError(
@@ -152,8 +231,12 @@ class RewardConfig:
             raise ValueError("warmup_ratio must be in [0, 1)")
         if not 4 <= self.data.max_length <= self.model.max_length:
             raise ValueError("Require 4 <= data.max_length <= model.max_length")
-        if self.system.precision not in ("auto", "bf16", "fp16", "fp32"):
-            raise ValueError("precision must be auto/bf16/fp16/fp32")
+        if self.system.precision not in ("auto", "bf16", "fp32"):
+            raise ValueError(
+                "RLHF precision must be auto/bf16/fp32; FP16 is unsupported"
+            )
+        if self.system.percentile_strategy not in ("exact", "approximate"):
+            raise ValueError("percentile_strategy must be exact or approximate")
 
 
 def smoke_config(output_dir: str) -> RewardConfig:
@@ -168,6 +251,8 @@ def smoke_config(output_dir: str) -> RewardConfig:
     cfg.training.max_steps = 2
     cfg.system.output_dir = output_dir
     cfg.system.precision = "fp32"
+    cfg.system.require_fused_mamba = False
     cfg.system.log_interval = cfg.system.eval_interval = cfg.system.save_interval = 1
     cfg.system.diagnostic_eval_pairs = 4
+    cfg.system.diagnostic_eval_interval = 1
     return cfg

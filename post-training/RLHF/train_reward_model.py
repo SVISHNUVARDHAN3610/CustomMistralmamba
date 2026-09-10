@@ -30,7 +30,7 @@ from sft_fsdp2_post_train import load_pretraining_fsdp2
 from torch.utils.data import DataLoader, DistributedSampler, Subset
 from transformers import AutoTokenizer
 
-from model.hybrid.mamba import fused_mamba_scan_available
+from model.hybrid.mamba import MambaBlock, fused_mamba_scan_available
 from model.hybrid.model import _checkpoint_autocast_contexts
 from RLHF.config import RewardConfig, smoke_config
 from RLHF.evaluation_metrics import RewardStatistics, isolated_evaluation_rng
@@ -45,6 +45,31 @@ from RLHF.rlhf_dataset import (
 )
 
 FAMILY = "pure_mamba_reward_dcp_v1"
+
+
+def resolve_precision(precision: str, *, bf16_supported: bool) -> str:
+    if precision not in ("auto", "bf16", "fp32"):
+        raise ValueError("RLHF supports BF16/FP32; FP16 is unsupported")
+    if precision == "auto":
+        return "bf16" if bf16_supported else "fp32"
+    if precision == "bf16" and not bf16_supported:
+        raise RuntimeError("BF16 requested on unsupported hardware; choose fp32")
+    return precision
+
+
+def require_mamba_kernels(
+    model: torch.nn.Module, required: bool, device: torch.device
+) -> None:
+    """Fail before training and propagate kernel errors instead of falling back."""
+    if required and (device.type != "cuda" or not fused_mamba_scan_available()):
+        raise RuntimeError(
+            "require_fused_mamba needs CUDA and working mamba-ssm kernels"
+        )
+    for module in model.modules():
+        if isinstance(module, MambaBlock):
+            if required and (not module.use_fused_scan or module.use_parallel_scan):
+                raise ValueError("Production Mamba config disables the fused scan")
+            module.require_fused_scan = required
 
 
 class RewardBackend(sft.SingleGPUBackend):
@@ -64,27 +89,16 @@ class RewardBackend(sft.SingleGPUBackend):
                 )
             self.api = self.base._require_fsdp2()
             self.rank, self.world, self.device = self.base.init_distributed("nccl")
-        precision = cfg.system.precision
-        if precision == "auto":
-            precision = (
-                "fp32"
-                if smoke
-                else ("bf16" if torch.cuda.is_bf16_supported() else "fp16")
-            )
-        if (
-            precision == "bf16"
-            and self.device.type == "cuda"
-            and not torch.cuda.is_bf16_supported()
-        ):
-            raise RuntimeError("BF16 requested on unsupported GPU; choose auto or fp16")
-        self.dtype = {"fp32": None, "bf16": torch.bfloat16, "fp16": torch.float16}[
-            precision
-        ]
+        precision = resolve_precision(
+            cfg.system.precision,
+            bf16_supported=not smoke and torch.cuda.is_bf16_supported(),
+        )
+        self.dtype = {"fp32": None, "bf16": torch.bfloat16}[precision]
         self.precision = precision
-        self.loss_scale = 65536.0 if precision == "fp16" else 1.0
+        self.loss_scale = 1.0
         self.scale_good_steps = 0
 
-    def wrap(self, model: RewardModel, cfg: RewardConfig):
+    def wrap(self, model: torch.nn.Module, cfg: RewardConfig):
         if self.smoke:
             return model.to(self.device)
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -141,43 +155,30 @@ class RewardBackend(sft.SingleGPUBackend):
         )
 
     def optimizer_step(self, model, optimizer, max_norm):
-        # DTensor-local unscale avoids GradScaler's mixed Tensor/DTensor foreach
-        # assumptions. The existing global norm collective supplies one shared
-        # overflow decision so ranks always step/skip together.
-        for param in model.parameters():
-            if param.grad is not None:
-                grad = (
-                    param.grad.to_local()
-                    if hasattr(param.grad, "to_local")
-                    else param.grad
-                )
-                grad.div_(self.loss_scale)
         norm = self.base._clip_grad_norm_fsdp2_mixed(
             model.parameters(), max_norm, world_size=self.world
         )
         if not torch.isfinite(norm):
-            if self.precision != "fp16":
-                raise FloatingPointError("Nonfinite reward gradient norm")
-            self.loss_scale /= 2
-            self.scale_good_steps = 0
-            if self.loss_scale < 1e-8:
-                raise FloatingPointError(
-                    "Persistent FP16 overflow; use FP32 or inspect data"
-                )
-            optimizer.zero_grad(set_to_none=True)
-            return norm, False
+            raise FloatingPointError("Nonfinite RLHF gradient norm")
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         self.scale_good_steps += 1
-        if self.precision == "fp16" and self.scale_good_steps % 2000 == 0:
-            self.loss_scale = min(self.loss_scale * 2, 2**24)
         return norm, True
 
 
 class PreferenceFeed(sft.ShardFeed):
     """Reuse SFT's thread lifecycle, rank-zero wait/broadcast, and error handling."""
 
-    def __init__(self, cfg, tokenizer, backend, purpose, cursor=None, smoke=False):
+    def __init__(
+        self,
+        cfg,
+        tokenizer,
+        backend,
+        purpose,
+        cursor=None,
+        smoke=False,
+        producer_class=PreferenceShardProducer,
+    ):
         self.backend = backend
         # Per-invocation queue; checkpoints carry the consumer cursor and pinned
         # native HF boundary, so no stale/prefetched files need to survive resume.
@@ -191,7 +192,7 @@ class PreferenceFeed(sft.ShardFeed):
         self.producer = self.thread = None
         self.stop = threading.Event()
         if backend.rank == 0:
-            self.producer = PreferenceShardProducer(
+            self.producer = producer_class(
                 str(cache),
                 tokenizer,
                 cfg.data,
@@ -407,7 +408,14 @@ def build_diagnostic_set(cfg, tokenizer, backend, smoke=False):
 
 
 @torch.no_grad()
-def evaluate_batches(model, batches, backend):
+def evaluate_batches(
+    model,
+    batches,
+    backend,
+    *,
+    percentile_strategy="exact",
+    percentile_sample_size=100000,
+):
     """Global statistics for the existing replicated FSDP evaluation protocol.
 
     Every rank scores the same rows and executes identical forward collectives.
@@ -430,7 +438,9 @@ def evaluate_batches(model, batches, backend):
                             rejected.detach().cpu(),
                         )
                         if "overall" not in groups:
-                            groups["overall"] = RewardStatistics()
+                            groups["overall"] = RewardStatistics(
+                                percentile_strategy, percentile_sample_size
+                            )
                         groups["overall"].update(chosen, rejected)
                         for field, prefix in (
                             ("category", "category/"),
@@ -444,7 +454,9 @@ def evaluate_batches(model, batches, backend):
                                 ]
                                 key = prefix + value
                                 if key not in groups:
-                                    groups[key] = RewardStatistics()
+                                    groups[key] = RewardStatistics(
+                                        percentile_strategy, percentile_sample_size
+                                    )
                                 groups[key].update(chosen[indices], rejected[indices])
                     except Exception as exc:  # noqa: BLE001 -- broadcast rank-zero failures
                         status = str(exc)
@@ -511,6 +523,8 @@ def evaluate(
         model,
         evaluation_batches(cfg, tokenizer, backend, purpose, smoke, max_batches),
         backend,
+        percentile_strategy=cfg.system.percentile_strategy,
+        percentile_sample_size=cfg.system.percentile_sample_size,
     )
     result["evaluation_scope"] = (
         "synthetic_fixture"
@@ -563,17 +577,19 @@ def write_evaluation(result, cfg, backend, kind, step):
             )
 
 
-def checkpoint_metadata(path):
+def checkpoint_metadata(path, family=FAMILY):
     path = Path(path)
     if not (path / "complete").is_file():
         raise ValueError(f"Incomplete reward checkpoint: {path}")
     metadata = torch.load(path / "trainer.pt", map_location="cpu", weights_only=True)
-    if metadata.get("family") != FAMILY:
-        raise ValueError("Incompatible checkpoint: expected pure Mamba reward model")
+    if metadata.get("family") != family:
+        raise ValueError(f"Incompatible checkpoint: expected {family}")
     return metadata
 
 
-def save_checkpoint(path, model, optimizer, scheduler, cfg, backend, cursor, step):
+def save_checkpoint(
+    path, model, optimizer, scheduler, cfg, backend, cursor, step, *, family=FAMILY
+):
     """DCP stores sharded model/optimizer; small trainer metadata commits last."""
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
@@ -594,7 +610,7 @@ def save_checkpoint(path, model, optimizer, scheduler, cfg, backend, cursor, ste
     rng = backend.base._gather_rng_payload(backend.rank, backend.world)
     if backend.rank == 0:
         payload = {
-            "family": FAMILY,
+            "family": family,
             "config": cfg.to_dict(),
             "scheduler": scheduler.state_dict(),
             "cursor": cursor,
@@ -614,7 +630,14 @@ def save_checkpoint(path, model, optimizer, scheduler, cfg, backend, cursor, ste
 
 
 def load_checkpoint(
-    path, model, optimizer=None, scheduler=None, cfg=None, backend=None
+    path,
+    model,
+    optimizer=None,
+    scheduler=None,
+    cfg=None,
+    backend=None,
+    *,
+    family=FAMILY,
 ):
     import torch.distributed.checkpoint as dcp
     from torch.distributed.checkpoint.state_dict import (
@@ -625,7 +648,7 @@ def load_checkpoint(
         set_state_dict,
     )
 
-    metadata = checkpoint_metadata(path)
+    metadata = checkpoint_metadata(path, family)
     if cfg is not None and metadata["config"]["model"] != cfg.to_dict()["model"]:
         raise ValueError("Checkpoint reward architecture differs from configuration")
     options = StateDictOptions(full_state_dict=False)
@@ -634,7 +657,7 @@ def load_checkpoint(
         dcp.load(state, checkpoint_id=Path(path) / "state")
         set_model_state_dict(model, state["model"], options=options)
     else:
-        for key in ("seed", "model", "data", "training"):
+        for key in ("seed", "model", "data", "training", "rlhf"):
             # Fill new observability/default strategy fields for old checkpoints.
             if (
                 RewardConfig.from_dict(metadata["config"]).to_dict()[key]
@@ -715,13 +738,24 @@ def pin_revisions(cfg, backend):
         setattr(cfg.data, key, value)
 
 
-def run_training(cfg: RewardConfig, smoke=False, stop_after=None):
+def run_training(cfg: RewardConfig, smoke=False, stop_after=None, preflight=False):
     cfg.validate()
     base = load_pretraining_fsdp2()
     logger = base._setup_logging(Path(cfg.system.output_dir))
     feed = None
     try:
         backend = RewardBackend(cfg, logger, smoke)
+        if preflight and (
+            smoke
+            or backend.world != 2
+            or backend.precision != "bf16"
+            or not cfg.system.require_fused_mamba
+        ):
+            raise ValueError("--preflight requires two cloud BF16 GPUs and fused Mamba")
+        if cfg.system.require_fused_mamba and not fused_mamba_scan_available():
+            raise RuntimeError(
+                "require_fused_mamba: install a compatible mamba-ssm CUDA build"
+            )
         if not smoke:
             pin_revisions(cfg, backend)
         if cfg.data.pairs_per_shard < backend.world * cfg.training.batch_size:
@@ -739,6 +773,7 @@ def run_training(cfg: RewardConfig, smoke=False, stop_after=None):
                 backend.precision,
             )
         model = RewardModel(cfg.model, cfg.system.activation_checkpointing)
+        require_mamba_kernels(model, cfg.system.require_fused_mamba, backend.device)
         model = backend.wrap(model, cfg)
         if not smoke and not fused_mamba_scan_available():
             logger.warning(
@@ -904,12 +939,7 @@ def run_training(cfg: RewardConfig, smoke=False, stop_after=None):
                                         handle.write(json.dumps(record) + "\n")
                             if (
                                 diagnostic is not None
-                                and step
-                                % (
-                                    cfg.system.diagnostic_eval_interval
-                                    or cfg.system.eval_interval
-                                )
-                                == 0
+                                and step % cfg.system.diagnostic_eval_interval == 0
                             ):
                                 result = evaluate_diagnostic(
                                     model, diagnostic, cfg, tokenizer, backend
@@ -1028,6 +1058,11 @@ def main():
     parser.add_argument("--output-dir")
     parser.add_argument("--resume")
     parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Cloud only: two BF16 GPUs, two updates and DCP save/resume",
+    )
+    parser.add_argument(
         "--smoke", action="store_true", help="Tiny offline CPU model, two updates"
     )
     parser.add_argument(
@@ -1042,6 +1077,8 @@ def main():
     )
     parser.add_argument("--write-config", help="Write default configuration and exit")
     args = parser.parse_args()
+    if args.smoke and args.preflight:
+        parser.error("--smoke and --preflight are mutually exclusive")
     if args.stop_after is not None and args.stop_after <= 0:
         parser.error("--stop-after must be a positive update number")
     if args.resume:
@@ -1055,6 +1092,17 @@ def main():
             cfg = smoke_config(args.output_dir or "runs/reward_smoke")
     if args.output_dir:
         cfg.system.output_dir = args.output_dir
+    if args.preflight:
+        cfg.system.precision = "bf16"
+        cfg.system.require_fused_mamba = True
+        cfg.training.max_steps = 2
+        cfg.training.batch_size = 1
+        cfg.training.gradient_accumulation_steps = 2
+        cfg.system.save_interval = cfg.system.diagnostic_eval_interval = 1
+        cfg.system.diagnostic_eval_pairs = 4
+        cfg.system.full_eval_enabled = False
+        cfg.data.buffer_size = 1
+        cfg.data.pairs_per_shard = 8
     if args.write_config:
         cfg.save_pretrained(args.write_config)
         return
@@ -1068,7 +1116,7 @@ def main():
         return
     if args.smoke and (cfg.model.d_model > 32 or cfg.training.max_steps > 4):
         parser.error("--smoke cannot run a production configuration")
-    run_training(cfg, args.smoke, args.stop_after)
+    run_training(cfg, args.smoke, args.stop_after, args.preflight)
 
 
 if __name__ == "__main__":

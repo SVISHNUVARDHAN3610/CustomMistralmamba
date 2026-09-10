@@ -30,6 +30,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output-dir", default="runs/reward_evaluation")
+    parser.add_argument("--percentile-strategy", choices=("exact", "approximate"))
+    parser.add_argument("--percentile-sample-size", type=int)
     parser.add_argument(
         "--dataset",
         choices=("all", "ultrafeedback_test", "hh_rlhf_test", "helpsteer2"),
@@ -52,6 +54,11 @@ def main(argv=None):
     if args.max_batches is not None and args.max_batches <= 0:
         parser.error("--max-batches must be positive")
     cfg.system.output_dir = args.output_dir
+    if args.percentile_strategy:
+        cfg.system.percentile_strategy = args.percentile_strategy
+    if args.percentile_sample_size is not None:
+        cfg.system.percentile_sample_size = args.percentile_sample_size
+    cfg.validate()
     logger = load_pretraining_fsdp2()._setup_logging(Path(args.output_dir))
     try:
         backend = RewardBackend(cfg, logger, args.smoke)
