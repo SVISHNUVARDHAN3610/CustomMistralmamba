@@ -226,6 +226,8 @@ class MambaBlock(nn.Module):
         self.dt_rank = dt_rank if dt_rank is not None else math.ceil(hidden_size / 16)
         self.use_parallel_scan = use_parallel_scan
         self.use_fused_scan = use_fused_scan
+        # Opt-in runtime guard; no state-dict/config change for existing models.
+        self.require_fused_scan = False
         self.parallel_scan_fallback_max_len = parallel_scan_fallback_max_len
         self.blocked_scan_chunk_size = blocked_scan_chunk_size
         self.blocked_scan_min_len = blocked_scan_min_len
@@ -375,6 +377,7 @@ class MambaBlock(nn.Module):
             return_final_state=True,
             use_parallel_scan=self.use_parallel_scan,
             use_fused_scan=self.use_fused_scan,
+            require_fused_scan=self.require_fused_scan,
             training=self.training,
             attention_mask=attention_mask,
             batch_has_padding=batch_has_padding,
@@ -682,6 +685,7 @@ class MambaBlock(nn.Module):
         sequential_scan_min_len: int = 65536,
         mamba_internal_checkpoint: bool = True,
         layer_checkpointing_active: bool = False,
+        require_fused_scan: bool = False,
     ) -> tuple[Tensor, Tensor | None]:
         """
         u, dt: [B, L, d_inner]; A: [d_inner, n]; B, C: [B, L, n]; D: [d_inner]
@@ -702,6 +706,10 @@ class MambaBlock(nn.Module):
             and u.is_cuda
             and fused_fn_available
         )
+        if require_fused_scan and not can_use_fused:
+            raise RuntimeError(
+                "Production RLHF requires CUDA fused mamba-ssm selective_scan"
+            )
         if can_use_fused and not has_padding:
             try:
                 _MAMBA_SCAN_STATS["fused_full_batch"] += 1
@@ -715,6 +723,8 @@ class MambaBlock(nn.Module):
                     return_final_state=return_final_state,
                 )
             except (RuntimeError, ValueError, TypeError) as exc:
+                if require_fused_scan:
+                    raise RuntimeError("Required fused Mamba kernel failed") from exc
                 if not _FUSED_SCAN_WARNED:
                     warnings.warn(
                         f"mamba-ssm fused selective_scan failed ({type(exc).__name__}: "
@@ -736,6 +746,10 @@ class MambaBlock(nn.Module):
                     return_final_state=return_final_state,
                 )
             except (RuntimeError, ValueError, TypeError) as exc:
+                if require_fused_scan:
+                    raise RuntimeError(
+                        "Required unpadded fused Mamba kernel failed"
+                    ) from exc
                 if not _FUSED_SCAN_WARNED:
                     warnings.warn(
                         f"mamba-ssm unpadded fused selective_scan failed "
@@ -744,6 +758,10 @@ class MambaBlock(nn.Module):
                     )
                     _FUSED_SCAN_WARNED = True
 
+        if require_fused_scan:
+            raise RuntimeError(
+                "Required fused Mamba cannot handle this scan/mask configuration"
+            )
         _MAMBA_SCAN_STATS["pytorch_fallback"] += 1
         input_dtype = u.dtype
         u_f = u.float()
