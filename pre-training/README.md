@@ -6,12 +6,12 @@ The `pre-training` directory contains the multi-GPU distributed pre-training eng
 
 ## Architecture & Distributed Design
 
-The primary training entry point is [`fsdp2_train.py`](file:///d:/Working_Repo/CustomMistralmamba/pre-training/fsdp2_train.py). It scales the hybrid model across multi-GPU and multi-node clusters while adhering to strict mathematical and numerical contracts:
+The primary training entry point is [`fsdp2_train.py`](fsdp2_train.py). It scales the hybrid model across multi-GPU and multi-node clusters while adhering to strict mathematical and numerical contracts:
 
 ### 1. FSDP2 Bottom-Up Parameter Sharding
 * Submodules (individual `HybridBlock` / `TransformerBlock` layers) are wrapped via `torch.distributed.fsdp.fully_shard` **before** the root model is wrapped.
 * Non-matrix parameters, biases, norms, gains, and deliberately replicated custom-math parameters (such as selective scan $A, B, C$ projections and memory compression projections) are managed with custom exclusions:
-  * Replicated parameters are registered via [`_prepare_fsdp2_custom_math_params`](file:///d:/Working_Repo/CustomMistralmamba/pre-training/fsdp2_train.py#L380) and their gradients are explicitly synchronized via [`_sync_replicated_param_grads`](file:///d:/Working_Repo/CustomMistralmamba/pre-training/fsdp2_train.py#L420) across all ranks.
+  * Replicated parameters are registered via [`_prepare_fsdp2_custom_math_params`](fsdp2_train.py#L380) and their gradients are explicitly synchronized via [`_sync_replicated_param_grads`](fsdp2_train.py#L420) across all ranks.
   * 2D hidden weight matrices are fully sharded across ranks as `DTensor`s.
 
 ### 2. Mixed Precision Policy
@@ -20,7 +20,7 @@ The primary training entry point is [`fsdp2_train.py`](file:///d:/Working_Repo/C
 * **Auxiliary Loss Precision**: Critical memory bank read/write auxiliary losses, router logits, and SSM state calculations are promoted to `float32` activations, avoiding the NaN and underflow pitfalls common with naive bfloat16 parameter casting.
 
 ### 3. Distributed Muon + AdamW Optimization
-* [`build_fsdp2_optimizers`](file:///d:/Working_Repo/CustomMistralmamba/pre-training/fsdp2_train.py#L650) splits model parameters into two optimizer groups:
+* [`build_fsdp2_optimizers`](fsdp2_train.py#L650) splits model parameters into two optimizer groups:
   1. **`MuonDTensor`**: Handles 2D hidden linear weights. Gathers full momentum matrices across ranks into bounded buffers (`--muon-gather-buffer-mb`), computes 5th-order Newton–Schulz orthogonalization, and redistributes sharded updates.
   2. **`AdamW`**: Handles 1D parameters, embeddings, LM head, biases, normalization gains, and replicated custom-math tensors.
 

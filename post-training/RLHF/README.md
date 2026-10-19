@@ -181,9 +181,9 @@ torchrun --standalone --nproc_per_node=2 post-training/RLHF/train_rlhf.py \
   --resume runs/ppo_preflight/checkpoint-00000001 --preflight
 
 # Optional separate Reward Model FSDP2 preflight (two updates, four diagnostics).
-torchrun --standalone --nproc_per_node=2 post-training/RLHF/train_reward_model.py \
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/Reward-model/train/train_reward_model.py \
   --config reward.json --preflight --stop-after 1 --output-dir runs/rm_preflight
-torchrun --standalone --nproc_per_node=2 post-training/RLHF/train_reward_model.py \
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/Reward-model/train/train_reward_model.py \
   --resume runs/rm_preflight/checkpoint-00000001 --preflight
 ```
 
@@ -202,7 +202,7 @@ replacement are claimed without a cloud measurement. Run the separate bounded
 benchmark with the real RM on otherwise idle cloud GPUs:
 
 ```bash
-torchrun --standalone --nproc_per_node=2 post-training/RLHF/benchmark_reward_shards.py \
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/Reward-model/benchmark_reward_shards.py \
   --config reward.json --cloud-benchmark --pairs 2048
 ```
 
@@ -602,12 +602,12 @@ Run these from the repository root. The following development commands are small
 and safe for a laptop; no distributed group or CUDA training is initialized:
 
 ```bash
-python post-training/RLHF/train_reward_model.py --count-only
+python post-training/RLHF/Reward-model/train/train_reward_model.py --count-only
 python -m unittest tests.test_reward_model -v
 python -m unittest tests.test_reward_diagnostics -v
-python post-training/RLHF/train_reward_model.py --smoke --output-dir runs/reward_smoke --stop-after 1
-python post-training/RLHF/train_reward_model.py --smoke --resume runs/reward_smoke/checkpoint-00000001
-python post-training/RLHF/evaluate_reward_model.py --smoke --checkpoint runs/reward_smoke/checkpoint-00000002 --max-batches 1
+python post-training/RLHF/Reward-model/train/train_reward_model.py --smoke --output-dir runs/reward_smoke --stop-after 1
+python post-training/RLHF/Reward-model/train/train_reward_model.py --smoke --resume runs/reward_smoke/checkpoint-00000001
+python post-training/RLHF/Reward-model/evaluate_reward_model.py --smoke --checkpoint runs/reward_smoke/checkpoint-00000002 --max-batches 1
 ```
 
 Use a fresh output directory for a fresh smoke run. The smoke evaluator uses
@@ -623,7 +623,7 @@ Remove-Item Env:RM_LIVE_SCHEMA
 Generate and edit the nested JSON configuration before cloud training:
 
 ```bash
-python post-training/RLHF/train_reward_model.py --write-config reward_config.json
+python post-training/RLHF/Reward-model/train/train_reward_model.py --write-config reward_config.json
 ```
 
 **Cloud only**, after installing `requirements-fsdp2.txt` using the appropriate
@@ -631,19 +631,19 @@ official CUDA wheel index and a compatible optional `mamba-ssm` build:
 
 ```bash
 # Single cloud GPU
-torchrun --standalone --nproc_per_node=1 post-training/RLHF/train_reward_model.py --config reward_config.json
+torchrun --standalone --nproc_per_node=1 post-training/RLHF/Reward-model/train/train_reward_model.py --config reward_config.json
 
 # Multiple cloud GPUs, existing repository torchrun convention
-torchrun --standalone --nproc_per_node=4 post-training/RLHF/train_reward_model.py --config reward_config.json
+torchrun --standalone --nproc_per_node=4 post-training/RLHF/Reward-model/train/train_reward_model.py --config reward_config.json
 
 # Resume: saved config supplies the original scheduler and data settings
-torchrun --standalone --nproc_per_node=4 post-training/RLHF/train_reward_model.py --resume runs/reward_model/checkpoint-00000500
+torchrun --standalone --nproc_per_node=4 post-training/RLHF/Reward-model/train/train_reward_model.py --resume runs/reward_model/checkpoint-00000500
 
 # Independent full evaluation of all three sources (cloud only)
-torchrun --standalone --nproc_per_node=1 post-training/RLHF/evaluate_reward_model.py --checkpoint runs/reward_model/checkpoint-00000500
+torchrun --standalone --nproc_per_node=1 post-training/RLHF/Reward-model/evaluate_reward_model.py --checkpoint runs/reward_model/checkpoint-00000500
 
 # Optional single-source evaluation
-torchrun --standalone --nproc_per_node=1 post-training/RLHF/evaluate_reward_model.py --checkpoint runs/reward_model/checkpoint-00000500 --dataset helpsteer2
+torchrun --standalone --nproc_per_node=1 post-training/RLHF/Reward-model/evaluate_reward_model.py --checkpoint runs/reward_model/checkpoint-00000500 --dataset helpsteer2
 ```
 
 No cloud training was run during implementation. CPU smoke/checkpoint tests and
@@ -753,13 +753,13 @@ compilation time and peak memory still require measurement on Kaggle.
 
 ```bash
 # Kaggle only: one process controls all eight devices. Use your Dataset factory.
-python post-training/RLHF/reward_model_tpu_train.py --model-config reward_tpu_model.json --dataset-factory my_data:make_train_dataset --dataset-kwargs '{}' --output-dir /kaggle/working/reward_tpu
+python post-training/RLHF/Reward-model/train/reward_model_tpu_train.py --model-config reward_tpu_model.json --dataset-factory my_data:make_train_dataset --dataset-kwargs '{}' --output-dir /kaggle/working/reward_tpu
 
 # Resume with the SAME model, Dataset and training settings.
-python post-training/RLHF/reward_model_tpu_train.py --model-config reward_tpu_model.json --dataset-factory my_data:make_train_dataset --dataset-kwargs '{}' --output-dir /kaggle/working/reward_tpu --resume /kaggle/working/reward_tpu/latest.pth
+python post-training/RLHF/Reward-model/train/reward_model_tpu_train.py --model-config reward_tpu_model.json --dataset-factory my_data:make_train_dataset --dataset-kwargs '{}' --output-dir /kaggle/working/reward_tpu --resume /kaggle/working/reward_tpu/latest.pth
 
 # Laptop: only a built-in 6,417-parameter CPU fixture, at most two steps.
-python post-training/RLHF/reward_model_tpu_train.py --smoke --output-dir runs/reward_tpu_smoke
+python post-training/RLHF/Reward-model/train/reward_model_tpu_train.py --smoke --output-dir runs/reward_tpu_smoke
 python -m unittest tests.test_reward_tpu_train -v
 ```
 

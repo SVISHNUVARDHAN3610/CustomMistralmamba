@@ -9,7 +9,7 @@
 > **Status:** Research Reference Implementation (v2.1 Finalized & Verified)  
 > **Primary Public Exports:** `from model import HybridForCausalLM, HybridMambaMoEConfig, MixtralForCausalLM, MixtralConfig`  
 > **Design Specifications:** [`research/research.md`](../research/research.md) | [`research/loss-definitions.md`](../research/loss-definitions.md)  
-> **Unit Test Coverage:** [`tests/test_model.py`](../tests/test_model.py) (83 tests covering forward, backward, AMP, caching, and scan backends)
+> **Unit Test Coverage:** [`tests/test_model.py`](../tests/test_model.py) (91 tests covering forward, backward, AMP, caching, and scan backends)
 
 ---
 

@@ -4,7 +4,7 @@
 [![PyTorch 2.6+](https://img.shields.io/badge/PyTorch-2.6%2B-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
-[![Tests: 83 Passed](https://img.shields.io/badge/tests-83%20passed-brightgreen.svg)](tests/test_model.py)
+[![Unit Tests: 200](https://img.shields.io/badge/unit%20tests-200-brightgreen.svg)](tests/README.md)
 
 > **A sub-quadratic causal language model architecture for long-context sequence modeling, integrating sliding-window grouped-query attention, selective state-space models (Mamba S6), dual gated compressive memory banks, and sparse Mixture-of-Experts (MoE) with rigorous empirical falsification protocols.**
 
@@ -22,8 +22,9 @@
 | **Package Architecture Reference** | [`model/README.md`](model/README.md) (Comprehensive 24-section developer specification) |
 | **Optimization Stack** | Moonshot Muon + AdamW for single-GPU and PyTorch FSDP2 training |
 | **Supervised Post-Training** | [`post-training/readme.md`](post-training/readme.md) — SFT pipeline, single-GPU/FSDP2 launch commands, validation, and resume |
+| **Preference Alignment (RLHF)** | [`post-training/RLHF/README.md`](post-training/RLHF/README.md) — 352.8M pure-Mamba reward model (GPU/FSDP2/TPU trainers) and PPO policy optimization |
 | **Scan Acceleration** | 4-Tier Selective Scan (Fused CUDA `mamba-ssm` $\to$ Parallel $\to$ Blocked $\to$ Checkpointed) |
-| **Test Suite** | [`tests/test_model.py`](tests/test_model.py) (83 deterministic unit tests, AMP & gradient verified) |
+| **Test Suite** | [`tests/`](tests/README.md) (200 `unittest` tests: 91 model, FSDP2 contracts, SFT, reward model, PPO) |
 
 ---
 
@@ -252,7 +253,7 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{CE}} + \lambda_{\text{aux}}\ma
       ▼                      ▼                               ▼                      ▼
 Language Modeling      MoE Regularization             Memory Supervision     System Regularization
   • Causal CE            • Router Load Balance          • L_recon (0.08)       • L_fusion (8e-3)
-  • Vocab Z-Loss         • Router Z-Loss                • L_assoc (0.0614)     • L_slot (3e-3)
+  • Vocab Z-Loss         • Router Z-Loss                • L_assoc (0.0614)     • L_slot (0.0, telemetry only)
                                                         • L_assoc_norm (1e-3)  • L_ssm (0.0, bypassed)
                                                         • L_gate (1e-3)        • L_expert (0.0, bypassed)
                                                         • L_read (5e-3)
@@ -277,7 +278,7 @@ Language Modeling      MoE Regularization             Memory Supervision     Sys
 | $\mathcal{L}_{\text{gate}}$ | Write-Gate Entropy | $1.0\times 10^{-3}$ | $-\frac{1}{|G|}\sum [g \log(g+\epsilon) + (1-g)\log(1-g+\epsilon)]$ | Maximizes write-gate entropy to prevent saturation at $0$ (never update) or $1$ (always overwrite). |
 | $\mathcal{L}_{\text{read}}$ | Read Utilization | $5.0\times 10^{-3}$ | $\max(0, r_{\text{min}} - r)^2, \; r = \frac{\|W_{\text{mem}}\|_F}{\|W_{\text{own}}\|_F + \|W_{\text{mem}}\|_F}$ | Hinge loss preventing linear combine layers from zeroing out the memory read pathway ($r_{\text{min}} = 0.15$). |
 | $\mathcal{L}_{\text{fusion}}$ | Fusion Balance | $8.0\times 10^{-3}$ | $\frac{1}{d} \| \bar{g}_{\text{fusion}} - 0.5 \|_2^2$ | Centers batch-mean fusion gate at $0.5$ to ensure balanced utilization between Attention and Mamba. |
-| $\mathcal{L}_{\text{slot}}$ | Slot Diversity | $3.0\times 10^{-3}$ | $\frac{1}{m^2}\sum_{p \neq q} \max(0, \cos(\hat{M}_p, \hat{M}_q) - \tau)^2 + \alpha \mathcal{L}_{\text{cross}}$ | Penalizes intra-bank slot cosine similarity above margin $\tau=0.3$ and cross-bank slot alignment. |
+| $\mathcal{L}_{\text{slot}}$ | Slot Diversity | $0.0$ *(telemetry only)* | $\frac{1}{m^2}\sum_{p \neq q} \max(0, \cos(\hat{M}_p, \hat{M}_q) - \tau)^2 + \alpha \mathcal{L}_{\text{cross}}$ | Not optimized by default; slot similarity is still reported through detached `gate_stats` telemetry. |
 | $\mathcal{L}_{\text{expert}}$ | Expert Specialization | $0.0$ *(bypassed)* | $\frac{1}{|T|}\sum |\cos(e_i, e_j)| - \beta \text{Var}_e(\text{Softmax}(z))$ | Disabled by default to eliminate VRAM and pairwise computation waste; router uses standard Switch MoE load balancing. |
 | $\mathcal{L}_{\text{ssm}}$ | SSM Norm Hinge | $0.0$ *(bypassed)* | $\max(0, \frac{1}{T}\sum \|h_t\|_2^2 - \gamma)$ | Disabled by default; Mamba SSM recurrence $\bar{A} = \exp(\Delta A)$ is contractive and bounded. |
 
@@ -385,7 +386,45 @@ architecture and weights and consume the weighted conversation mixture from
 The [post-training guide](post-training/readme.md) covers launch commands, topic
 weights, context limits, held-out validation, and exact SFT resume requirements.
 SFT uses its own uint32 token/mask shard format; retain its dedicated cache when
-resuming a run. Whole conversations must fit the pretrained model's context.
+resuming a run. Conversations longer than the pretrained context are handled by
+`--oversized-behavior chunk|filter|truncate|error` (default `chunk`).
+
+### 4. Reward Model (`post-training/RLHF/Reward-model/`)
+
+* **Architecture:** A 352,798,721-parameter pure-Mamba scalar model (48 × [RMSNorm → `MambaBlock` → residual], $d=1024$, `Linear(1024, 1)` head on the last non-padding token). No attention, MoE, or vocabulary head. Production configs outside 300–400M raise.
+* **Data:** UltraFeedback (`train_prefs`) and HH-RLHF (`train`) interleaved at relative weights 35:75. HelpSteer2's preference release is held out and used **only** for evaluation.
+* **Objective:** Bradley–Terry pairwise loss, $\mathcal{L} = -\log \sigma(r_{\text{chosen}} - r_{\text{rejected}})$. Rewards stay raw scalars (no normalization, clipping, or sigmoid).
+* **Checkpoints:** Sharded Distributed Checkpoint (DCP) with a completion marker, family `pure_mamba_reward_dcp_v1`.
+
+| Trainer | Target | Launch |
+| :--- | :--- | :--- |
+| [`train/train_reward_model_single_gpu.py`](post-training/RLHF/Reward-model/train/train_reward_model_single_gpu.py) | One GPU | `python` |
+| [`train/train_reward_model.py`](post-training/RLHF/Reward-model/train/train_reward_model.py) | Multi-GPU FSDP2 | `torchrun` |
+| [`train/reward_model_tpu_train.py`](post-training/RLHF/Reward-model/train/reward_model_tpu_train.py) | Kaggle TPU v5e-8 (SPMD) | `python`; uses a hybrid (memory-off) backbone instead of pure Mamba |
+
+[`evaluate_reward_model.py`](post-training/RLHF/Reward-model/evaluate_reward_model.py) reports pairwise accuracy and reward-scale diagnostics separately for UltraFeedback, HH-RLHF, and HelpSteer2.
+
+```bash
+torchrun --standalone --nproc_per_node=4 post-training/RLHF/Reward-model/train/train_reward_model.py \
+  --config reward_config.json
+```
+
+### 5. PPO Policy Optimization (`post-training/RLHF/train_rlhf.py`)
+
+* **Models:** `PolicyValueModel` is the hybrid SFT policy plus a `Linear(hidden_size, 1)` value head. A frozen hybrid reference model and the frozen reward model are loaded alongside it.
+* **Rollouts:** Prompts from UltraChat `train_gen` with full-support sampling (`top_p=1`, no top-k). Rollout and PPO replay use the same fixed SFT memory chunks with prefix replay.
+* **Objective:** Per-token KL penalty against the reference, with the RM score added once at the last action, then GAE ($\gamma=1$, $\lambda=0.95$) and clipped policy/value losses.
+* **Distributed & checkpoints:** FSDP2 for all three models; DCP family `hybrid_ppo_dcp_v1`. Exact resume requires the same world size and configuration.
+
+```bash
+torchrun --standalone --nproc_per_node=2 post-training/RLHF/train_rlhf.py \
+  --config ppo.json --output-dir runs/ppo
+```
+
+See the [RLHF guide](post-training/RLHF/README.md) and the [reward trainer guide](post-training/RLHF/Reward-model/train/README.md) for configuration, the required cloud preflight, and diagnostics.
+
+> [!NOTE]
+> The reward model and PPO pipelines are verified only by CPU unit tests and tiny fixtures. No cloud preflight or production run has been completed yet.
 
 ---
 
@@ -460,9 +499,12 @@ The codebase provides built-in hooks to execute three strict falsification tests
 
 ```
 CustomMistralmamba/
-├── README.md                      # Primary research documentation & specification
-├── requirements.txt                # Production & development dependencies
+├── README.md                       # Primary research documentation & specification
+├── train.py                        # Single-GPU pretrainer & shared training helpers
+├── requirements.txt                # Runtime & development dependencies
+├── requirements-fsdp2.txt          # Pinned cloud baseline (Python 3.11, torch 2.6.0, CUDA 12.4)
 ├── pyproject.toml                  # Static analysis & linter configurations (Ruff)
+├── .github/                        # CI (ruff, unit tests) & PR-description validation
 │
 ├── model/                          # Core neural architecture package
 │   ├── __init__.py                 # Public API exports & version metadata
@@ -472,6 +514,7 @@ CustomMistralmamba/
 │   │   ├── constants.py            # MEMORY_NAN_FIX_ID revision tags
 │   │   ├── dtype.py                # FP32 promotion helpers for mixed precision
 │   │   ├── optim.py                # Muon / AdamW parameter splitting logic
+│   │   ├── fsdp.py                 # FSDP2 sharding helpers
 │   │   └── builders.py             # Parameter budgeting & Test 3 null baseline builder
 │   ├── layers/                     # Shared neural building blocks
 │   │   ├── norm.py                 # RMSNorm implementation
@@ -491,34 +534,55 @@ CustomMistralmamba/
 │
 ├── research/                       # Research proposals & theoretical documentation
 │   ├── research.md                 # Complete research proposal & methodology
-│   ├── loss-definitions.md         # Formula-level specification for all 8 auxiliary losses
-│   └── Improvement-suggestions.md  # Architectural backlog & scaling suggestions
+│   └── loss-definitions.md         # Formula-level specification for the auxiliary losses
 │
 ├── pre-training/                   # Distributed multi-GPU training
+│   ├── README.md                   # FSDP2 pretraining guide
 │   └── fsdp2_train.py              # PyTorch FSDP2 + MuonDTensor/AdamW trainer
 │
-├── post-training/                  # Supervised fine-tuning from pretrained weights
+├── post-training/                  # Post-training from pretrained weights
 │   ├── readme.md                   # SFT pipeline, launch commands, validation & resume
 │   ├── sft_post_train.py           # Single-GPU SFT & shared training loop
-│   └── sft_fsdp2_post_train.py     # Distributed FSDP2 SFT backend
+│   ├── sft_fsdp2_post_train.py     # Distributed FSDP2 SFT backend
+│   └── RLHF/                       # Preference alignment
+│       ├── README.md               # Reward model + PPO guide, preflight & diagnostics
+│       ├── __init__.py             # Registers RLHF.<module> import aliases
+│       ├── train_rlhf.py           # PPO entry point (policy + value head, frozen ref & RM)
+│       ├── ppo.py                  # PolicyValueModel, rollouts, GAE, clipped PPO loss
+│       ├── ppo_dataset.py          # UltraChat prompt shards for rollouts
+│       └── Reward-model/           # 352.8M pure-Mamba scalar reward model
+│           ├── config.py           # RewardConfig / PPOConfig dataclasses
+│           ├── reward_model.py     # RewardModel & Bradley–Terry pairwise loss
+│           ├── rlhf_dataset.py     # UltraFeedback + HH-RLHF preference shards
+│           ├── evaluate_reward_model.py   # UF / HH / HelpSteer2 evaluation
+│           ├── evaluation_metrics.py      # Exact/approximate reward-scale statistics
+│           ├── benchmark_reward_shards.py # Cloud shard-size benchmark
+│           └── train/              # Single-GPU, FSDP2, and Kaggle TPU trainers
 │
 ├── utils/                          # Dataset streaming & validation utilities
 │   ├── dataset.py                  # TokenizedShardProducer, MmapShardDataset
 │   ├── sft_dataset.py              # Weighted conversations & assistant-masked SFT shards
 │   ├── fsdp2_muon.py               # MuonDTensor implementation & Newton-Schulz checks
+│   ├── training_logging.py         # Shared training logger
 │   └── validation.py               # WikiTextCyclicValidator for periodic evaluation
 │
 ├── scripts/                        # Verification & smoke test scripts
 │   ├── toy_train.py                # Single-file ~5M parameter CPU/GPU smoke test
 │   ├── test_cloud_train.py         # ~200M parameter cloud training smoke test
 │   ├── bench_grad_guard.py         # Distributed gradient sanity benchmark
+│   ├── check_gradient_checkpointing.py # Gradient-checkpointing parity check
 │   └── verify_model_package.py     # Public API surface verification
 │
-└── tests/                          # Comprehensive unit test suite
-    ├── test_model.py               # 83 rigorous tests covering forward, backward, caches
-    ├── test_toy_train_smoke.py     # Integration smoke test for toy training loop
+└── tests/                          # Unit test suite (stdlib unittest)
+    ├── test_model.py               # 91 tests: forward, backward, caches, memory, scans
+    ├── test_toy_train_smoke.py     # Chunked-BPTT backward smoke test
+    ├── test_fsdp2_contracts.py     # FSDP2 sharding & resume contracts
     ├── test_sft_dataset.py         # SFT adapters, masking, shards & replay
-    └── test_sft_post_train.py      # CPU SFT integration & distributed adapter contracts
+    ├── test_sft_post_train.py      # CPU SFT integration & distributed adapter contracts
+    ├── test_reward_model.py        # Reward model, preference data & DCP checkpoints
+    ├── test_reward_diagnostics.py  # Reward-scale statistics & evaluation reports
+    ├── test_reward_tpu_train.py    # TPU reward trainer CPU fixtures
+    └── test_ppo.py                 # PPO rollout, GAE, loss & resume
 ```
 
 ---
@@ -532,8 +596,11 @@ CustomMistralmamba/
 git clone https://github.com/SVISHNUVARDHAN3610/CustomMistralmamba.git
 cd CustomMistralmamba
 
-# Install runtime dependencies (PyTorch >= 2.1)
+# Install runtime dependencies (PyTorch >= 2.6)
 pip install -r requirements.txt
+
+# Cloud training baseline (Python 3.11, torch 2.6.0, CUDA 12.4)
+# pip install -r requirements-fsdp2.txt
 
 # (Optional) Install fused CUDA selective scan kernels
 pip install mamba-ssm>=2.2.0
@@ -545,10 +612,18 @@ pip install mamba-ssm>=2.2.0
 # 1. Verify model package exports and public API surface
 python scripts/verify_model_package.py
 
-# 2. Run the full unit test suite (83 tests)
-python -m unittest tests.test_model -v
+# 2. Run the CI test suites (model, chunked-BPTT smoke, FSDP2 contracts)
+python -m unittest tests.test_model tests.test_toy_train_smoke tests.test_fsdp2_contracts -v
 
-# 3. Run the standalone toy training smoke test (~5M parameters)
+# 3. Post-training suites (need datasets/transformers)
+python -m unittest tests.test_sft_dataset tests.test_sft_post_train -v
+python -m unittest tests.test_reward_model tests.test_reward_diagnostics tests.test_ppo tests.test_reward_tpu_train -v
+
+# 4. Lint & format (CI pins ruff==0.16.2)
+ruff check .
+ruff format --check .
+
+# 5. Run the standalone toy training smoke test (~5M parameters)
 python scripts/toy_train.py --steps 50 --device cpu
 ```
 
@@ -635,6 +710,7 @@ print(f"Generated sequence shape: {generated_ids.shape}")
 1. **Auxiliary Loss Tuning:** Defaults for the 8 auxiliary $\lambda$ coefficients are derived from initial theoretical modeling in `loss-definitions.md`; large-scale Bayesian hyperparameter sweeps have not yet been executed.
 2. **Hardware Kernel Optimization:** While the Mamba branch supports fused CUDA kernels via `mamba-ssm`, custom fused Triton / CUDA kernels for batched dual-memory cross-attention operations are not yet implemented.
 3. **Scale of Completed Experiments:** Reference implementation has been verified through unit testing, toy training, and ~200M parameter cloud smoke runs; full multi-billion parameter pre-training runs across trillion-token datasets remain future work.
+4. **Post-Training Validation:** The SFT, reward model, and PPO pipelines are verified only by CPU unit tests and tiny fixtures. Reward-model and PPO cloud preflights have not been run.
 
 ### Engineering Roadmap
 
@@ -642,6 +718,9 @@ print(f"Generated sequence shape: {generated_ids.shape}")
 - [x] Implementation of 8-objective auxiliary loss suite with warmup schedules.
 - [x] Multi-tier Mamba scan dispatch (fused, parallel, blocked, sequential checkpointed).
 - [x] PyTorch FSDP2 distributed trainer with DTensor Muon + AdamW and an AdamW-only fallback.
+- [x] Supervised fine-tuning pipeline (single-GPU and FSDP2) with assistant-only supervision.
+- [x] Pure-Mamba reward model (single-GPU, FSDP2, Kaggle TPU trainers) and PPO policy optimization.
+- [ ] Cloud preflight and production runs of the reward model and PPO stages.
 - [ ] Implement synthetic needle-in-a-haystack and associative retrieval evaluation benchmarks.
 - [ ] Execute the complete 3-stage falsification suite (Inference Zeroing, Gate Telemetry, Null Baseline).
 - [ ] Develop custom fused Triton kernels for batched dual-memory summary writes.
