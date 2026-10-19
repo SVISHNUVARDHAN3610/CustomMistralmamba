@@ -121,6 +121,11 @@ class HybridMambaMoEConfig(MixtralConfig):
     blocked_scan_chunk_size: int = 256
     blocked_scan_min_len: int = 4096
     sequential_scan_min_len: int = 65536
+    # Memory-lean chunked fallback (custom autograd, recompute-in-backward).
+    # Supersedes the parallel/blocked/sequential tiers when enabled; set False
+    # to restore them. Ignored when use_parallel_scan=True.
+    use_chunked_scan_fallback: bool = True
+    chunked_scan_chunk_size: int = 64
     gradient_checkpointing: bool = False
     # This implementation deliberately supports only non-reentrant checkpointing.
     # Persist the choice so resume can reject incompatible historical runs

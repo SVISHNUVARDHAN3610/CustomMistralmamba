@@ -17,7 +17,7 @@ retaining a mechanism for long-range, non-recurring information that both
 attention and the SSM branch tend to lose over long contexts.
 
 A reference PyTorch implementation exists (`model.py`, ~4.4k lines), verified
-with 83 unit tests in `tests/test_model.py`, forward/backward passes, chunked
+with 91 unit tests in `tests/test_model.py`, forward/backward passes, chunked
 long-context training, and an autoregressive `generate()` method. A cloud
 training smoke script (`scripts/test_cloud_train.py`) exercises the full
 training objective on IMDB at ~200M parameters. This document lays out the
@@ -279,7 +279,7 @@ share the GQA and MoE stacks:
 
 ### 5.3 Training & Test Infrastructure
 
-- ✅ **`tests/test_model.py`** — 83 unit tests covering forward/backward,
+- ✅ **`tests/test_model.py`** — 91 unit tests covering forward/backward,
   chunked training parity, incremental vs full-forward logit cosine similarity,
   memory persistence across chunks, padding/NaN edge cases, fused Mamba parity,
   auxiliary loss gradients, MoE dispatch, CUDA-graph decode parity, and

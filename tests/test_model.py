@@ -1642,6 +1642,93 @@ class TestHybridModel(unittest.TestCase):
         sequential = MambaBlock._sequential_associative_scan(delta_a, delta_b_u)
         self.assertLess((blocked - sequential).abs().max().item(), 1e-5)
 
+    @staticmethod
+    def _chunked_scan_inputs(b: int, seq_len: int, d: int, n: int, dtype=torch.float32):
+        u = torch.randn(b, seq_len, d, dtype=dtype, requires_grad=True)
+        dt = (
+            torch.nn.functional.softplus(torch.randn(b, seq_len, d, dtype=dtype))
+            .detach()
+            .requires_grad_()
+        )
+        a_log = torch.randn(d, n, dtype=dtype).mul(0.5).requires_grad_()
+        b_in = torch.randn(b, seq_len, n, dtype=dtype, requires_grad=True)
+        c_in = torch.randn(b, seq_len, n, dtype=dtype, requires_grad=True)
+        d_skip = torch.randn(d, dtype=dtype, requires_grad=True)
+        return u, dt, a_log, b_in, c_in, d_skip
+
+    def test_chunked_scan_matches_reference_scan(self) -> None:
+        """Chunked custom-autograd scan == existing autograd scan (values + grads)."""
+        torch.manual_seed(0)
+        b, seq_len, d, n = 2, 37, 6, 4  # L not a multiple of the chunk size
+        mask = torch.ones(b, seq_len)
+        mask[1, 29:] = 0  # right padding on row 1
+        for attention_mask in (None, mask):
+            inputs = self._chunked_scan_inputs(b, seq_len, d, n)
+            results = []
+            for chunked in (False, True):
+                u, dt, a_log, b_in, c_in, d_skip = inputs
+                for t in inputs:
+                    t.grad = None
+                y, state = MambaBlock._selective_scan(
+                    u,
+                    dt,
+                    -torch.exp(a_log),
+                    b_in,
+                    c_in,
+                    d_skip,
+                    return_final_state=True,
+                    use_fused_scan=False,
+                    training=True,
+                    attention_mask=attention_mask,
+                    use_chunked_scan_fallback=chunked,
+                    chunked_scan_chunk_size=8,
+                )
+                weights = torch.linspace(-1.0, 1.0, y.numel()).view_as(y)
+                loss = (y * weights).sum() + state.pow(2).sum()
+                loss.backward()
+                grads = [t.grad.clone() for t in inputs]
+                results.append((y.detach(), state.detach(), grads))
+            (y_ref, st_ref, g_ref), (y_new, st_new, g_new) = results
+            torch.testing.assert_close(y_new, y_ref, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(st_new, st_ref, rtol=1e-4, atol=1e-5)
+            for name, gn, gr in zip(("u", "dt", "A_log", "B", "C", "D"), g_new, g_ref):
+                torch.testing.assert_close(
+                    gn, gr, rtol=1e-4, atol=1e-4, msg=f"grad mismatch: {name}"
+                )
+
+    def test_chunked_scan_gradcheck(self) -> None:
+        from model.hybrid.mamba import _ChunkedSelectiveScanFn
+
+        torch.manual_seed(0)
+        u, dt, a_log, b_in, c_in, _ = self._chunked_scan_inputs(
+            2, 7, 3, 2, dtype=torch.float64
+        )
+        a_param = (-torch.exp(a_log)).detach().requires_grad_()
+        mask = torch.ones(2, 7, dtype=torch.float64)
+        mask[0, 5:] = 0
+        for m in (None, mask):
+            self.assertTrue(
+                torch.autograd.gradcheck(
+                    lambda u_, dt_, a_, b_, c_, m=m: _ChunkedSelectiveScanFn.apply(
+                        u_, dt_, a_, b_, c_, m, 3
+                    ),
+                    (u, dt, a_param, b_in, c_in),
+                )
+            )
+
+    def test_chunked_scan_used_by_default_fallback(self) -> None:
+        reset_mamba_scan_stats()
+        cfg = _small_hybrid_config(use_fused_mamba_scan=False)
+        self.assertTrue(cfg.use_chunked_scan_fallback)
+        model = HybridForCausalLM(cfg).train()
+        ids = torch.randint(0, cfg.vocab_size, (1, 32))
+        out = model(input_ids=ids, labels=ids)
+        out.loss.backward()
+        self.assertTrue(torch.isfinite(out.loss))
+        stats = get_mamba_scan_stats()
+        self.assertGreater(stats["pytorch_chunked_fallback"], 0)
+        self.assertEqual(stats["pytorch_chunked_fallback"], stats["pytorch_fallback"])
+
     def test_scan_dispatch_parallel_for_short_seq(self) -> None:
         with mock.patch.object(
             MambaBlock,
@@ -1649,7 +1736,9 @@ class TestHybridModel(unittest.TestCase):
             wraps=MambaBlock._parallel_associative_scan,
         ) as spy:
             cfg = _small_hybrid_config(
-                use_fused_mamba_scan=False, parallel_scan_fallback_max_len=512
+                use_fused_mamba_scan=False,
+                parallel_scan_fallback_max_len=512,
+                use_chunked_scan_fallback=False,
             )
             model = HybridForCausalLM(cfg).train()
             ids = torch.randint(0, cfg.vocab_size, (1, 64))
