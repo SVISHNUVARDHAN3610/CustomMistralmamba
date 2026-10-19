@@ -85,6 +85,11 @@ def log_mamba_backend(config: HybridMambaMoEConfig | None = None) -> str:
         )
     elif config.use_parallel_scan:
         msg = "Mamba backend: Hillis-Steele parallel scan (explicit use_parallel_scan=True)"
+    elif config.use_chunked_scan_fallback:
+        msg = (
+            "Mamba backend: PyTorch chunked scan fallback "
+            f"(chunk={config.chunked_scan_chunk_size}, recompute-in-backward)"
+        )
     else:
         msg = (
             "Mamba backend: PyTorch fallback "
