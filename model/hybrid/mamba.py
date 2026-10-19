@@ -53,6 +53,7 @@ _MAMBA_SCAN_STATS: dict[str, int] = {
     "fused_full_batch": 0,
     "fused_unpadded_batch": 0,
     "pytorch_fallback": 0,
+    "pytorch_chunked_fallback": 0,
 }
 
 
@@ -192,6 +193,136 @@ def _attention_mask_has_padding(attention_mask: Tensor | None, seq_len: int) -> 
     return not attention_mask[:, -seq_len:].all().item()
 
 
+def _hillis_steele_scan(a: Tensor, b: Tensor) -> Tensor:
+    """Inclusive scan h_t = a_t * h_{t-1} + b_t over dim 1 (h_{-1} = 0)."""
+    seq_len = a.size(1)
+    n = 1
+    while n < seq_len:
+        b = torch.cat([b[:, :n], a[:, n:] * b[:, :-n] + b[:, n:]], dim=1)
+        a = torch.cat([a[:, :n], a[:, n:] * a[:, :-n]], dim=1)
+        n *= 2
+    return b
+
+
+def _chunk_scan_terms(
+    u: Tensor, dt: Tensor, A: Tensor, B: Tensor, mask: Tensor | None
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Per-chunk discretization: returns (delta_a_raw, delta_a, delta_b_u)."""
+    delta_a_raw = torch.exp(dt.unsqueeze(-1) * A)  # [B, T, d_inner, n]
+    delta_b_u = dt.unsqueeze(-1) * B.unsqueeze(2) * u.unsqueeze(-1)
+    if mask is None:
+        return delta_a_raw, delta_a_raw, delta_b_u
+    m = mask.unsqueeze(-1).unsqueeze(-1)  # [B, T, 1, 1]
+    # Pad steps: h_t = 1 * h_{t-1} + 0
+    return delta_a_raw, delta_a_raw * m + (1.0 - m), delta_b_u * m
+
+
+class _ChunkedSelectiveScanFn(torch.autograd.Function):
+    """
+    Memory-lean PyTorch selective scan (no D skip term).
+
+    Forward walks the sequence in chunks of `chunk_size`, builds the
+    [B, T, d_inner, n] discretized tensors for one chunk at a time, contracts
+    them with C immediately, and keeps only each chunk's starting state.
+    Backward revisits chunks in reverse, recomputes that chunk's states from
+    the saved start state, and runs the adjoint recurrence
+    g_t = C_t * dy_t + a_{t+1} * g_{t+1}. Peak activation memory is
+    O(B * chunk_size * d_inner * n) instead of O(B * L * log L * d_inner * n).
+
+    u, dt: [B, L, d_inner]; A: [d_inner, n]; B, C: [B, L, n];
+    mask: [B, L] float (1 = valid) or None.
+    Returns y [B, L, d_inner] and the final state [B, d_inner, n].
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        u: Tensor,
+        dt: Tensor,
+        A: Tensor,
+        B: Tensor,
+        C: Tensor,
+        mask: Tensor | None,
+        chunk_size: int,
+    ) -> tuple[Tensor, Tensor]:
+        batch, seq_len, d_inner = u.shape
+        n = A.size(-1)
+        with torch.autocast(device_type=u.device.type, enabled=False):
+            state = u.new_zeros(batch, d_inner, n)
+            y = u.new_empty(batch, seq_len, d_inner)
+            start_states = []
+            for start in range(0, seq_len, chunk_size):
+                end = min(start + chunk_size, seq_len)
+                chunk_mask = None if mask is None else mask[:, start:end]
+                _, delta_a, delta_b_u = _chunk_scan_terms(
+                    u[:, start:end], dt[:, start:end], A, B[:, start:end], chunk_mask
+                )
+                start_states.append(state)
+                delta_b_u[:, 0] += delta_a[:, 0] * state
+                states = _hillis_steele_scan(delta_a, delta_b_u)
+                y[:, start:end] = (states * C[:, start:end].unsqueeze(2)).sum(dim=-1)
+                state = states[:, -1].contiguous()
+        ctx.chunk_size = chunk_size
+        ctx.has_mask = mask is not None
+        saved_mask = mask if mask is not None else u.new_empty(0)
+        ctx.save_for_backward(u, dt, A, B, C, saved_mask, torch.stack(start_states))
+        return y, state
+
+    @staticmethod
+    def backward(ctx, dy: Tensor, dh_final: Tensor):  # type: ignore[override]
+        u, dt, A, B, C, saved_mask, start_states = ctx.saved_tensors
+        mask = saved_mask if ctx.has_mask else None
+        chunk_size = ctx.chunk_size
+        seq_len = u.size(1)
+        with torch.autocast(device_type=u.device.type, enabled=False):
+            du = torch.empty_like(u)
+            ddt = torch.empty_like(dt)
+            dB = torch.empty_like(B)
+            dC = torch.empty_like(C)
+            dA = torch.zeros_like(A)
+            # dL/dh at the end of the current chunk, flowing in from the future.
+            carry = dh_final
+            starts = list(range(0, seq_len, chunk_size))
+            for k in reversed(range(len(starts))):
+                start = starts[k]
+                end = min(start + chunk_size, seq_len)
+                u_c, dt_c = u[:, start:end], dt[:, start:end]
+                B_c, C_c, dy_c = B[:, start:end], C[:, start:end], dy[:, start:end]
+                chunk_mask = None if mask is None else mask[:, start:end]
+                delta_a_raw, delta_a, delta_b_u = _chunk_scan_terms(
+                    u_c, dt_c, A, B_c, chunk_mask
+                )
+                h0 = start_states[k]
+                seeded = delta_b_u.clone()
+                seeded[:, 0] += delta_a[:, 0] * h0
+                states = _hillis_steele_scan(delta_a, seeded)
+                h_prev = torch.cat([h0.unsqueeze(1), states[:, :-1]], dim=1)
+
+                # Adjoint: g_t = C_t * dy_t + a_{t+1} * g_{t+1}, reverse scan.
+                r = dy_c.unsqueeze(-1) * C_c.unsqueeze(2)
+                r[:, -1] += carry
+                a_next = torch.cat(
+                    [delta_a[:, 1:], torch.zeros_like(delta_a[:, :1])], dim=1
+                )
+                g = _hillis_steele_scan(a_next.flip(1), r.flip(1)).flip(1)
+                carry = delta_a[:, 0] * g[:, 0]
+
+                dC[:, start:end] = (states * dy_c.unsqueeze(-1)).sum(dim=2)
+                d_delta_a = g * h_prev
+                d_delta_b_u = g
+                if chunk_mask is not None:
+                    m = chunk_mask.unsqueeze(-1).unsqueeze(-1)
+                    d_delta_a = d_delta_a * m
+                    d_delta_b_u = d_delta_b_u * m
+                dz = d_delta_a * delta_a_raw  # grad of dt * A
+                gb = (d_delta_b_u * B_c.unsqueeze(2)).sum(dim=-1)  # [B, T, d_inner]
+                ddt[:, start:end] = (dz * A).sum(dim=-1) + gb * u_c
+                du[:, start:end] = gb * dt_c
+                dB[:, start:end] = (d_delta_b_u * (dt_c * u_c).unsqueeze(-1)).sum(dim=2)
+                dA += (dz * dt_c.unsqueeze(-1)).sum(dim=(0, 1))
+        return du, ddt, dA, dB, dC, None, None
+
+
 class MambaBlock(nn.Module):
     """
     Selective SSM (Mamba / S6).
@@ -217,6 +348,8 @@ class MambaBlock(nn.Module):
         blocked_scan_chunk_size: int = 256,
         blocked_scan_min_len: int = 4096,
         sequential_scan_min_len: int = 65536,
+        use_chunked_scan_fallback: bool = True,
+        chunked_scan_chunk_size: int = 64,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -232,6 +365,8 @@ class MambaBlock(nn.Module):
         self.blocked_scan_chunk_size = blocked_scan_chunk_size
         self.blocked_scan_min_len = blocked_scan_min_len
         self.sequential_scan_min_len = sequential_scan_min_len
+        self.use_chunked_scan_fallback = use_chunked_scan_fallback
+        self.chunked_scan_chunk_size = chunked_scan_chunk_size
 
         self.in_proj = nn.Linear(hidden_size, 2 * self.d_inner, bias=False)
         self.conv1d = nn.Conv1d(
@@ -387,6 +522,8 @@ class MambaBlock(nn.Module):
             sequential_scan_min_len=self.sequential_scan_min_len,
             mamba_internal_checkpoint=mamba_internal_checkpoint,
             layer_checkpointing_active=layer_checkpointing_active,
+            use_chunked_scan_fallback=self.use_chunked_scan_fallback,
+            chunked_scan_chunk_size=self.chunked_scan_chunk_size,
         )
         y = y * F.silu(z)
         out = self.out_proj(y)
@@ -686,6 +823,8 @@ class MambaBlock(nn.Module):
         mamba_internal_checkpoint: bool = True,
         layer_checkpointing_active: bool = False,
         require_fused_scan: bool = False,
+        use_chunked_scan_fallback: bool = False,
+        chunked_scan_chunk_size: int = 64,
     ) -> tuple[Tensor, Tensor | None]:
         """
         u, dt: [B, L, d_inner]; A: [d_inner, n]; B, C: [B, L, n]; D: [d_inner]
@@ -769,9 +908,6 @@ class MambaBlock(nn.Module):
         B_f = B.float()
         C_f = C.float()
 
-        delta_a = torch.exp(dt_f.unsqueeze(-1) * A)  # [B, L, d_inner, n]
-        delta_b_u = dt_f.unsqueeze(-1) * B_f.unsqueeze(2) * u_f.unsqueeze(-1)
-
         token_mask: Tensor | None = None
         if attention_mask is not None:
             if attention_mask.dim() != 2:
@@ -780,7 +916,22 @@ class MambaBlock(nn.Module):
                 raise ValueError(
                     f"attention_mask length {attention_mask.size(1)} < seq_len {seq_len}."
                 )
-            token_mask = attention_mask[:, -seq_len:].to(dtype=delta_a.dtype)
+            token_mask = attention_mask[:, -seq_len:].to(dtype=torch.float32)
+
+        if use_chunked_scan_fallback and not use_parallel_scan:
+            _MAMBA_SCAN_STATS["pytorch_chunked_fallback"] += 1
+            y, final_state = _ChunkedSelectiveScanFn.apply(
+                u_f, dt_f, A.float(), B_f, C_f, token_mask, chunked_scan_chunk_size
+            )
+            y = y + u_f * D.float()
+            if token_mask is not None:
+                y = y * token_mask.unsqueeze(-1)
+            return y.to(input_dtype), final_state if return_final_state else None
+
+        delta_a = torch.exp(dt_f.unsqueeze(-1) * A)  # [B, L, d_inner, n]
+        delta_b_u = dt_f.unsqueeze(-1) * B_f.unsqueeze(2) * u_f.unsqueeze(-1)
+
+        if token_mask is not None:
             m = token_mask.unsqueeze(-1).unsqueeze(-1)  # [B, L, 1, 1]
             # Pad steps: h_t = 1 * h_{t-1} + 0
             delta_a = delta_a * m + (1.0 - m)

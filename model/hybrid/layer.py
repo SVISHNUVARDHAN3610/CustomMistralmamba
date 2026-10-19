@@ -163,6 +163,8 @@ class HybridDecoderLayer(nn.Module):
             blocked_scan_chunk_size=config.blocked_scan_chunk_size,
             blocked_scan_min_len=config.blocked_scan_min_len,
             sequential_scan_min_len=config.sequential_scan_min_len,
+            use_chunked_scan_fallback=config.use_chunked_scan_fallback,
+            chunked_scan_chunk_size=config.chunked_scan_chunk_size,
         )
 
         if self.use_dual_memory:
